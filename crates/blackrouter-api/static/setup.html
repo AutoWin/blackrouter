@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>BlackRouter Setup</title>
+    <link rel="stylesheet" href="/setup.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <a class="brand" href="/setup" aria-label="BlackRouter setup">
+          <span class="brand-mark">BR</span>
+          <span>
+            <strong>BlackRouter</strong>
+            <small id="versionLabel">0.1.0</small>
+          </span>
+        </a>
+        <nav class="tabs" aria-label="Setup sections">
+          <button class="tab active" data-panel="runtime" type="button">Runtime</button>
+          <button class="tab" data-panel="database" type="button">Database</button>
+          <button class="tab" data-panel="keys" type="button">API Keys</button>
+          <button class="tab" data-panel="telegram" type="button">Telegram</button>
+          <button class="tab" data-panel="providers" type="button">Providers</button>
+          <button class="tab" data-panel="combos" type="button">Combos</button>
+        </nav>
+      </aside>
+
+      <main class="content">
+        <header class="topbar">
+          <div>
+            <h1>Setup</h1>
+            <p id="endpointLabel">127.0.0.1:20130</p>
+          </div>
+          <div class="actions">
+            <span id="healthBadge" class="badge muted">Checking</span>
+            <button id="refreshButton" class="icon-button" type="button" aria-label="Refresh">
+              <span aria-hidden="true">R</span>
+            </button>
+          </div>
+        </header>
+
+        <section id="runtime" class="panel active">
+          <div class="section-head">
+            <h2>Runtime</h2>
+            <span id="uptimeLabel" class="metric">0s</span>
+          </div>
+          <div class="grid two">
+            <label class="field">
+              <span>Host</span>
+              <input id="hostValue" readonly />
+            </label>
+            <label class="field">
+              <span>Port</span>
+              <input id="portValue" readonly />
+            </label>
+            <label class="field">
+              <span>Data Dir</span>
+              <input id="dataDirValue" readonly />
+            </label>
+            <label class="field">
+              <span>Database URL</span>
+              <input id="databaseUrlValue" readonly />
+            </label>
+          </div>
+          <form id="configForm" class="form-block">
+            <div class="section-head compact">
+              <h2>Saved Config</h2>
+              <span id="configSaveBadge" class="badge muted">DB backed</span>
+            </div>
+            <label class="check-field">
+              <input id="configRequireApiKey" type="checkbox" />
+              <span>Require API key for v1 routes after runtime wiring</span>
+            </label>
+            <div class="form-actions">
+              <button class="primary-button" type="submit">Save Config</button>
+            </div>
+          </form>
+        </section>
+
+        <section id="database" class="panel">
+          <div class="section-head">
+            <h2>Database</h2>
+            <span id="databaseBadge" class="badge muted">Unknown</span>
+          </div>
+          <div class="grid two">
+            <label class="field wide">
+              <span>SQLite Path</span>
+              <input id="databasePathValue" readonly />
+            </label>
+            <label class="field">
+              <span>9Router Compatibility</span>
+              <input id="compatValue" readonly />
+            </label>
+          </div>
+          <div id="tableCounts" class="table-list" aria-live="polite"></div>
+        </section>
+
+        <section id="keys" class="panel">
+          <div class="section-head">
+            <h2>API Keys</h2>
+            <span id="apiKeyBadge" class="badge muted">Unknown</span>
+          </div>
+          <div class="grid two">
+            <label class="field">
+              <span>Require API Key</span>
+              <input id="requireApiKeyValue" readonly />
+            </label>
+            <label class="field">
+              <span>Configured Keys</span>
+              <input id="apiKeyCountValue" readonly />
+            </label>
+          </div>
+          <form id="apiKeyForm" class="form-block">
+            <div class="grid two">
+              <label class="field">
+                <span>Name</span>
+                <input id="apiKeyNameInput" placeholder="Local CLI" />
+              </label>
+              <label class="field">
+                <span>Machine ID</span>
+                <input id="apiKeyMachineInput" placeholder="optional" />
+              </label>
+            </div>
+            <div class="form-actions">
+              <button class="primary-button" type="submit">Create API Key</button>
+            </div>
+          </form>
+          <div id="newApiKeyNotice" class="notice hidden"></div>
+          <div id="apiKeysList" class="table-list" aria-live="polite"></div>
+        </section>
+
+        <section id="telegram" class="panel">
+          <div class="section-head">
+            <h2>Telegram</h2>
+            <span id="telegramBadge" class="badge muted">Unknown</span>
+          </div>
+          <div class="grid two">
+            <label class="check-field inline">
+              <input id="telegramEnabledInput" type="checkbox" />
+              <span>Enabled</span>
+            </label>
+            <label class="field">
+              <span>Admin IDs</span>
+              <input id="telegramAdminInput" placeholder="123456,987654" />
+            </label>
+            <label class="check-field inline">
+              <input id="telegramWebhookInput" type="checkbox" />
+              <span>Use Webhook</span>
+            </label>
+            <label class="field">
+              <span>Link TTL</span>
+              <input id="telegramTtlInput" type="number" min="60" step="1" />
+            </label>
+            <label class="field wide">
+              <span>Webhook URL</span>
+              <input id="telegramWebhookUrlInput" placeholder="https://example.com/telegram/webhook" />
+            </label>
+          </div>
+          <div class="form-actions">
+            <button id="saveTelegramButton" class="primary-button" type="button">Save Telegram Config</button>
+          </div>
+        </section>
+
+        <section id="providers" class="panel">
+          <div class="section-head">
+            <h2>Providers</h2>
+            <span id="modelsBadge" class="badge muted">0 models</span>
+          </div>
+          <form id="providerForm" class="form-block">
+            <input id="providerEditIdInput" type="hidden" />
+            <div class="grid two">
+              <label class="field wide">
+                <span>Preset</span>
+                <select id="providerPresetInput"></select>
+              </label>
+              <label class="field">
+                <span>Provider</span>
+                <input id="providerInput" placeholder="openai" required />
+              </label>
+              <label class="field">
+                <span>Auth Type</span>
+                <input id="authTypeInput" placeholder="api-key" required />
+              </label>
+              <label class="field">
+                <span>Base URL</span>
+                <input id="providerBaseUrlInput" placeholder="https://api.openai.com/v1/chat/completions" />
+              </label>
+              <label class="field">
+                <span>Format</span>
+                <input id="providerFormatInput" placeholder="openai" />
+              </label>
+              <label class="field">
+                <span>Name</span>
+                <input id="providerNameInput" placeholder="OpenAI primary" />
+              </label>
+              <label class="field">
+                <span>Priority</span>
+                <input id="providerPriorityInput" type="number" step="1" placeholder="1" />
+              </label>
+              <label class="field wide">
+                <span>API Key / Token</span>
+                <input id="providerApiKeyInput" autocomplete="off" placeholder="provider API key or access token" />
+              </label>
+              <label class="check-field inline">
+                <input id="providerActiveInput" type="checkbox" checked />
+                <span>Active</span>
+              </label>
+              <label class="field wide">
+                <span>Data JSON</span>
+                <textarea id="providerDataInput" rows="6" spellcheck="false" placeholder='{"baseUrl":"https://api.openai.com/v1/chat/completions","apiKey":"..."}'></textarea>
+              </label>
+            </div>
+            <div class="form-actions">
+              <button id="providerCancelEditButton" class="secondary-button hidden" type="button">Cancel Edit</button>
+              <button id="providerSubmitButton" class="primary-button" type="submit">Add Provider</button>
+            </div>
+          </form>
+          <div id="providerTestNotice" class="notice hidden"></div>
+          <div id="providersList" class="table-list" aria-live="polite"></div>
+          <div id="modelsList" class="model-list" aria-live="polite"></div>
+        </section>
+
+        <section id="combos" class="panel">
+          <div class="section-head">
+            <h2>Combos</h2>
+            <span id="combosBadge" class="badge muted">0 combos</span>
+          </div>
+          <form id="comboForm" class="form-block">
+            <input id="comboEditIdInput" type="hidden" />
+            <div class="grid two">
+              <label class="field">
+                <span>Name</span>
+                <input id="comboNameInput" placeholder="code-high" required />
+              </label>
+              <label class="field">
+                <span>Kind</span>
+                <input id="comboKindInput" placeholder="llm" value="llm" />
+              </label>
+              <label class="field wide">
+                <span>Fetched Provider Model</span>
+                <select id="comboModelSelect"></select>
+              </label>
+              <label class="field wide">
+                <span>Models in Combo</span>
+                <textarea id="comboModelsInput" rows="6" spellcheck="false" placeholder="cline/claude-sonnet-4&#10;commandcode/claude-opus"></textarea>
+              </label>
+            </div>
+            <div class="form-actions">
+              <button id="comboAddModelButton" class="secondary-button" type="button">Add Model</button>
+              <button id="comboCancelEditButton" class="secondary-button hidden" type="button">Cancel Edit</button>
+              <button id="comboSubmitButton" class="primary-button" type="submit">Add Combo</button>
+            </div>
+          </form>
+          <div id="combosList" class="table-list" aria-live="polite"></div>
+          <div id="comboModelsList" class="model-list" aria-live="polite"></div>
+        </section>
+      </main>
+    </div>
+    <script src="/setup.js"></script>
+  </body>
+</html>

@@ -1,0 +1,19 @@
+[package]
+name = "blackrouter-bin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "blackrouter"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+blackrouter-api = { path = "../blackrouter-api" }
+blackrouter-config = { path = "../blackrouter-config" }
+blackrouter-storage = { path = "../blackrouter-storage" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

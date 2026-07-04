@@ -1,0 +1,11 @@
+[package]
+name = "blackrouter-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+blackrouter-common = { path = "../blackrouter-common" }
+dotenvy.workspace = true
+serde.workspace = true
+thiserror.workspace = true
