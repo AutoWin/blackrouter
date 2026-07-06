@@ -5,5 +5,14 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+blackrouter-common = { path = "../blackrouter-common" }
+bytes.workspace = true
+futures-util.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["macros", "rt"] }

@@ -12,8 +12,12 @@ path = "src/main.rs"
 anyhow.workspace = true
 axum.workspace = true
 blackrouter-api = { path = "../blackrouter-api" }
+blackrouter-common = { path = "../blackrouter-common" }
 blackrouter-config = { path = "../blackrouter-config" }
+blackrouter-core = { path = "../blackrouter-core" }
 blackrouter-storage = { path = "../blackrouter-storage" }
+blackrouter-telegram = { path = "../blackrouter-telegram" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+serde_json.workspace = true

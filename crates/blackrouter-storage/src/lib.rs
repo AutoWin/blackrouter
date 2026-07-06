@@ -148,6 +148,61 @@ pub struct NewCombo {
     pub models: Vec<String>,
 }
 
+/// Usage history entry for recording request metrics (Phase 3.1)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageEntry {
+    pub id: String,
+    pub timestamp: String,
+    pub provider: String,
+    pub model: String,
+    pub connection_id: Option<String>,
+    pub api_key: Option<String>,
+    pub endpoint: String,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub cost: f64,
+    pub status: String,
+    pub tokens: Option<String>,
+    pub meta: Option<String>,
+}
+
+/// Aggregated usage row for reporting
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageRow {
+    pub provider: String,
+    pub model: String,
+    pub status: String,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub cost: f64,
+    pub count: u64,
+}
+
+/// Request detail entry for storing full request/response metadata (Phase 3.1)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestDetailEntry {
+    pub id: String,
+    pub timestamp: String,
+    pub provider: String,
+    pub model: String,
+    pub connection_id: Option<String>,
+    pub status: String,
+    pub data: String,
+}
+
+/// Daily usage summary stored in usageDaily table
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DailyUsage {
+    pub date_key: String,
+    pub total_requests: u64,
+    pub successful_requests: u64,
+    pub failed_requests: u64,
+    pub total_prompt_tokens: u64,
+    pub total_completion_tokens: u64,
+    pub total_cost: f64,
+    pub by_provider: serde_json::Value,
+}
+
 impl Storage {
     pub fn new(database_path: impl Into<PathBuf>) -> Self {
         Self {
@@ -696,6 +751,197 @@ impl Storage {
             .optional()?
             .is_some();
         Ok(found)
+    }
+
+    /// Record a usage entry to the usageHistory table (Phase 3.1)
+    pub fn record_usage(&self, entry: &UsageEntry) -> Result<()> {
+        let conn = self.open()?;
+        conn.execute(
+            "INSERT INTO usageHistory
+             (id, timestamp, provider, model, connectionId, apiKey, endpoint,
+              promptTokens, completionTokens, cost, status, tokens, meta)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                entry.id,
+                entry.timestamp,
+                entry.provider,
+                entry.model,
+                entry.connection_id,
+                entry.api_key,
+                entry.endpoint,
+                entry.prompt_tokens,
+                entry.completion_tokens,
+                entry.cost,
+                entry.status,
+                entry.tokens,
+                entry.meta,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Get aggregated usage stats for a time range
+    pub fn usage_stats(&self, since: Option<&str>) -> Result<Vec<UsageRow>> {
+        let conn = self.open()?;
+        let since = since.unwrap_or("1970-01-01T00:00:00Z");
+        let mut stmt = conn.prepare(
+            "SELECT provider, model, status,
+                    SUM(promptTokens) as pt, SUM(completionTokens) as ct,
+                    SUM(cost) as cost, COUNT(*) as cnt
+             FROM usageHistory
+             WHERE timestamp >= ?1
+             GROUP BY provider, model, status
+             ORDER BY cnt DESC",
+        )?;
+        let rows = stmt.query_map(params![since], |row| {
+            Ok(UsageRow {
+                provider: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                model: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                status: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                prompt_tokens: row.get::<_, i64>(3)? as u64,
+                completion_tokens: row.get::<_, i64>(4)? as u64,
+                cost: row.get::<_, f64>(5)?,
+                count: row.get::<_, i64>(6)? as u64,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| StorageError::Sqlite(e))
+    }
+
+    /// Record a request detail entry to the requestDetails table (Phase 3.1)
+    pub fn record_request_details(&self, entry: &RequestDetailEntry) -> Result<()> {
+        let conn = self.open()?;
+        conn.execute(
+            "INSERT INTO requestDetails
+             (id, timestamp, provider, model, connectionId, status, data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                entry.id,
+                entry.timestamp,
+                entry.provider,
+                entry.model,
+                entry.connection_id,
+                entry.status,
+                entry.data,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Aggregate usage for a specific date (YYYY-MM-DD) from usageHistory into usageDaily
+    pub fn aggregate_daily_usage(&self, date_key: &str) -> Result<DailyUsage> {
+        let conn = self.open()?;
+        let start = format!("{}T00:00:00Z", date_key);
+        let end = format!("{}T23:59:59Z", date_key);
+
+        // Aggregate from usageHistory
+        let total_requests: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM usageHistory WHERE timestamp >= ?1 AND timestamp <= ?2",
+            params![start, end],
+            |row| row.get(0),
+        )?;
+
+        let successful_requests: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM usageHistory WHERE timestamp >= ?1 AND timestamp <= ?2 AND status = 'success'",
+            params![start, end],
+            |row| row.get(0),
+        )?;
+
+        let failed_requests: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM usageHistory WHERE timestamp >= ?1 AND timestamp <= ?2 AND status != 'success'",
+            params![start, end],
+            |row| row.get(0),
+        )?;
+
+        let total_prompt_tokens: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(promptTokens), 0) FROM usageHistory WHERE timestamp >= ?1 AND timestamp <= ?2",
+            params![start, end],
+            |row| row.get(0),
+        )?;
+
+        let total_completion_tokens: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(completionTokens), 0) FROM usageHistory WHERE timestamp >= ?1 AND timestamp <= ?2",
+            params![start, end],
+            |row| row.get(0),
+        )?;
+
+        let total_cost: f64 = conn.query_row(
+            "SELECT COALESCE(SUM(cost), 0.0) FROM usageHistory WHERE timestamp >= ?1 AND timestamp <= ?2",
+            params![start, end],
+            |row| row.get(0),
+        )?;
+
+        // Aggregate by provider
+        let mut stmt = conn.prepare(
+            "SELECT provider, COUNT(*), SUM(promptTokens), SUM(completionTokens), SUM(cost)
+             FROM usageHistory WHERE timestamp >= ?1 AND timestamp <= ?2
+             GROUP BY provider",
+        )?;
+        let provider_rows = stmt.query_map(params![start, end], |row| {
+            Ok(serde_json::json!({
+                "provider": row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                "requests": row.get::<_, i64>(1)?,
+                "prompt_tokens": row.get::<_, i64>(2)? as u64,
+                "completion_tokens": row.get::<_, i64>(3)? as u64,
+                "cost": row.get::<_, f64>(4)?,
+            }))
+        })?;
+        let by_provider: Vec<Value> = provider_rows.filter_map(|r| r.ok()).collect();
+
+        let daily = DailyUsage {
+            date_key: date_key.to_string(),
+            total_requests: total_requests as u64,
+            successful_requests: successful_requests as u64,
+            failed_requests: failed_requests as u64,
+            total_prompt_tokens: total_prompt_tokens as u64,
+            total_completion_tokens: total_completion_tokens as u64,
+            total_cost,
+            by_provider: Value::Array(by_provider),
+        };
+
+        // Upsert into usageDaily
+        let data_json = serde_json::to_string(&daily).unwrap_or_else(|_| "{}".to_string());
+        conn.execute(
+            "INSERT INTO usageDaily (dateKey, data) VALUES (?1, ?2)
+             ON CONFLICT(dateKey) DO UPDATE SET data = ?2",
+            params![date_key, data_json],
+        )?;
+
+        Ok(daily)
+    }
+
+    /// Get daily usage for a specific date
+    pub fn get_daily_usage(&self, date_key: &str) -> Result<Option<DailyUsage>> {
+        let conn = self.open()?;
+        let result = conn
+            .query_row(
+                "SELECT data FROM usageDaily WHERE dateKey = ?1 LIMIT 1",
+                params![date_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+
+        match result {
+            Some(json) => {
+                let daily: DailyUsage = serde_json::from_str(&json).map_err(StorageError::from)?;
+                Ok(Some(daily))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// List daily usage entries
+    pub fn list_daily_usage(&self, limit: u32) -> Result<Vec<DailyUsage>> {
+        let conn = self.open()?;
+        let mut stmt =
+            conn.prepare("SELECT data FROM usageDaily ORDER BY dateKey DESC LIMIT ?1")?;
+        let rows = stmt.query_map(params![limit], |row| row.get::<_, String>(0))?;
+        rows.filter_map(|r| r.ok())
+            .filter_map(|json| serde_json::from_str::<DailyUsage>(&json).ok())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(Ok)
+            .collect()
     }
 
     pub fn list_model_shell_items(&self) -> Result<Vec<ModelListItem>> {
