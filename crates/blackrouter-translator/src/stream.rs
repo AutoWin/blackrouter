@@ -404,7 +404,7 @@ impl TranslateState {
     fn translate_event(&mut self, data: &str) -> Vec<String> {
         match self.from {
             WireFormat::ClaudeMessages => self.translate_claude_event(data),
-            WireFormat::Gemini => self.translate_gemini_event(data),
+            WireFormat::Gemini | WireFormat::Antigravity => self.translate_gemini_event(data),
             _ => {
                 // For OpenAI passthrough, just forward as-is
                 vec![format!("data: {}\n\n", data)]

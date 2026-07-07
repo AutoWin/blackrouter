@@ -404,16 +404,12 @@ fn openai_to_kiro(body: &Value) -> Result<Value> {
 }
 
 fn openai_to_antigravity(body: &Value) -> Result<Value> {
-    // Antigravity uses a similar format to OpenAI with some differences
-    let mut result = body.clone();
-    if let Some(obj) = result.as_object_mut() {
-        // Remove unsupported fields
-        obj.remove("functions");
-        obj.remove("function_call");
-        obj.remove("tools");
-        obj.remove("tool_choice");
-    }
-    Ok(result)
+    let request = openai_to_gemini(body)?;
+    Ok(serde_json::json!({
+        "request": request,
+        "requestType": "agent",
+        "userAgent": "antigravity",
+    }))
 }
 
 // ============================================================
@@ -835,17 +831,8 @@ fn kiro_response_to_openai(body: &Value) -> Result<Value> {
 }
 
 fn antigravity_response_to_openai(body: &Value) -> Result<Value> {
-    // Antigravity uses a similar format to OpenAI
-    let mut result = body.clone();
-    if let Some(obj) = result.as_object_mut() {
-        if !obj.contains_key("object") {
-            obj.insert(
-                "object".to_string(),
-                Value::String("chat.completion".to_string()),
-            );
-        }
-    }
-    Ok(result)
+    let response = body.get("response").unwrap_or(body);
+    gemini_response_to_openai(response)
 }
 
 // ============================================================
@@ -1521,6 +1508,66 @@ mod tests {
         assert_eq!(
             choices[0].get("message").unwrap().get("content").unwrap(),
             "Hello from Gemini"
+        );
+    }
+
+    #[test]
+    fn test_openai_to_antigravity_wraps_gemini_request() {
+        let body = json!({
+            "model": "black-gemini",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 16
+        });
+
+        let result =
+            translate_request(&body, WireFormat::OpenAiChat, WireFormat::Antigravity).unwrap();
+
+        assert!(result.get("request").is_some());
+        assert!(result.get("request").unwrap().get("contents").is_some());
+        assert!(result
+            .get("request")
+            .unwrap()
+            .get("generationConfig")
+            .is_some());
+        assert!(result.get("contents").is_none());
+    }
+
+    #[test]
+    fn test_antigravity_response_to_openai_unwraps_response() {
+        let body = json!({
+            "response": {
+                "candidates": [{
+                    "content": {
+                        "parts": [{"text": "ok"}]
+                    },
+                    "finishReason": "STOP"
+                }],
+                "usageMetadata": {
+                    "promptTokenCount": 6,
+                    "candidatesTokenCount": 1
+                }
+            },
+            "traceId": "trace"
+        });
+
+        let result =
+            translate_response(&body, WireFormat::Antigravity, WireFormat::OpenAiChat).unwrap();
+        let choices = result.get("choices").unwrap().as_array().unwrap();
+        assert_eq!(
+            choices[0].get("message").unwrap().get("content").unwrap(),
+            "ok"
+        );
+        assert_eq!(
+            result.get("usage").unwrap().get("prompt_tokens").unwrap(),
+            6
+        );
+        assert_eq!(
+            result
+                .get("usage")
+                .unwrap()
+                .get("completion_tokens")
+                .unwrap(),
+            1
         );
     }
 

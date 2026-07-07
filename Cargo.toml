@@ -2,6 +2,7 @@
 members = [
   "crates/blackrouter-api",
   "crates/blackrouter-bin",
+  "crates/blackrouter-cli",
   "crates/blackrouter-common",
   "crates/blackrouter-config",
   "crates/blackrouter-core",
@@ -26,13 +27,19 @@ bytes = "1"
 dotenvy = "0.15"
 futures-util = "0.3"
 http = "1"
+prometheus = { version = "0.13", features = ["process"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "http2"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync"] }
 tower-http = { version = "0.6", features = ["cors", "limit", "timeout", "trace"] }
+opentelemetry = { version = "0.27", features = ["trace"] }
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["tonic"] }
 tracing = "0.1"
+tracing-opentelemetry = "0.28"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["v4"] }
+open = "5"

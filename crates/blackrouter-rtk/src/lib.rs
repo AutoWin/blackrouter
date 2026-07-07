@@ -116,6 +116,154 @@ impl RateLimitState {
     }
 }
 
+// ── Circuit Breaker (Phase 4.1) ────────────────────────────────────────
+
+/// Circuit breaker state
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CircuitState {
+    /// Normal operation — requests pass through
+    Closed,
+    /// Failing — requests are rejected
+    Open,
+    /// Testing after cooldown — one request allowed
+    HalfOpen,
+}
+
+/// Per-provider circuit breaker state
+#[derive(Clone, Debug)]
+struct CircuitBreakerEntry {
+    state: CircuitState,
+    consecutive_failures: u32,
+    last_failure_time: Option<Instant>,
+    opened_at: Option<Instant>,
+}
+
+impl Default for CircuitBreakerEntry {
+    fn default() -> Self {
+        Self {
+            state: CircuitState::Closed,
+            consecutive_failures: 0,
+            last_failure_time: None,
+            opened_at: None,
+        }
+    }
+}
+
+/// Configuration for circuit breaker
+#[derive(Clone, Debug)]
+pub struct CircuitBreakerConfig {
+    /// Number of consecutive failures before opening circuit
+    pub failure_threshold: u32,
+    /// Time to wait before trying again (half-open state)
+    pub cooldown: Duration,
+    /// Number of successes in half-open before closing circuit
+    pub half_open_max_successes: u32,
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            failure_threshold: 5,
+            cooldown: Duration::from_secs(30),
+            half_open_max_successes: 2,
+        }
+    }
+}
+
+// ── Load Balancer (Phase 4.1) ──────────────────────────────────────────
+
+/// Load balancing strategy
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadBalanceStrategy {
+    /// Rotate through providers sequentially
+    RoundRobin,
+    /// Use priority as weight (higher priority = more requests)
+    WeightedRoundRobin,
+    /// Select provider with fewest active connections
+    LeastConnections,
+    /// Select provider with lowest average response time
+    ResponseTime,
+}
+
+impl Default for LoadBalanceStrategy {
+    fn default() -> Self {
+        Self::RoundRobin
+    }
+}
+
+// ── Response Cache (Phase 4.2) ─────────────────────────────────────────
+
+/// A cached response entry
+struct CacheEntry {
+    body: Vec<u8>,
+    content_type: Option<String>,
+    inserted_at: Instant,
+}
+
+/// Response cache with TTL and LRU eviction (Phase 4.2)
+#[derive(Clone)]
+pub struct ResponseCache {
+    entries: Arc<RwLock<std::collections::HashMap<String, CacheEntry>>>,
+    ttl: Duration,
+    max_entries: usize,
+}
+
+impl ResponseCache {
+    pub fn new(ttl: Duration, max_entries: usize) -> Self {
+        Self {
+            entries: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            ttl,
+            max_entries,
+        }
+    }
+
+    /// Try to get a cached response. Returns None if not cached or expired.
+    pub async fn get(&self, key: &str) -> Option<(Vec<u8>, Option<String>)> {
+        let entries = self.entries.read().await;
+        if let Some(entry) = entries.get(key) {
+            if entry.inserted_at.elapsed() < self.ttl {
+                return Some((entry.body.clone(), entry.content_type.clone()));
+            }
+        }
+        None
+    }
+
+    /// Store a response in the cache
+    pub async fn put(&self, key: String, body: Vec<u8>, content_type: Option<String>) {
+        let mut entries = self.entries.write().await;
+        // LRU eviction: remove oldest if at capacity
+        if entries.len() >= self.max_entries {
+            if let Some(oldest_key) = entries
+                .iter()
+                .min_by_key(|(_, e)| e.inserted_at)
+                .map(|(k, _)| k.clone())
+            {
+                entries.remove(&oldest_key);
+            }
+        }
+        entries.insert(
+            key,
+            CacheEntry {
+                body,
+                content_type,
+                inserted_at: Instant::now(),
+            },
+        );
+    }
+
+    /// Clear all cached entries
+    pub async fn clear(&self) {
+        let mut entries = self.entries.write().await;
+        entries.clear();
+    }
+
+    /// Get current cache size
+    pub async fn len(&self) -> usize {
+        self.entries.read().await.len()
+    }
+}
+
 /// Real-time tracker for request metrics and rate limiting
 #[derive(Clone)]
 pub struct Rtk {
@@ -137,6 +285,16 @@ struct RtkInner {
     total_requests: AtomicU64,
     successful_requests: AtomicU64,
     failed_requests: AtomicU64,
+    /// Circuit breaker state per provider connection ID
+    circuit_breakers: RwLock<HashMap<String, CircuitBreakerEntry>>,
+    /// Circuit breaker configuration
+    cb_config: RwLock<CircuitBreakerConfig>,
+    /// Round-robin counters per provider name
+    rr_counters: RwLock<HashMap<String, u64>>,
+    /// Load balancing strategy
+    lb_strategy: RwLock<LoadBalanceStrategy>,
+    /// Per-provider average response times (for ResponseTime strategy)
+    response_times: RwLock<HashMap<String, f64>>,
 }
 
 impl Rtk {
@@ -151,6 +309,11 @@ impl Rtk {
                 total_requests: AtomicU64::new(0),
                 successful_requests: AtomicU64::new(0),
                 failed_requests: AtomicU64::new(0),
+                circuit_breakers: RwLock::new(HashMap::new()),
+                cb_config: RwLock::new(CircuitBreakerConfig::default()),
+                rr_counters: RwLock::new(HashMap::new()),
+                lb_strategy: RwLock::new(LoadBalanceStrategy::default()),
+                response_times: RwLock::new(HashMap::new()),
             }),
         }
     }
@@ -351,6 +514,149 @@ impl Rtk {
 
         let mut samples = self.inner.latency_samples.write().await;
         samples.clear();
+    }
+
+    // ── Circuit Breaker methods (Phase 4.1) ───────────────────────────
+
+    /// Check if the circuit breaker is open for a provider connection
+    pub async fn is_circuit_open(&self, connection_id: &str) -> bool {
+        let config = self.inner.cb_config.read().await;
+        let mut breakers = self.inner.circuit_breakers.write().await;
+        let entry = breakers
+            .entry(connection_id.to_string())
+            .or_insert_with(CircuitBreakerEntry::default);
+
+        match entry.state {
+            CircuitState::Open => {
+                // Check if cooldown has passed → transition to HalfOpen
+                if let Some(opened_at) = entry.opened_at {
+                    if opened_at.elapsed() >= config.cooldown {
+                        entry.state = CircuitState::HalfOpen;
+                        return false; // Allow request through (half-open)
+                    }
+                }
+                true // Circuit is open, reject
+            }
+            CircuitState::HalfOpen | CircuitState::Closed => false,
+        }
+    }
+
+    /// Record a successful request — may close a half-open circuit
+    pub async fn record_circuit_success(&self, connection_id: &str) {
+        let mut breakers = self.inner.circuit_breakers.write().await;
+        if let Some(entry) = breakers.get_mut(connection_id) {
+            entry.consecutive_failures = 0;
+            entry.state = CircuitState::Closed;
+            entry.opened_at = None;
+        }
+    }
+
+    /// Record a failed request — may open the circuit
+    pub async fn record_circuit_failure(&self, connection_id: &str) {
+        let config = self.inner.cb_config.read().await;
+        let mut breakers = self.inner.circuit_breakers.write().await;
+        let entry = breakers
+            .entry(connection_id.to_string())
+            .or_insert_with(CircuitBreakerEntry::default);
+
+        entry.consecutive_failures += 1;
+        entry.last_failure_time = Some(Instant::now());
+
+        if entry.consecutive_failures >= config.failure_threshold {
+            entry.state = CircuitState::Open;
+            entry.opened_at = Some(Instant::now());
+            tracing::warn!(
+                "Circuit breaker opened for connection {}: {} consecutive failures",
+                connection_id,
+                entry.consecutive_failures
+            );
+        }
+    }
+
+    /// Get circuit breaker state for a connection
+    pub async fn circuit_state(&self, connection_id: &str) -> CircuitState {
+        let breakers = self.inner.circuit_breakers.read().await;
+        breakers
+            .get(connection_id)
+            .map(|e| e.state.clone())
+            .unwrap_or(CircuitState::Closed)
+    }
+
+    /// Update circuit breaker configuration
+    pub async fn update_cb_config(&self, config: CircuitBreakerConfig) {
+        let mut current = self.inner.cb_config.write().await;
+        *current = config;
+    }
+
+    // ── Load Balancer methods (Phase 4.1) ─────────────────────────────
+
+    /// Select an index from a list of providers using the configured strategy
+    pub async fn select_provider_index(&self, provider_name: &str, count: usize) -> usize {
+        if count <= 1 {
+            return 0;
+        }
+
+        let strategy = self.inner.lb_strategy.read().await.clone();
+        match strategy {
+            LoadBalanceStrategy::RoundRobin => {
+                let mut counters = self.inner.rr_counters.write().await;
+                let counter = counters.entry(provider_name.to_string()).or_insert(0);
+                let idx = (*counter % count as u64) as usize;
+                *counter += 1;
+                idx
+            }
+            LoadBalanceStrategy::WeightedRoundRobin => {
+                // For weighted, we use priority-based selection
+                // Higher priority (lower number) gets more requests
+                // Simple approach: still round-robin but skip lower-priority items sometimes
+                // For now, use round-robin (weight info comes from storage)
+                let mut counters = self.inner.rr_counters.write().await;
+                let counter = counters.entry(provider_name.to_string()).or_insert(0);
+                let idx = (*counter % count as u64) as usize;
+                *counter += 1;
+                idx
+            }
+            LoadBalanceStrategy::LeastConnections => {
+                // Use the rate limit state to find the provider with fewest concurrent requests
+                // Since we don't have per-connection tracking here, fall back to round-robin
+                let mut counters = self.inner.rr_counters.write().await;
+                let counter = counters.entry(provider_name.to_string()).or_insert(0);
+                let idx = (*counter % count as u64) as usize;
+                *counter += 1;
+                idx
+            }
+            LoadBalanceStrategy::ResponseTime => {
+                // Select the provider with lowest average response time
+                // For now, fall back to round-robin if no response time data
+                let _response_times = self.inner.response_times.read().await;
+                // Without per-connection IDs here, we can't select by response time
+                // This is a placeholder — the API layer will handle this
+                let mut counters = self.inner.rr_counters.write().await;
+                let counter = counters.entry(provider_name.to_string()).or_insert(0);
+                let idx = (*counter % count as u64) as usize;
+                *counter += 1;
+                idx
+            }
+        }
+    }
+
+    /// Update the load balancing strategy
+    pub async fn update_lb_strategy(&self, strategy: LoadBalanceStrategy) {
+        let mut current = self.inner.lb_strategy.write().await;
+        *current = strategy;
+    }
+
+    /// Get the current load balancing strategy
+    pub async fn lb_strategy(&self) -> LoadBalanceStrategy {
+        self.inner.lb_strategy.read().await.clone()
+    }
+
+    /// Record response time for a provider connection (for ResponseTime strategy)
+    pub async fn record_response_time(&self, connection_id: &str, duration: Duration) {
+        let mut times = self.inner.response_times.write().await;
+        let current = times.entry(connection_id.to_string()).or_insert(0.0);
+        // Exponential moving average
+        *current = *current * 0.8 + duration.as_secs_f64() * 1000.0 * 0.2;
     }
 }
 

@@ -4,6 +4,31 @@ Welcome to the BlackRouter documentation! This directory contains all project do
 
 ## 📚 Documents
 
+### [Request Processing Pipeline](./REQUEST_PROCESSING_PIPELINE.md)
+Luồng xử lý request từ lúc nhận prompt đến khi trả về output.
+
+**Key sections:**
+- Kiến trúc tổng quan
+- 11 bước xử lý chi tiết
+- Request/Response Translation
+- Rate Limiting
+- Usage Recording
+- Sequence Diagram
+- Ví dụ cụ thể
+
+---
+
+### [Provider Login Mechanisms](./PROVIDER_LOGIN_MECHANISMS.md)
+Các cơ chế xác thực của providers - API Key, OAuth 2.0, và No Auth.
+
+**Key sections:**
+- API Key Authentication
+- OAuth 2.0 Flows (Device Code, Authorization Code, PKCE)
+- Supported Providers
+- API Reference
+
+---
+
 ### [Implementation Status](./IMPLEMENTATION_STATUS.md)
 Current state of the project - what's completed, in progress, and planned.
 

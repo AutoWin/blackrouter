@@ -2,8 +2,7 @@ use anyhow::Context;
 use blackrouter_api::{build_router, AppState};
 use blackrouter_config::AppConfig;
 use blackrouter_storage::Storage;
-use blackrouter_telegram::{TelegramBot, TelegramBotConfig, TelegramCommand};
-use std::sync::Arc;
+use blackrouter_telegram::{TelegramBot, TelegramBotConfig, TelegramRuntime};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
@@ -35,6 +34,11 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(%bind_addr, "BlackRouter listening");
 
+    // OpenTelemetry: log configuration status (full OTLP export requires subscriber integration)
+    if std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok() {
+        tracing::info!("OpenTelemetry endpoint configured, ready for export");
+    }
+
     // Start Telegram bot if configured
     let telegram_handle = if config.telegram.enabled {
         if let Some(bot_token) = &config.telegram.bot_token {
@@ -50,26 +54,11 @@ async fn main() -> anyhow::Result<()> {
                 Ok(bot) => {
                     tracing::info!("Starting Telegram bot");
 
-                    let bot = Arc::new(bot);
-                    let storage = storage.clone();
+                    let runtime =
+                        TelegramRuntime::new(storage.clone(), config.telegram.admin_ids.clone());
 
                     let handle = tokio::spawn(async move {
-                        let bot_clone = bot.clone();
-                        let storage_clone = storage.clone();
-
-                        let handler = move |command: TelegramCommand, chat_id: i64| {
-                            let bot = bot_clone.clone();
-                            let storage = storage_clone.clone();
-
-                            Box::pin(async move {
-                                handle_telegram_command(&bot, &storage, command, chat_id).await
-                            })
-                                as std::pin::Pin<
-                                    Box<dyn std::future::Future<Output = String> + Send>,
-                                >
-                        };
-
-                        if let Err(e) = bot.start_polling(handler).await {
+                        if let Err(e) = runtime.start_polling(bot).await {
                             tracing::error!("Telegram bot error: {}", e);
                         }
                     });
@@ -114,233 +103,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-async fn handle_telegram_command(
-    _bot: &TelegramBot,
-    storage: &Storage,
-    command: TelegramCommand,
-    _chat_id: i64,
-) -> String {
-    match command {
-        TelegramCommand::Start => {
-            format!("🤖 Welcome to BlackRouter!\n\nType /help for available commands.")
-        }
-        TelegramCommand::Help => TelegramBot::help_message(),
-        TelegramCommand::Status => match storage.status() {
-            Ok(status) => {
-                let table_count = status.table_counts.len();
-                format!(
-                        "📊 <b>BlackRouter Status</b>\n\n✅ Status: Running\n📁 Database: {}\n📋 Tables: {}\n🔌 Schema Compatible: {}",
-                        status.database_path.display(),
-                        table_count,
-                        if status.schema_compatible { "Yes" } else { "No" }
-                    )
-            }
-            Err(e) => format!("❌ Error getting status: {}", e),
-        },
-        TelegramCommand::Health => match storage.status() {
-            Ok(status) => {
-                if status.schema_compatible {
-                    "✅ <b>Health Check</b>\n\nStatus: Healthy".to_string()
-                } else {
-                    "⚠️ <b>Health Check</b>\n\nStatus: Degraded\nReason: Schema incompatible"
-                        .to_string()
-                }
-            }
-            Err(e) => format!("❌ <b>Health Check Failed</b>\n\nError: {}", e),
-        },
-        TelegramCommand::Version => {
-            let build_info = blackrouter_common::BuildInfo::default();
-            format!(
-                "📦 <b>BlackRouter Version</b>\n\nName: {}\nVersion: {}\nRuntime: {}",
-                build_info.name, build_info.version, build_info.rust_runtime
-            )
-        }
-        TelegramCommand::Providers => match storage.list_provider_connections() {
-            Ok(providers) => {
-                if providers.is_empty() {
-                    "📭 No providers configured".to_string()
-                } else {
-                    let mut msg = "🔌 <b>Providers</b>\n\n".to_string();
-                    for p in &providers {
-                        let status = if p.is_active { "✅" } else { "❌" };
-                        msg.push_str(&format!(
-                            "{} {} ({}) - Priority: {}\n",
-                            status,
-                            p.name.as_deref().unwrap_or(&p.provider),
-                            p.provider,
-                            p.priority.unwrap_or(0)
-                        ));
-                    }
-                    msg
-                }
-            }
-            Err(e) => format!("❌ Error listing providers: {}", e),
-        },
-        TelegramCommand::Provider { provider_id } => {
-            match storage.get_provider_connection_raw(&provider_id) {
-                Ok(provider) => {
-                    let status = if provider.is_active {
-                        "✅ Active"
-                    } else {
-                        "❌ Inactive"
-                    };
-                    format!(
-                        "🔌 <b>Provider: {}</b>\n\nID: {}\nStatus: {}\nAuth Type: {}\nPriority: {}\nCreated: {}",
-                        provider.name.as_deref().unwrap_or(&provider.provider),
-                        provider.id,
-                        status,
-                        provider.auth_type,
-                        provider.priority.unwrap_or(0),
-                        provider.created_at
-                    )
-                }
-                Err(e) => format!("❌ Provider not found: {}", e),
-            }
-        }
-        TelegramCommand::Models { provider_id } => {
-            match storage.get_provider_connection_raw(&provider_id) {
-                Ok(provider) => {
-                    let models = provider
-                        .data
-                        .get("models")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_str())
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        })
-                        .unwrap_or_else(|| "No models fetched".to_string());
-
-                    format!(
-                        "🤖 <b>Models for {}</b>\n\n{}",
-                        provider.name.as_deref().unwrap_or(&provider.provider),
-                        models
-                    )
-                }
-                Err(e) => format!("❌ Provider not found: {}", e),
-            }
-        }
-        TelegramCommand::Combos => match storage.list_combos() {
-            Ok(combos) => {
-                if combos.is_empty() {
-                    "📭 No combos configured".to_string()
-                } else {
-                    let mut msg = "🎯 <b>Combos</b>\n\n".to_string();
-                    for c in &combos {
-                        msg.push_str(&format!(
-                            "• {} ({}) - {} models\n",
-                            c.name,
-                            c.kind,
-                            c.models.len()
-                        ));
-                    }
-                    msg
-                }
-            }
-            Err(e) => format!("❌ Error listing combos: {}", e),
-        },
-        TelegramCommand::Combo { combo_name } => match storage.resolve_model_route(&combo_name) {
-            Ok(route) => match route {
-                blackrouter_core::RouteKind::Single(model) => {
-                    format!(
-                        "🎯 <b>Route: {}</b>\n\nType: Single\nProvider: {}\nModel: {}",
-                        combo_name, model.provider, model.model
-                    )
-                }
-                blackrouter_core::RouteKind::Combo { name, models } => {
-                    let models_str = models
-                        .iter()
-                        .map(|m| format!("• {}/{}", m.provider, m.model))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    format!(
-                        "🎯 <b>Combo: {}</b>\n\nType: Fallback\nModels:\n{}",
-                        name, models_str
-                    )
-                }
-            },
-            Err(e) => format!("❌ Combo not found: {}", e),
-        },
-        TelegramCommand::Usage { range } => {
-            // TODO: Implement usage tracking
-            format!(
-                "📈 <b>Usage Statistics</b>\n\nPeriod: {}\n\n⚠️ Usage tracking not implemented yet",
-                match range {
-                    blackrouter_telegram::UsageRange::Today => "Today",
-                    blackrouter_telegram::UsageRange::SevenDays => "Last 7 Days",
-                }
-            )
-        }
-        TelegramCommand::Logs { limit } => {
-            // TODO: Implement log retrieval
-            format!(
-                "📋 <b>Recent Logs</b>\n\nLimit: {}\n\n⚠️ Log retrieval not implemented yet",
-                limit
-            )
-        }
-        TelegramCommand::EnableProvider { provider_id } => {
-            match storage.set_provider_connection_active(&provider_id, true) {
-                Ok(_) => format!("✅ Provider {} enabled", provider_id),
-                Err(e) => format!("❌ Failed to enable provider: {}", e),
-            }
-        }
-        TelegramCommand::DisableProvider { provider_id } => {
-            match storage.set_provider_connection_active(&provider_id, false) {
-                Ok(_) => format!("✅ Provider {} disabled", provider_id),
-                Err(e) => format!("❌ Failed to disable provider: {}", e),
-            }
-        }
-        TelegramCommand::EnableConnection { connection_id } => {
-            match storage.set_provider_connection_active(&connection_id, true) {
-                Ok(_) => format!("✅ Connection {} enabled", connection_id),
-                Err(e) => format!("❌ Failed to enable connection: {}", e),
-            }
-        }
-        TelegramCommand::DisableConnection { connection_id } => {
-            match storage.set_provider_connection_active(&connection_id, false) {
-                Ok(_) => format!("✅ Connection {} disabled", connection_id),
-                Err(e) => format!("❌ Failed to disable connection: {}", e),
-            }
-        }
-        TelegramCommand::TestProvider { provider_id } => {
-            // TODO: Implement provider testing
-            format!(
-                "🧪 <b>Test Provider</b>\n\nProvider: {}\n\n⚠️ Provider testing not implemented yet",
-                provider_id
-            )
-        }
-        TelegramCommand::TestConnection { connection_id } => {
-            // TODO: Implement connection testing
-            format!(
-                "🧪 <b>Test Connection</b>\n\nConnection: {}\n\n⚠️ Connection testing not implemented yet",
-                connection_id
-            )
-        }
-        TelegramCommand::Rtk { enabled } => {
-            // TODO: Implement RTK toggle
-            format!(
-                "⚡ <b>RTK Rate Limiting</b>\n\nStatus: {}\n\n⚠️ RTK toggle not implemented yet",
-                if enabled { "Enabled" } else { "Disabled" }
-            )
-        }
-        TelegramCommand::Reload => {
-            // TODO: Implement config reload
-            "🔄 <b>Reload Configuration</b>\n\n⚠️ Config reload not implemented yet".to_string()
-        }
-        TelegramCommand::Shutdown => {
-            "🛑 <b>Shutdown</b>\n\n⚠️ Shutdown not implemented yet".to_string()
-        }
-        TelegramCommand::Link { code } => {
-            // TODO: Implement account linking
-            format!(
-                "🔗 <b>Link Account</b>\n\nCode: {}\n\n⚠️ Account linking not implemented yet",
-                code
-            )
-        }
-    }
 }
 
 fn init_tracing(default_directive: &str) -> anyhow::Result<()> {

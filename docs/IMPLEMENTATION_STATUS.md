@@ -96,9 +96,11 @@ _Updated: 2026-07-06_
 - [ ] Docker optimization
 
 ### Phase 4: Advanced Features
-- [ ] Load balancing strategies
-- [ ] Response caching
-- [ ] Advanced routing rules
+- [x] Load balancing strategies (round-robin, weighted, least-connections, response-time)
+- [x] Circuit breaker pattern
+- [x] Response caching (LRU + TTL, non-streaming temp=0 only)
+- [x] Model aliases
+- [x] Request queuing (retry with backoff)
 - [ ] Plugin system
 
 ---

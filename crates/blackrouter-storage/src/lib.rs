@@ -45,6 +45,7 @@ const COMPAT_TABLES: &[&str] = &[
     "usageHistory",
     "usageDaily",
     "requestDetails",
+    "modelAliases",
 ];
 
 const BLACKROUTER_TABLES: &[&str] = &["adminAuditLog", "telegramLinks", "runtimeEvents"];
@@ -101,6 +102,9 @@ pub struct ProviderConnectionRecord {
     pub email: Option<String>,
     pub priority: Option<i64>,
     pub is_active: bool,
+    pub status: String,
+    pub cooldown_until: Option<String>,
+    pub expires_at: Option<String>,
     pub data: Value,
     pub created_at: String,
     pub updated_at: String,
@@ -114,6 +118,12 @@ pub struct NewProviderConnection {
     pub email: Option<String>,
     pub priority: Option<i64>,
     pub is_active: Option<bool>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub cooldown_until: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
     pub data: Option<Value>,
 }
 
@@ -126,9 +136,20 @@ pub struct RawProviderConnection {
     pub email: Option<String>,
     pub priority: Option<i64>,
     pub is_active: bool,
+    pub status: String,
+    pub cooldown_until: Option<String>,
+    pub expires_at: Option<String>,
     pub data: Value,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CachedProviderModels {
+    pub models: Vec<String>,
+    pub models_url: Option<String>,
+    pub fetched_at: String,
+    pub age_seconds: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -190,6 +211,23 @@ pub struct RequestDetailEntry {
     pub data: String,
 }
 
+/// Model alias record (Phase 4.3 — model aliases)
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ModelAliasRecord {
+    pub id: String,
+    pub alias: String,
+    pub target: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Create a new model alias
+#[derive(Clone, Debug, Deserialize)]
+pub struct NewModelAlias {
+    pub alias: String,
+    pub target: String,
+}
+
 /// Daily usage summary stored in usageDaily table
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DailyUsage {
@@ -222,6 +260,7 @@ impl Storage {
         conn.execute_batch(PRAGMA_SQL)?;
         conn.execute_batch(COMPAT_SCHEMA_SQL)?;
         conn.execute_batch(BLACKROUTER_SCHEMA_SQL)?;
+        migrate_schema(&conn)?;
 
         self.status_with_existing_flag(existed_before_init)
     }
@@ -313,18 +352,60 @@ impl Storage {
         })
     }
 
+    /// Rotate an API key: deactivate old key, create new one with same metadata
+    pub fn rotate_api_key(&self, key_id: &str) -> Result<CreatedApiKey> {
+        let conn = self.open()?;
+        // Get existing key metadata
+        let (name, machine_id): (Option<String>, Option<String>) = conn.query_row(
+            "SELECT name, machineId FROM apiKeys WHERE id = ?1",
+            params![key_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+
+        // Deactivate old key
+        conn.execute(
+            "UPDATE apiKeys SET isActive = 0 WHERE id = ?1",
+            params![key_id],
+        )?;
+
+        // Create new key with same metadata
+        let new_id = new_id();
+        let key = format!("brk_{}", Uuid::new_v4().simple());
+        let created_at = now_text();
+
+        conn.execute(
+            r#"
+            INSERT INTO apiKeys (id, key, name, machineId, isActive, createdAt)
+            VALUES (?1, ?2, ?3, ?4, 1, ?5)
+            "#,
+            params![new_id, key, name, machine_id, created_at],
+        )?;
+
+        Ok(CreatedApiKey {
+            record: ApiKeyRecord {
+                id: new_id,
+                key_masked: mask_secret(&key),
+                name,
+                machine_id,
+                is_active: true,
+                created_at,
+            },
+            key,
+        })
+    }
+
     pub fn list_provider_connections(&self) -> Result<Vec<ProviderConnectionRecord>> {
         let conn = self.open()?;
         let mut stmt = conn.prepare(
             r#"
-            SELECT id, provider, authType, name, email, priority, isActive, data, createdAt, updatedAt
+            SELECT id, provider, authType, name, email, priority, isActive, status, cooldownUntil, expiresAt, data, createdAt, updatedAt
             FROM providerConnections
             ORDER BY provider ASC, COALESCE(priority, 999999) ASC, createdAt DESC
             "#,
         )?;
 
         let rows = stmt.query_map([], |row| {
-            let raw_data: String = row.get(7)?;
+            let raw_data: String = row.get(10)?;
             let data = serde_json::from_str(&raw_data)
                 .map(mask_sensitive_json)
                 .unwrap_or(Value::Object(Default::default()));
@@ -336,9 +417,14 @@ impl Storage {
                 email: row.get(4)?,
                 priority: row.get(5)?,
                 is_active: row.get::<_, i64>(6)? != 0,
+                status: row
+                    .get::<_, Option<String>>(7)?
+                    .unwrap_or_else(|| "unknown".to_string()),
+                cooldown_until: row.get(8)?,
+                expires_at: row.get(9)?,
                 data,
-                created_at: row.get(8)?,
-                updated_at: row.get(9)?,
+                created_at: row.get(11)?,
+                updated_at: row.get(12)?,
             })
         })?;
 
@@ -368,15 +454,18 @@ impl Storage {
         let email = normalize_opt(input.email);
         let priority = input.priority;
         let is_active = input.is_active.unwrap_or(true);
+        let status = normalize_status(input.status.as_deref());
+        let cooldown_until = normalize_opt(input.cooldown_until);
+        let expires_at = normalize_opt(input.expires_at);
         let data = input.data.unwrap_or(Value::Object(Default::default()));
         let raw_data = serde_json::to_string_pretty(&data)?;
 
         conn.execute(
             r#"
             INSERT INTO providerConnections
-              (id, provider, authType, name, email, priority, isActive, data, createdAt, updatedAt)
+              (id, provider, authType, name, email, priority, isActive, status, cooldownUntil, expiresAt, data, createdAt, updatedAt)
             VALUES
-              (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+              (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             "#,
             params![
                 id,
@@ -386,6 +475,9 @@ impl Storage {
                 email,
                 priority,
                 if is_active { 1 } else { 0 },
+                status,
+                cooldown_until,
+                expires_at,
                 raw_data,
                 now,
                 now
@@ -400,6 +492,9 @@ impl Storage {
             email,
             priority,
             is_active,
+            status,
+            cooldown_until,
+            expires_at,
             data: mask_sensitive_json(data),
             created_at: now.clone(),
             updated_at: now,
@@ -410,13 +505,13 @@ impl Storage {
         let conn = self.open()?;
         conn.query_row(
             r#"
-            SELECT id, provider, authType, name, email, priority, isActive, data, createdAt, updatedAt
+            SELECT id, provider, authType, name, email, priority, isActive, status, cooldownUntil, expiresAt, data, createdAt, updatedAt
             FROM providerConnections
             WHERE id = ?1
             "#,
             params![id],
             |row| {
-                let raw_data: String = row.get(7)?;
+                let raw_data: String = row.get(10)?;
                 let data = serde_json::from_str(&raw_data).unwrap_or(Value::Object(Default::default()));
                 Ok(RawProviderConnection {
                     id: row.get(0)?,
@@ -426,9 +521,14 @@ impl Storage {
                     email: row.get(4)?,
                     priority: row.get(5)?,
                     is_active: row.get::<_, i64>(6)? != 0,
+                    status: row
+                        .get::<_, Option<String>>(7)?
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    cooldown_until: row.get(8)?,
+                    expires_at: row.get(9)?,
                     data,
-                    created_at: row.get(8)?,
-                    updated_at: row.get(9)?,
+                    created_at: row.get(11)?,
+                    updated_at: row.get(12)?,
                 })
             },
         )
@@ -443,15 +543,19 @@ impl Storage {
         let conn = self.open()?;
         conn.query_row(
             r#"
-            SELECT id, provider, authType, name, email, priority, isActive, data, createdAt, updatedAt
+            SELECT id, provider, authType, name, email, priority, isActive, status, cooldownUntil, expiresAt, data, createdAt, updatedAt
             FROM providerConnections
-            WHERE provider = ?1 AND isActive = 1
+            WHERE provider = ?1
+              AND isActive = 1
+              AND COALESCE(status, 'unknown') NOT IN ('disabled', 'expired')
+              AND (cooldownUntil IS NULL OR cooldownUntil = '' OR CAST(cooldownUntil AS INTEGER) <= ?2)
+              AND (expiresAt IS NULL OR expiresAt = '' OR CAST(expiresAt AS INTEGER) > ?2)
             ORDER BY COALESCE(priority, 999999) ASC, createdAt DESC
             LIMIT 1
             "#,
-            params![provider],
+            params![provider, now_text()],
             |row| {
-                let raw_data: String = row.get(7)?;
+                let raw_data: String = row.get(10)?;
                 let data =
                     serde_json::from_str(&raw_data).unwrap_or(Value::Object(Default::default()));
                 Ok(RawProviderConnection {
@@ -462,9 +566,14 @@ impl Storage {
                     email: row.get(4)?,
                     priority: row.get(5)?,
                     is_active: row.get::<_, i64>(6)? != 0,
+                    status: row
+                        .get::<_, Option<String>>(7)?
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    cooldown_until: row.get(8)?,
+                    expires_at: row.get(9)?,
                     data,
-                    created_at: row.get(8)?,
-                    updated_at: row.get(9)?,
+                    created_at: row.get(11)?,
+                    updated_at: row.get(12)?,
                 })
             },
         )
@@ -474,6 +583,50 @@ impl Storage {
                 "active provider connection not found: {provider}"
             ))
         })
+    }
+
+    /// List all active provider connections for a given provider name, ordered by priority.
+    /// Used for load balancing (Phase 4.1).
+    pub fn list_active_provider_connections(
+        &self,
+        provider: &str,
+    ) -> Result<Vec<RawProviderConnection>> {
+        let conn = self.open()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, provider, authType, name, email, priority, isActive, status, cooldownUntil, expiresAt, data, createdAt, updatedAt
+            FROM providerConnections
+            WHERE provider = ?1
+              AND isActive = 1
+              AND COALESCE(status, 'unknown') NOT IN ('disabled', 'expired')
+              AND (cooldownUntil IS NULL OR cooldownUntil = '' OR CAST(cooldownUntil AS INTEGER) <= ?2)
+              AND (expiresAt IS NULL OR expiresAt = '' OR CAST(expiresAt AS INTEGER) > ?2)
+            ORDER BY COALESCE(priority, 999999) ASC, createdAt DESC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![provider, now_text()], |row| {
+            let raw_data: String = row.get(10)?;
+            let data = serde_json::from_str(&raw_data).unwrap_or(Value::Object(Default::default()));
+            Ok(RawProviderConnection {
+                id: row.get(0)?,
+                provider: row.get(1)?,
+                auth_type: row.get(2)?,
+                name: row.get(3)?,
+                email: row.get(4)?,
+                priority: row.get(5)?,
+                is_active: row.get::<_, i64>(6)? != 0,
+                status: row
+                    .get::<_, Option<String>>(7)?
+                    .unwrap_or_else(|| "unknown".to_string()),
+                cooldown_until: row.get(8)?,
+                expires_at: row.get(9)?,
+                data,
+                created_at: row.get(11)?,
+                updated_at: row.get(12)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
     }
 
     pub fn update_provider_connection(
@@ -499,6 +652,13 @@ impl Storage {
         let email = normalize_opt(input.email);
         let priority = input.priority;
         let is_active = input.is_active.unwrap_or(existing.is_active);
+        let status = input
+            .status
+            .as_deref()
+            .map(|value| normalize_status(Some(value)))
+            .unwrap_or(existing.status);
+        let cooldown_until = input.cooldown_until.or(existing.cooldown_until);
+        let expires_at = input.expires_at.or(existing.expires_at);
         let data = preserve_sensitive_json(
             existing.data,
             input.data.unwrap_or(Value::Object(Default::default())),
@@ -514,8 +674,11 @@ impl Storage {
                 email = ?5,
                 priority = ?6,
                 isActive = ?7,
-                data = ?8,
-                updatedAt = ?9
+                status = ?8,
+                cooldownUntil = ?9,
+                expiresAt = ?10,
+                data = ?11,
+                updatedAt = ?12
             WHERE id = ?1
             "#,
             params![
@@ -526,6 +689,9 @@ impl Storage {
                 email,
                 priority,
                 if is_active { 1 } else { 0 },
+                status,
+                cooldown_until,
+                expires_at,
                 raw_data,
                 now
             ],
@@ -545,6 +711,9 @@ impl Storage {
             email,
             priority,
             is_active,
+            status,
+            cooldown_until,
+            expires_at,
             data: mask_sensitive_json(data),
             created_at: existing.created_at,
             updated_at: now,
@@ -564,6 +733,9 @@ impl Storage {
             email: existing.email,
             priority: existing.priority,
             is_active: Some(is_active),
+            status: Some(existing.status),
+            cooldown_until: existing.cooldown_until,
+            expires_at: existing.expires_at,
             data: Some(existing.data),
         };
         self.update_provider_connection(id, input)
@@ -596,9 +768,98 @@ impl Storage {
             email: existing.email,
             priority: existing.priority,
             is_active: Some(existing.is_active),
+            status: Some(existing.status),
+            cooldown_until: existing.cooldown_until,
+            expires_at: existing.expires_at,
             data: Some(Value::Object(data)),
         };
         self.update_provider_connection(id, input)
+    }
+
+    pub fn cached_provider_models(
+        &self,
+        id: &str,
+        max_age_seconds: u64,
+    ) -> Result<Option<CachedProviderModels>> {
+        let provider = self.get_provider_connection_raw(id)?;
+        let data = match provider.data {
+            Value::Object(map) => map,
+            _ => return Ok(None),
+        };
+        let models = data
+            .get("models")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|models| !models.is_empty());
+        let Some(models) = models else {
+            return Ok(None);
+        };
+
+        let fetched_at = data
+            .get("modelsFetchedAt")
+            .or_else(|| data.get("models_fetched_at"))
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse::<u64>().ok());
+        let Some(fetched_at) = fetched_at else {
+            return Ok(None);
+        };
+
+        let now = blackrouter_common::unix_timestamp();
+        let age_seconds = now.saturating_sub(fetched_at);
+        if age_seconds > max_age_seconds {
+            return Ok(None);
+        }
+
+        let models_url = data
+            .get("modelsUrl")
+            .or_else(|| data.get("models_url"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+
+        Ok(Some(CachedProviderModels {
+            models,
+            models_url,
+            fetched_at: fetched_at.to_string(),
+            age_seconds,
+        }))
+    }
+
+    pub fn set_provider_runtime_status(
+        &self,
+        id: &str,
+        status: &str,
+        cooldown_until: Option<String>,
+        expires_at: Option<String>,
+    ) -> Result<ProviderConnectionRecord> {
+        let conn = self.open()?;
+        let status = normalize_status(Some(status));
+        let now = now_text();
+        let changed = conn.execute(
+            r#"
+            UPDATE providerConnections
+            SET status = ?2,
+                cooldownUntil = ?3,
+                expiresAt = ?4,
+                updatedAt = ?5
+            WHERE id = ?1
+            "#,
+            params![id, status, cooldown_until, expires_at, now],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::Validation(
+                "provider connection not found".to_string(),
+            ));
+        }
+
+        Ok(provider_record_from_raw(
+            self.get_provider_connection_raw(id)?,
+        ))
     }
 
     pub fn delete_provider_connection(&self, id: &str) -> Result<()> {
@@ -724,6 +985,24 @@ impl Storage {
             return Ok(RouteKind::Single(model_ref));
         }
 
+        // Check model aliases first (Phase 4.3)
+        if let Ok(conn) = self.open() {
+            let alias_target: Option<String> = conn
+                .query_row(
+                    "SELECT target FROM modelAliases WHERE alias = ?1 LIMIT 1",
+                    params![model],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(target) = alias_target {
+                let model_ref = parse_provider_model(&target)
+                    .map_err(|error| StorageError::Validation(error.to_string()))?;
+                let conn = self.open()?;
+                ensure_active_provider(&conn, &model_ref.provider)?;
+                return Ok(RouteKind::Single(model_ref));
+            }
+        }
+
         let combo = self.get_combo_by_name(model)?;
         let models = combo
             .models
@@ -738,6 +1017,140 @@ impl Storage {
             name: combo.name,
             models,
         })
+    }
+
+    // ── Model Aliases (Phase 4.3) ──────────────────────────────────────────
+
+    pub fn list_model_aliases(&self) -> Result<Vec<ModelAliasRecord>> {
+        let conn = self.open()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, alias, target, createdAt, updatedAt
+            FROM modelAliases
+            ORDER BY alias ASC
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ModelAliasRecord {
+                id: row.get(0)?,
+                alias: row.get(1)?,
+                target: row.get(2)?,
+                created_at: row.get(3)?,
+                updated_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
+    pub fn get_model_alias_by_name(&self, alias: &str) -> Result<Option<String>> {
+        let conn = self.open()?;
+        let target: Option<String> = conn
+            .query_row(
+                "SELECT target FROM modelAliases WHERE alias = ?1 LIMIT 1",
+                params![alias],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(target)
+    }
+
+    pub fn create_model_alias(&self, input: NewModelAlias) -> Result<ModelAliasRecord> {
+        let alias = input.alias.trim().to_string();
+        let target = input.target.trim().to_string();
+        if alias.is_empty() || target.is_empty() {
+            return Err(StorageError::Validation(
+                "alias and target are required".to_string(),
+            ));
+        }
+        // Validate target format: must contain "/"
+        if !target.contains('/') {
+            return Err(StorageError::Validation(
+                "target must be in format provider/model".to_string(),
+            ));
+        }
+        // Check for duplicate alias name (also conflicts with combo names)
+        let conn = self.open()?;
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT id FROM modelAliases WHERE alias = ?1 LIMIT 1",
+                params![alias],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if existing.is_some() {
+            return Err(StorageError::Validation(format!(
+                "alias '{}' already exists",
+                alias
+            )));
+        }
+        let id = Uuid::new_v4().to_string();
+        let now = blackrouter_common::unix_timestamp().to_string();
+        conn.execute(
+            r#"
+            INSERT INTO modelAliases (id, alias, target, createdAt, updatedAt)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            params![id, alias, target, now, now],
+        )?;
+        Ok(ModelAliasRecord {
+            id,
+            alias,
+            target,
+            created_at: now.clone(),
+            updated_at: now,
+        })
+    }
+
+    pub fn update_model_alias(&self, id: &str, input: NewModelAlias) -> Result<ModelAliasRecord> {
+        let alias = input.alias.trim().to_string();
+        let target = input.target.trim().to_string();
+        if alias.is_empty() || target.is_empty() {
+            return Err(StorageError::Validation(
+                "alias and target are required".to_string(),
+            ));
+        }
+        if !target.contains('/') {
+            return Err(StorageError::Validation(
+                "target must be in format provider/model".to_string(),
+            ));
+        }
+        let conn = self.open()?;
+        let existing: Option<()> = conn
+            .query_row(
+                "SELECT 1 FROM modelAliases WHERE id = ?1",
+                params![id],
+                |_| Ok(()),
+            )
+            .optional()?;
+        if existing.is_none() {
+            return Err(StorageError::Validation("alias not found".to_string()));
+        }
+        let now = blackrouter_common::unix_timestamp().to_string();
+        conn.execute(
+            r#"
+            UPDATE modelAliases
+            SET alias = ?2, target = ?3, updatedAt = ?4
+            WHERE id = ?1
+            "#,
+            params![id, alias, target, now],
+        )?;
+        Ok(ModelAliasRecord {
+            id: id.to_string(),
+            alias,
+            target,
+            created_at: String::new(), // not needed for response
+            updated_at: now,
+        })
+    }
+
+    pub fn delete_model_alias(&self, id: &str) -> Result<()> {
+        let conn = self.open()?;
+        let changed = conn.execute("DELETE FROM modelAliases WHERE id = ?1", params![id])?;
+        if changed == 0 {
+            return Err(StorageError::Validation("alias not found".to_string()));
+        }
+        Ok(())
     }
 
     pub fn is_valid_api_key(&self, api_key: &str) -> Result<bool> {
@@ -758,11 +1171,10 @@ impl Storage {
         let conn = self.open()?;
         conn.execute(
             "INSERT INTO usageHistory
-             (id, timestamp, provider, model, connectionId, apiKey, endpoint,
+             (timestamp, provider, model, connectionId, apiKey, endpoint,
               promptTokens, completionTokens, cost, status, tokens, meta)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
-                entry.id,
                 entry.timestamp,
                 entry.provider,
                 entry.model,
@@ -777,6 +1189,60 @@ impl Storage {
                 entry.meta,
             ],
         )?;
+        Ok(())
+    }
+
+    /// Record multiple usage entries in a single transaction (Phase 1.4)
+    pub fn record_usages_batch(&self, entries: &[UsageEntry]) -> Result<()> {
+        let conn = self.open()?;
+        let tx = conn.unchecked_transaction()?;
+        for entry in entries {
+            tx.execute(
+                "INSERT INTO usageHistory
+                 (timestamp, provider, model, connectionId, apiKey, endpoint,
+                  promptTokens, completionTokens, cost, status, tokens, meta)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                rusqlite::params![
+                    entry.timestamp,
+                    entry.provider,
+                    entry.model,
+                    entry.connection_id,
+                    entry.api_key,
+                    entry.endpoint,
+                    entry.prompt_tokens,
+                    entry.completion_tokens,
+                    entry.cost,
+                    entry.status,
+                    entry.tokens,
+                    entry.meta,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Record multiple request detail entries in a single transaction (Phase 1.4)
+    pub fn record_request_details_batch(&self, entries: &[RequestDetailEntry]) -> Result<()> {
+        let conn = self.open()?;
+        let tx = conn.unchecked_transaction()?;
+        for entry in entries {
+            tx.execute(
+                "INSERT INTO requestDetails
+                 (id, timestamp, provider, model, connectionId, status, data)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    entry.id,
+                    entry.timestamp,
+                    entry.provider,
+                    entry.model,
+                    entry.connection_id,
+                    entry.status,
+                    entry.data,
+                ],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -806,6 +1272,21 @@ impl Storage {
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| StorageError::Sqlite(e))
+    }
+
+    pub fn total_cost_since(&self, since_unix: u64) -> Result<f64> {
+        let conn = self.open()?;
+        let total = conn.query_row(
+            r#"
+            SELECT COALESCE(SUM(cost), 0)
+            FROM usageHistory
+            WHERE CAST(timestamp AS INTEGER) >= ?1
+              AND COALESCE(status, '') = 'success'
+            "#,
+            params![since_unix],
+            |row| row.get::<_, f64>(0),
+        )?;
+        Ok(total)
     }
 
     /// Record a request detail entry to the requestDetails table (Phase 3.1)
@@ -960,6 +1441,19 @@ impl Storage {
             }
         }
 
+        // Add model aliases to the model list
+        if table_exists(&conn, "modelAliases")? {
+            let mut stmt = conn.prepare("SELECT alias FROM modelAliases ORDER BY alias ASC")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                items.push(ModelListItem {
+                    id: row?,
+                    object: "model",
+                    owned_by: "alias",
+                });
+            }
+        }
+
         Ok(items)
     }
 
@@ -1092,6 +1586,13 @@ fn normalize_opt(value: Option<String>) -> Option<String> {
         .filter(|item| !item.is_empty())
 }
 
+fn normalize_status(value: Option<&str>) -> String {
+    value
+        .map(|item| item.trim().to_ascii_lowercase())
+        .filter(|item| !item.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 struct NormalizedComboInput {
     name: String,
     kind: String,
@@ -1114,11 +1615,39 @@ fn combo_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ComboRecord> {
     })
 }
 
+fn provider_record_from_raw(raw: RawProviderConnection) -> ProviderConnectionRecord {
+    ProviderConnectionRecord {
+        id: raw.id,
+        provider: raw.provider,
+        auth_type: raw.auth_type,
+        name: raw.name,
+        email: raw.email,
+        priority: raw.priority,
+        is_active: raw.is_active,
+        status: raw.status,
+        cooldown_until: raw.cooldown_until,
+        expires_at: raw.expires_at,
+        data: mask_sensitive_json(raw.data),
+        created_at: raw.created_at,
+        updated_at: raw.updated_at,
+    }
+}
+
 fn ensure_active_provider(conn: &Connection, provider: &str) -> Result<()> {
+    let now = now_text();
     let found = conn
         .query_row(
-            "SELECT 1 FROM providerConnections WHERE provider = ?1 AND isActive = 1 LIMIT 1",
-            params![provider],
+            r#"
+            SELECT 1
+            FROM providerConnections
+            WHERE provider = ?1
+              AND isActive = 1
+              AND COALESCE(status, 'unknown') NOT IN ('disabled', 'expired')
+              AND (cooldownUntil IS NULL OR cooldownUntil = '' OR CAST(cooldownUntil AS INTEGER) <= ?2)
+              AND (expiresAt IS NULL OR expiresAt = '' OR CAST(expiresAt AS INTEGER) > ?2)
+            LIMIT 1
+            "#,
+            params![provider, now],
             |_| Ok(()),
         )
         .optional()?
@@ -1202,6 +1731,46 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
     Ok(exists)
 }
 
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    if !column_exists(conn, table, column)? {
+        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {definition}"), [])?;
+    }
+    Ok(())
+}
+
+fn migrate_schema(conn: &Connection) -> Result<()> {
+    add_column_if_missing(
+        conn,
+        "providerConnections",
+        "status",
+        "status TEXT DEFAULT 'unknown'",
+    )?;
+    add_column_if_missing(
+        conn,
+        "providerConnections",
+        "cooldownUntil",
+        "cooldownUntil TEXT",
+    )?;
+    add_column_if_missing(conn, "providerConnections", "expiresAt", "expiresAt TEXT")?;
+    Ok(())
+}
+
 fn count_rows(conn: &Connection, table: &str) -> Result<i64> {
     let sql = format!("SELECT COUNT(*) FROM {table}");
     conn.query_row(&sql, [], |row| row.get::<_, i64>(0))
@@ -1227,6 +1796,9 @@ CREATE TABLE IF NOT EXISTS providerConnections (
   email TEXT,
   priority INTEGER,
   isActive INTEGER DEFAULT 1,
+  status TEXT DEFAULT 'unknown',
+  cooldownUntil TEXT,
+  expiresAt TEXT,
   data TEXT NOT NULL,
   createdAt TEXT NOT NULL,
   updatedAt TEXT NOT NULL
@@ -1322,6 +1894,15 @@ CREATE INDEX IF NOT EXISTS idx_rd_ts ON requestDetails(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_rd_provider ON requestDetails(provider);
 CREATE INDEX IF NOT EXISTS idx_rd_model ON requestDetails(model);
 CREATE INDEX IF NOT EXISTS idx_rd_conn ON requestDetails(connectionId);
+
+CREATE TABLE IF NOT EXISTS modelAliases (
+  id TEXT PRIMARY KEY,
+  alias TEXT UNIQUE NOT NULL,
+  target TEXT NOT NULL,
+  createdAt TEXT NOT NULL,
+  updatedAt TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ma_alias ON modelAliases(alias);
 "#;
 
 const BLACKROUTER_SCHEMA_SQL: &str = r#"
@@ -1384,6 +1965,9 @@ mod tests {
             email: None,
             priority: None,
             is_active: Some(true),
+            status: None,
+            cooldown_until: None,
+            expires_at: None,
             data: Some(json!({
                 "baseUrl": "http://127.0.0.1:20130/health",
                 "format": "openai"
@@ -1489,6 +2073,72 @@ mod tests {
             models: vec!["cline/model-a".to_string()],
         });
         assert!(disabled.is_err());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn provider_cooldown_and_expiry_block_active_routes() {
+        let (storage, path) = temp_storage("provider-runtime-status");
+        let future = (blackrouter_common::unix_timestamp() + 60).to_string();
+        let mut provider = active_provider("cline");
+        provider.status = Some("cooldown".to_string());
+        provider.cooldown_until = Some(future);
+        storage
+            .create_provider_connection(provider)
+            .expect("provider creates");
+
+        assert!(storage.get_active_provider_connection_raw("cline").is_err());
+        assert!(storage.resolve_model_route("cline/model-a").is_err());
+
+        let record = storage.list_provider_connections().unwrap().remove(0);
+        storage
+            .set_provider_runtime_status(&record.id, "healthy", None, None)
+            .expect("runtime status updates");
+        assert!(storage.get_active_provider_connection_raw("cline").is_ok());
+
+        let past = (blackrouter_common::unix_timestamp().saturating_sub(1)).to_string();
+        storage
+            .set_provider_runtime_status(&record.id, "expired", None, Some(past))
+            .expect("expiry updates");
+        assert!(storage.get_active_provider_connection_raw("cline").is_err());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn cached_provider_models_respects_ttl() {
+        let (storage, path) = temp_storage("provider-model-cache");
+        let fetched_at = (blackrouter_common::unix_timestamp().saturating_sub(100)).to_string();
+        let mut provider = active_provider("cline");
+        provider.data = Some(json!({
+            "baseUrl": "http://127.0.0.1:20130/health",
+            "format": "openai",
+            "models": ["cline/model-a", "cline/model-b"],
+            "modelsUrl": "https://example.test/models",
+            "modelsFetchedAt": fetched_at
+        }));
+        let record = storage
+            .create_provider_connection(provider)
+            .expect("provider creates");
+
+        let cached = storage
+            .cached_provider_models(&record.id, 200)
+            .expect("cache lookup")
+            .expect("fresh cache exists");
+        assert_eq!(
+            cached.models,
+            vec!["cline/model-a".to_string(), "cline/model-b".to_string()]
+        );
+        assert_eq!(
+            cached.models_url.as_deref(),
+            Some("https://example.test/models")
+        );
+
+        assert!(storage
+            .cached_provider_models(&record.id, 10)
+            .expect("cache lookup")
+            .is_none());
 
         let _ = fs::remove_file(path);
     }

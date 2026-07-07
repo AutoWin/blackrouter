@@ -10,6 +10,26 @@ const state = {
   combos: null,
 };
 
+const ANTIGRAVITY_MODELS = [
+  "gemini-3-flash-agent",
+  "gemini-3.5-flash-low",
+  "gemini-3.5-flash-extra-low",
+  "gemini-pro-agent",
+  "gemini-3.1-pro-low",
+  "claude-sonnet-4-6",
+  "claude-opus-4-6-thinking",
+  "gpt-oss-120b-medium",
+  "gemini-3-flash",
+  "gemini-2.0-flash-lite",
+  "gemini-2.0-flash",
+  "gemini-2.5-flash",
+  "gemini-1.5-flash",
+  "gemini-1.5-pro",
+  "gemini-2.5-pro",
+  "gemini-3-flash-preview",
+  "gemini-3-pro-preview",
+];
+
 const $ = (id) => document.getElementById(id);
 
 function setValue(id, value) {
@@ -64,18 +84,27 @@ async function sendJson(path, method, body) {
 async function refresh() {
   setBadge("healthBadge", "Checking", "muted");
 
-  const [health, version, runtime, models, setupConfig, apiKeys, providers, providerCatalog, combos] =
-    await Promise.all([
-      getJson("/health"),
-      getJson("/version"),
-      getJson("/api/runtime/status"),
-      getJson("/v1/models"),
-      getJson("/api/setup/config"),
-      getJson("/api/setup/api-keys"),
-      getJson("/api/setup/providers"),
-      getJson("/api/setup/provider-catalog"),
-      getJson("/api/setup/combos"),
-    ]);
+  const [
+    health,
+    version,
+    runtime,
+    models,
+    setupConfig,
+    apiKeys,
+    providers,
+    providerCatalog,
+    combos,
+  ] = await Promise.all([
+    getJson("/health"),
+    getJson("/version"),
+    getJson("/api/runtime/status"),
+    getJson("/v1/models"),
+    getJson("/api/setup/config"),
+    getJson("/api/setup/api-keys"),
+    getJson("/api/setup/providers"),
+    getJson("/api/setup/provider-catalog"),
+    getJson("/api/setup/combos"),
+  ]);
 
   state.health = health;
   state.version = version;
@@ -99,13 +128,20 @@ function render() {
   const savedTelegram = savedSettings.telegram || {};
   const models = Array.isArray(state.models?.data) ? state.models.data : [];
   const apiKeys = Array.isArray(state.apiKeys?.data) ? state.apiKeys.data : [];
-  const providers = Array.isArray(state.providers?.data) ? state.providers.data : [];
-  const catalog = Array.isArray(state.providerCatalog) ? state.providerCatalog : [];
+  const providers = Array.isArray(state.providers?.data)
+    ? state.providers.data
+    : [];
+  const catalog = Array.isArray(state.providerCatalog)
+    ? state.providerCatalog
+    : [];
   const combos = Array.isArray(state.combos?.data) ? state.combos.data : [];
   const tableCounts = storage.table_counts || {};
 
   setText("versionLabel", state.version?.version || "0.1.0");
-  setText("endpointLabel", `${config.host || "127.0.0.1"}:${config.port || ""}`);
+  setText(
+    "endpointLabel",
+    `${config.host || "127.0.0.1"}:${config.port || ""}`,
+  );
   setText("uptimeLabel", formatSeconds(runtime.uptime_seconds));
 
   setBadge(
@@ -118,7 +154,10 @@ function render() {
   setValue("portValue", config.port);
   setValue("dataDirValue", config.data_dir);
   setValue("databaseUrlValue", config.database_url);
-  setValue("databasePathValue", storage.database_path || state.health?.database?.path);
+  setValue(
+    "databasePathValue",
+    storage.database_path || state.health?.database?.path,
+  );
   setValue("compatValue", formatBool(config.compat_9router_db));
 
   setBadge(
@@ -131,42 +170,83 @@ function render() {
   $("configRequireApiKey").checked = savedRequireApiKey;
   setValue("requireApiKeyValue", formatBool(savedRequireApiKey));
   setValue("apiKeyCountValue", apiKeys.length);
-  setBadge("apiKeyBadge", savedRequireApiKey ? "Required" : "Local Mode", savedRequireApiKey ? "ok" : "warn");
+  setBadge(
+    "apiKeyBadge",
+    savedRequireApiKey ? "Required" : "Local Mode",
+    savedRequireApiKey ? "ok" : "warn",
+  );
 
-  $("telegramEnabledInput").checked = Boolean(savedTelegram.enabled ?? telegram.enabled);
-  $("telegramAdminInput").value = Array.isArray(savedTelegram.adminIds) ? savedTelegram.adminIds.join(",") : "";
-  $("telegramWebhookInput").checked = Boolean(savedTelegram.useWebhook ?? telegram.use_webhook);
-  $("telegramTtlInput").value = savedTelegram.linkCodeTtlSeconds || telegram.link_code_ttl_seconds || 300;
+  $("telegramEnabledInput").checked = Boolean(
+    savedTelegram.enabled ?? telegram.enabled,
+  );
+  $("telegramAdminInput").value = Array.isArray(savedTelegram.adminIds)
+    ? savedTelegram.adminIds.join(",")
+    : "";
+  $("telegramWebhookInput").checked = Boolean(
+    savedTelegram.useWebhook ?? telegram.use_webhook,
+  );
+  $("telegramTtlInput").value =
+    savedTelegram.linkCodeTtlSeconds || telegram.link_code_ttl_seconds || 300;
   $("telegramWebhookUrlInput").value = savedTelegram.webhookUrl || "";
-  setBadge("telegramBadge", $("telegramEnabledInput").checked ? "Enabled" : "Disabled", $("telegramEnabledInput").checked ? "ok" : "muted");
+  setBadge(
+    "telegramBadge",
+    $("telegramEnabledInput").checked ? "Enabled" : "Disabled",
+    $("telegramEnabledInput").checked ? "ok" : "muted",
+  );
 
-  setBadge("modelsBadge", `${models.length} models`, models.length ? "ok" : "muted");
-  setBadge("combosBadge", `${combos.length} combos`, combos.length ? "ok" : "muted");
+  setBadge(
+    "modelsBadge",
+    `${models.length} models`,
+    models.length ? "ok" : "muted",
+  );
+  setBadge(
+    "combosBadge",
+    `${combos.length} combos`,
+    combos.length ? "ok" : "muted",
+  );
 
   renderProviderCatalog(catalog);
-  renderRows("tableCounts", Object.entries(tableCounts).map(([name, count]) => ({ name, value: count })), "No tables");
-  renderRows("apiKeysList", apiKeys.map((key) => ({ name: key.name || key.id, value: key.key_masked })), "No API keys");
+  renderRows(
+    "tableCounts",
+    Object.entries(tableCounts).map(([name, count]) => ({
+      name,
+      value: count,
+    })),
+    "No tables",
+  );
+  renderRows(
+    "apiKeysList",
+    apiKeys.map((key) => ({ name: key.name || key.id, value: key.key_masked })),
+    "No API keys",
+  );
   renderProviders(providers);
-  renderRows("modelsList", models.map((model) => ({ name: model.id, value: model.owned_by || "blackrouter" })), "No models");
+  renderRows(
+    "modelsList",
+    models.map((model) => ({
+      name: model.id,
+      value: model.owned_by || "blackrouter",
+    })),
+    "No models",
+  );
   renderComboModelOptions(providers);
   renderCombos(combos);
-  renderRows("comboModelsList", models.map((model) => ({ name: model.id, value: model.owned_by || "blackrouter" })), "No models");
+  renderRows(
+    "comboModelsList",
+    models.map((model) => ({
+      name: model.id,
+      value: model.owned_by || "blackrouter",
+    })),
+    "No models",
+  );
 }
 
 function renderProviderCatalog(catalog) {
   const select = $("providerPresetInput");
   if (!select || select.dataset.rendered === "true") return;
 
-  const required = catalog.filter((item) => item.required);
-  const popular = catalog.filter((item) => !item.required);
   select.innerHTML = [
     `<option value="">Custom provider</option>`,
-    `<optgroup label="Required">`,
-    ...required.map(providerOption),
-    `</optgroup>`,
-    `<optgroup label="Popular">`,
-    ...popular.map(providerOption),
-    `</optgroup>`,
+    ...catalog.map(providerOption),
   ].join("");
   select.dataset.rendered = "true";
 }
@@ -252,17 +332,29 @@ function renderComboModelOptions(providers) {
     `<option value="">Select fetched provider model</option>`,
     ...options
       .sort((a, b) => a.label.localeCompare(b.label))
-      .map((option) => `<option value="${escapeHtml(option.value)}">${escapeHtml(option.label)}</option>`),
+      .map(
+        (option) =>
+          `<option value="${escapeHtml(option.value)}">${escapeHtml(option.label)}</option>`,
+      ),
   ].join("");
 }
 
 function providerModelIds(provider) {
   const models = provider?.data?.models;
-  if (!Array.isArray(models)) return [];
+  if (!Array.isArray(models) || models.length === 0) {
+    const providerId = String(provider?.provider || "").toLowerCase();
+    const alias = String(provider?.data?.alias || "").toLowerCase();
+    const format = String(provider?.data?.format || "").toLowerCase();
+    if (providerId === "antigravity" || alias === "ag" || format === "antigravity") {
+      return [...ANTIGRAVITY_MODELS];
+    }
+    return [];
+  }
   return models
     .map((model) => {
       if (typeof model === "string") return model.trim();
-      if (model && typeof model === "object") return String(model.id || model.name || model.model || "").trim();
+      if (model && typeof model === "object")
+        return String(model.id || model.name || model.model || "").trim();
       return "";
     })
     .filter(Boolean);
@@ -315,8 +407,14 @@ function bindTabs() {
   document.querySelectorAll(".tab").forEach((tab) => {
     tab.addEventListener("click", () => {
       const panelId = tab.dataset.panel;
-      document.querySelectorAll(".tab").forEach((item) => item.classList.toggle("active", item === tab));
-      document.querySelectorAll(".panel").forEach((panel) => panel.classList.toggle("active", panel.id === panelId));
+      document
+        .querySelectorAll(".tab")
+        .forEach((item) => item.classList.toggle("active", item === tab));
+      document
+        .querySelectorAll(".panel")
+        .forEach((panel) =>
+          panel.classList.toggle("active", panel.id === panelId),
+        );
     });
   });
 }
@@ -356,17 +454,33 @@ $("providerForm").addEventListener("submit", async (event) => {
   const rawData = $("providerDataInput").value.trim();
   if (rawData) advancedData = JSON.parse(rawData);
 
-  const apiKey = $("providerApiKeyInput").value.trim();
+  const authType = $("authTypeInput").value;
   const data = {
     ...advancedData,
     baseUrl: $("providerBaseUrlInput").value.trim() || advancedData.baseUrl,
     format: $("providerFormatInput").value.trim() || advancedData.format,
   };
-  if (apiKey) data.apiKey = apiKey;
+
+  if (authType === "api-key" || authType === "bearer" || authType === "oauth") {
+    const apiKey = $("providerApiKeyInput").value.trim();
+    if (apiKey) data.apiKey = apiKey;
+  } else if (authType === "basic") {
+    const username = $("providerBasicUserInput").value.trim();
+    const password = $("providerBasicPassInput").value;
+    if (username) data.username = username;
+    if (password) data.password = password;
+  } else if (authType === "header") {
+    const headerName = $("providerHeaderNameInput").value.trim();
+    const headerValue = $("providerHeaderValueInput").value.trim();
+    if (headerName) data.headerName = headerName;
+    if (headerValue) data.headerValue = headerValue;
+  }
 
   const editId = $("providerEditIdInput").value;
   const method = editId ? "PUT" : "POST";
-  const path = editId ? `/api/setup/providers/${encodeURIComponent(editId)}` : "/api/setup/providers";
+  const path = editId
+    ? `/api/setup/providers/${encodeURIComponent(editId)}`
+    : "/api/setup/providers";
 
   await sendJson(path, method, {
     provider: $("providerInput").value,
@@ -383,10 +497,14 @@ $("providerForm").addEventListener("submit", async (event) => {
 
 $("providerCancelEditButton").addEventListener("click", resetProviderForm);
 
+$("providerInput").addEventListener("input", () => {
+  showOauthButton($("providerInput").value);
+});
+
 $("comboForm").addEventListener("submit", async (event) => {
   event.preventDefault();
-  let models = $("comboModelsInput").value
-    .split(/\r?\n/)
+  let models = $("comboModelsInput")
+    .value.split(/\r?\n/)
     .map((item) => item.trim())
     .filter(Boolean);
   const selectedModel = $("comboModelSelect").value;
@@ -398,7 +516,9 @@ $("comboForm").addEventListener("submit", async (event) => {
   }
   const editId = $("comboEditIdInput").value;
   const method = editId ? "PUT" : "POST";
-  const path = editId ? `/api/setup/combos/${encodeURIComponent(editId)}` : "/api/setup/combos";
+  const path = editId
+    ? `/api/setup/combos/${encodeURIComponent(editId)}`
+    : "/api/setup/combos";
 
   await sendJson(path, method, {
     name: $("comboNameInput").value,
@@ -439,9 +559,13 @@ $("providersList").addEventListener("click", async (event) => {
   }
 
   if (action === "toggle") {
-    await sendJson(`/api/setup/providers/${encodeURIComponent(id)}/toggle`, "POST", {
-      is_active: button.dataset.active === "true",
-    });
+    await sendJson(
+      `/api/setup/providers/${encodeURIComponent(id)}/toggle`,
+      "POST",
+      {
+        is_active: button.dataset.active === "true",
+      },
+    );
     await refresh();
     return;
   }
@@ -478,17 +602,28 @@ $("combosList").addEventListener("click", async (event) => {
 });
 
 $("providerPresetInput").addEventListener("change", () => {
-  const catalog = Array.isArray(state.providerCatalog) ? state.providerCatalog : [];
-  const preset = catalog.find((item) => item.id === $("providerPresetInput").value);
+  const catalog = Array.isArray(state.providerCatalog)
+    ? state.providerCatalog
+    : [];
+  const preset = catalog.find(
+    (item) => item.id === $("providerPresetInput").value,
+  );
   if (!preset) return;
 
   $("providerInput").value = preset.id;
   $("authTypeInput").value = preset.auth_type;
+  showOauthButton(preset.id);
+  updateAuthFields();
   $("providerBaseUrlInput").value = preset.base_url;
   $("providerFormatInput").value = preset.format;
   $("providerNameInput").value = preset.name;
-  $("providerApiKeyInput").placeholder = preset.api_key_hint || "provider API key or access token";
-  $("providerDataInput").value = JSON.stringify(defaultProviderData(preset), null, 2);
+  $("providerApiKeyInput").placeholder =
+    preset.api_key_hint || "provider API key or access token";
+  $("providerDataInput").value = JSON.stringify(
+    defaultProviderData(preset),
+    null,
+    2,
+  );
 });
 
 function defaultProviderData(preset) {
@@ -516,11 +651,17 @@ function defaultProviderData(preset) {
     data.refreshUrl = "https://api.cline.bot/api/v1/auth/refresh";
   }
 
+  if (preset.id === "antigravity") {
+    data.models = [...ANTIGRAVITY_MODELS];
+  }
+
   return data;
 }
 
 function editProvider(id) {
-  const providers = Array.isArray(state.providers?.data) ? state.providers.data : [];
+  const providers = Array.isArray(state.providers?.data)
+    ? state.providers.data
+    : [];
   const provider = providers.find((item) => item.id === id);
   if (!provider) return;
 
@@ -528,33 +669,61 @@ function editProvider(id) {
   $("providerPresetInput").value = provider.provider;
   $("providerInput").value = provider.provider;
   $("authTypeInput").value = provider.auth_type;
+  updateAuthFields();
   $("providerBaseUrlInput").value = provider.data?.baseUrl || "";
   $("providerFormatInput").value = provider.data?.format || "";
   $("providerNameInput").value = provider.name || "";
   $("providerPriorityInput").value = provider.priority ?? "";
   $("providerApiKeyInput").value = "";
+  $("providerBasicUserInput").value = provider.data?.username || "";
+  $("providerBasicPassInput").value = "";
+  $("providerHeaderNameInput").value = provider.data?.headerName || "";
+  $("providerHeaderValueInput").value = "";
   $("providerActiveInput").checked = Boolean(provider.is_active);
   $("providerDataInput").value = JSON.stringify(provider.data || {}, null, 2);
   $("providerSubmitButton").textContent = "Save Provider";
   $("providerCancelEditButton").classList.remove("hidden");
+  showOauthButton(provider.provider);
   setBadge("modelsBadge", "Editing provider", "warn");
 }
 
 function resetProviderForm() {
   $("providerEditIdInput").value = "";
   $("providerInput").value = "";
-  $("authTypeInput").value = "";
+  $("authTypeInput").value = "api-key";
   $("providerBaseUrlInput").value = "";
   $("providerFormatInput").value = "";
   $("providerNameInput").value = "";
   $("providerPriorityInput").value = "";
   $("providerApiKeyInput").value = "";
+  $("providerBasicUserInput").value = "";
+  $("providerBasicPassInput").value = "";
+  $("providerHeaderNameInput").value = "";
+  $("providerHeaderValueInput").value = "";
   $("providerDataInput").value = "";
   $("providerActiveInput").checked = true;
   $("providerPresetInput").value = "";
   $("providerSubmitButton").textContent = "Add Provider";
   $("providerCancelEditButton").classList.add("hidden");
+  showOauthButton("");
+  updateAuthFields();
 }
+
+function updateAuthFields() {
+  const authType = $("authTypeInput").value;
+  const showApiKey =
+    authType === "api-key" || authType === "bearer" || authType === "oauth";
+  const showBasic = authType === "basic";
+  const showHeader = authType === "header";
+
+  $("apiKeyField").style.display = showApiKey ? "" : "none";
+  $("basicUserField").style.display = showBasic ? "" : "none";
+  $("basicPassField").style.display = showBasic ? "" : "none";
+  $("headerNameField").style.display = showHeader ? "" : "none";
+  $("headerValueField").style.display = showHeader ? "" : "none";
+}
+
+$("authTypeInput").addEventListener("change", updateAuthFields);
 
 function editCombo(id) {
   const combos = Array.isArray(state.combos?.data) ? state.combos.data : [];
@@ -564,7 +733,9 @@ function editCombo(id) {
   $("comboEditIdInput").value = combo.id;
   $("comboNameInput").value = combo.name || "";
   $("comboKindInput").value = combo.kind || "llm";
-  $("comboModelsInput").value = Array.isArray(combo.models) ? combo.models.join("\n") : "";
+  $("comboModelsInput").value = Array.isArray(combo.models)
+    ? combo.models.join("\n")
+    : "";
   $("comboSubmitButton").textContent = "Save Combo";
   $("comboCancelEditButton").classList.remove("hidden");
   setBadge("combosBadge", "Editing combo", "warn");
@@ -583,9 +754,135 @@ async function checkProvider(id) {
   const notice = $("providerTestNotice");
   notice.textContent = "Checking provider connection...";
   notice.classList.remove("hidden");
-  const result = await sendJson(`/api/setup/providers/${encodeURIComponent(id)}/test`, "POST", {});
+  const result = await sendJson(
+    `/api/setup/providers/${encodeURIComponent(id)}/test`,
+    "POST",
+    {},
+  );
   notice.textContent = `${result.ok ? "OK" : "Check failed"}: ${result.message}${result.status ? ` (HTTP ${result.status})` : ""}`;
   notice.classList.toggle("error", !result.ok);
+}
+
+async function startOAuth(providerId) {
+  const notice = $("oauthNotice");
+  notice.textContent = "Starting OAuth flow...";
+  notice.classList.remove("hidden");
+  notice.classList.remove("error");
+
+  try {
+    const resp = await fetch(
+      `/api/oauth/${encodeURIComponent(providerId)}/start`,
+      { method: "POST" },
+    );
+    const result = await resp.json();
+
+    if (!resp.ok) {
+      notice.textContent = "❌ " + (result.error || "Failed to start OAuth");
+      notice.classList.add("error");
+      return;
+    }
+
+    if (result.flow_type === "device_code") {
+      // Show device code UI
+      notice.innerHTML = [
+        "<strong>Login with " + result.provider + "</strong>",
+        "<p>1. Open this URL:</p>",
+        `<a href="${escapeHtml(result.verification_uri)}" target="_blank" rel="noopener">${escapeHtml(result.verification_uri)}</a>`,
+        "<p>2. Enter this code:</p>",
+        `<div class="oauth-code">${escapeHtml(result.user_code)}</div>`,
+        "<p>3. Waiting for authorization...</p>",
+      ].join("");
+
+      // Poll for token
+      pollOAuthToken(providerId, result.state, 5000);
+    } else {
+      // Authorization code flow: open browser
+      notice.textContent =
+        "Opening browser for " + result.provider + " login...";
+      window.open(result.url, "_blank", "width=600,height=700");
+      notice.innerHTML =
+        "<strong>Login with " +
+        result.provider +
+        "</strong><p>Complete authorization in the opened window.</p><p>Waiting for token...</p>";
+
+      // Poll for token
+      pollOAuthToken(providerId, result.state, 2000);
+    }
+  } catch (error) {
+    notice.textContent = "❌ OAuth failed: " + error.message;
+    notice.classList.add("error");
+  }
+}
+
+async function pollOAuthToken(providerId, state, interval) {
+  for (let i = 0; i < 60; i++) {
+    await new Promise((r) => setTimeout(r, interval));
+    try {
+      const resp = await fetch(
+        `/api/oauth/${encodeURIComponent(providerId)}/status?state=${encodeURIComponent(state)}`,
+      );
+      const data = await resp.json();
+
+      if (data.status === "done" && data.access_token) {
+        $("providerApiKeyInput").value = data.access_token;
+        // Store project_id in provider data for Antigravity
+        if (data.project_id) {
+          try {
+            const existing = JSON.parse($("providerDataInput").value || "{}");
+            existing.projectId = data.project_id;
+            $("providerDataInput").value = JSON.stringify(existing, null, 2);
+          } catch (e) {}
+        }
+        const extra = data.project_id ? ` (Project: ${data.project_id})` : "";
+        $("oauthNotice").innerHTML =
+          `<strong>✅ Token received!</strong>${extra} Fill remaining fields and save.`;
+        $("oauthNotice").classList.remove("error");
+        return;
+      }
+      if (data.status === "error") {
+        $("oauthNotice").textContent =
+          "❌ OAuth error: " + (data.error || "Unknown");
+        $("oauthNotice").classList.add("error");
+        return;
+      }
+    } catch (e) {
+      // Continue polling
+    }
+  }
+  $("oauthNotice").innerHTML =
+    "<strong>⏰ Login timed out.</strong> Please try again.";
+  $("oauthNotice").classList.add("error");
+}
+
+function showOauthButton(providerId) {
+  const btn = $("oauthGithubButton");
+  if (!btn) return;
+
+  const normalizedProviderId = (providerId || "").trim().toLowerCase();
+  const oauthProviders = [
+    "github",
+    "codex",
+    "openai",
+    "google",
+    "gemini",
+    "antigravity",
+  ];
+  if (oauthProviders.includes(normalizedProviderId)) {
+    btn.style.display = "";
+    const labels = {
+      github: "🔑 Login with GitHub",
+      codex: "🔑 Login with OpenAI",
+      openai: "🔑 Login with OpenAI",
+      google: "🔑 Login with Google",
+      gemini: "🔑 Login with Google",
+      antigravity: "🔑 Login with Google",
+    };
+    btn.textContent = labels[normalizedProviderId] || "🔑 OAuth Login";
+    btn.onclick = () => startOAuth(normalizedProviderId);
+  } else {
+    btn.style.display = "none";
+    btn.onclick = null;
+  }
 }
 
 async function fetchProviderModels(id) {
@@ -594,7 +891,11 @@ async function fetchProviderModels(id) {
   notice.classList.remove("hidden");
   notice.classList.remove("error");
   try {
-    const result = await sendJson(`/api/setup/providers/${encodeURIComponent(id)}/models`, "POST", {});
+    const result = await sendJson(
+      `/api/setup/providers/${encodeURIComponent(id)}/models`,
+      "POST",
+      {},
+    );
     notice.textContent = `OK: ${result.message} from ${result.models_url}`;
     notice.classList.remove("error");
     await refresh();
@@ -605,7 +906,9 @@ async function fetchProviderModels(id) {
 }
 
 function showProviderModels(id) {
-  const providers = Array.isArray(state.providers?.data) ? state.providers.data : [];
+  const providers = Array.isArray(state.providers?.data)
+    ? state.providers.data
+    : [];
   const provider = providers.find((item) => item.id === id);
   if (!provider) return;
 
@@ -619,8 +922,8 @@ function showProviderModels(id) {
 }
 
 function addComboModel(model) {
-  const current = $("comboModelsInput").value
-    .split(/\r?\n/)
+  const current = $("comboModelsInput")
+    .value.split(/\r?\n/)
     .map((item) => item.trim())
     .filter(Boolean);
   if (!current.includes(model)) current.push(model);
@@ -664,3 +967,38 @@ refresh().catch((error) => {
   setBadge("healthBadge", "Offline", "error");
   console.error(error);
 });
+
+// Handle OAuth callback: if URL has ?token=..., fill it in
+(function () {
+  const params = new URLSearchParams(window.location.search);
+  const token = params.get("token");
+  const provider = params.get("provider");
+
+  if (token && provider) {
+    // Restore form state
+    const saved = sessionStorage.getItem("oauthProviderForm");
+    if (saved) {
+      try {
+        const data = JSON.parse(saved);
+        $("providerInput").value = data.provider;
+        $("providerNameInput").value = data.name;
+        $("providerBaseUrlInput").value = data.baseUrl;
+        $("providerFormatInput").value = data.format;
+        $("providerPriorityInput").value = data.priority;
+      } catch (e) {}
+      sessionStorage.removeItem("oauthProviderForm");
+    }
+
+    // Fill the token
+    $("providerApiKeyInput").value = token;
+    $("oauthNotice").textContent =
+      "✅ Token received from " +
+      provider +
+      "! Fill remaining fields and save.";
+    $("oauthNotice").classList.remove("hidden");
+    $("oauthNotice").classList.remove("error");
+
+    // Clean URL
+    window.history.replaceState({}, document.title, window.location.pathname);
+  }
+})();

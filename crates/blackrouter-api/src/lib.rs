@@ -1,17 +1,25 @@
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use blackrouter_common::{unix_timestamp, BuildInfo};
 use blackrouter_config::AppConfig;
 use blackrouter_core::{ModelRef, RouteKind};
-use blackrouter_rtk::{RateLimitConfig, RequestKey, Rtk};
+use blackrouter_providers::{
+    builtin_provider_models as registry_builtin_provider_models, provider_profiles,
+    BuiltinProviderModels, ProviderProfile,
+};
+use blackrouter_rtk::{LoadBalanceStrategy, RateLimitConfig, RequestKey, ResponseCache, Rtk};
 use blackrouter_storage::{
-    ApiKeyRecord, ComboRecord, CreatedApiKey, DailyUsage, ModelListItem, NewApiKey, NewCombo,
-    NewProviderConnection, ProviderConnectionRecord, RawProviderConnection, RequestDetailEntry,
-    Storage, StorageError, StorageStatus, UsageEntry,
+    ApiKeyRecord, CachedProviderModels, ComboRecord, CreatedApiKey, DailyUsage, ModelAliasRecord,
+    ModelListItem, NewApiKey, NewCombo, NewModelAlias, NewProviderConnection,
+    ProviderConnectionRecord, RawProviderConnection, RequestDetailEntry, Storage, StorageError,
+    StorageStatus, UsageEntry,
+};
+use blackrouter_telegram::{
+    TelegramBot, TelegramBotConfig, TelegramRuntime, Update as TelegramUpdate,
 };
 use blackrouter_translator::{
     chat_response_to_responses, responses_request_to_chat, stream::translate_sse_stream,
@@ -19,13 +27,98 @@ use blackrouter_translator::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::sync::Arc;
 use std::time::Duration;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
+use prometheus::{
+    register_histogram_vec, register_int_counter_vec, register_int_gauge, Encoder, HistogramVec,
+    IntCounterVec, IntGauge, Registry, TextEncoder,
+};
+
+mod oauth;
+
 const MAX_REQUEST_BYTES: usize = 50 * 1024 * 1024;
+
+#[derive(Clone)]
+pub struct Metrics {
+    pub registry: Arc<Registry>,
+    pub requests_total: IntCounterVec,
+    pub request_duration: HistogramVec,
+    pub stream_ttfb: HistogramVec,
+    pub tokens_total: IntCounterVec,
+    pub open_connections: IntGauge,
+}
+
+impl Metrics {
+    pub fn new() -> Self {
+        let registry = Arc::new(Registry::new());
+
+        let requests_total = register_int_counter_vec!(
+            "blackrouter_requests_total",
+            "Total number of requests",
+            &["provider", "model", "status"]
+        )
+        .unwrap();
+
+        let request_duration = register_histogram_vec!(
+            "blackrouter_request_duration_seconds",
+            "Request duration in seconds",
+            &["provider", "model"],
+            vec![0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0]
+        )
+        .unwrap();
+
+        let stream_ttfb = register_histogram_vec!(
+            "blackrouter_stream_ttfb_seconds",
+            "Time to first byte for streaming requests",
+            &["provider", "model"],
+            vec![0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0]
+        )
+        .unwrap();
+
+        let tokens_total = register_int_counter_vec!(
+            "blackrouter_tokens_total",
+            "Total tokens processed",
+            &["provider", "model", "type"]
+        )
+        .unwrap();
+
+        let open_connections =
+            register_int_gauge!("blackrouter_open_connections", "Current open connections")
+                .unwrap();
+
+        // Register process metrics
+        let process_collector = prometheus::process_collector::ProcessCollector::for_self();
+        let _ = prometheus::register(Box::new(process_collector));
+
+        registry.register(Box::new(requests_total.clone())).ok();
+        registry.register(Box::new(request_duration.clone())).ok();
+        registry.register(Box::new(stream_ttfb.clone())).ok();
+        registry.register(Box::new(tokens_total.clone())).ok();
+        registry.register(Box::new(open_connections.clone())).ok();
+
+        Self {
+            registry,
+            requests_total,
+            request_duration,
+            stream_ttfb,
+            tokens_total,
+            open_connections,
+        }
+    }
+
+    pub fn encode(&self) -> String {
+        let mut buffer = vec![];
+        let encoder = TextEncoder::new();
+        let metric_families = self.registry.gather();
+        encoder.encode(&metric_families, &mut buffer).ok();
+        String::from_utf8(buffer).unwrap_or_default()
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -34,6 +127,9 @@ pub struct AppState {
     pub started_at_unix: u64,
     pub rtk: Rtk,
     pub http_client: reqwest::Client,
+    pub usage_tx: tokio::sync::mpsc::UnboundedSender<UsageEntry>,
+    pub metrics: Metrics,
+    pub response_cache: ResponseCache,
 }
 
 impl AppState {
@@ -56,12 +152,44 @@ impl AppState {
             .build()
             .expect("Failed to build shared HTTP client");
 
+        // Batch usage writer (Phase 1.4): buffer entries, flush every 5s or at 100 entries
+        let (usage_tx, mut usage_rx) = tokio::sync::mpsc::unbounded_channel::<UsageEntry>();
+        let batch_storage = storage.clone();
+        tokio::spawn(async move {
+            let mut buffer: Vec<UsageEntry> = Vec::with_capacity(128);
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    Some(entry) = usage_rx.recv() => {
+                        buffer.push(entry);
+                        if buffer.len() >= 100 {
+                            let batch = std::mem::take(&mut buffer);
+                            if let Err(e) = batch_storage.record_usages_batch(&batch) {
+                                tracing::warn!("batch usage write failed: {e}");
+                            }
+                        }
+                    }
+                    _ = interval.tick() => {
+                        if !buffer.is_empty() {
+                            let batch = std::mem::take(&mut buffer);
+                            if let Err(e) = batch_storage.record_usages_batch(&batch) {
+                                tracing::warn!("batch usage flush failed: {e}");
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
         Self {
             config,
             storage,
             started_at_unix: unix_timestamp(),
             rtk: Rtk::new(rtk_config),
             http_client,
+            usage_tx,
+            metrics: Metrics::new(),
+            response_cache: ResponseCache::new(Duration::from_secs(300), 1000),
         }
     }
 }
@@ -83,6 +211,7 @@ pub fn build_router(state: AppState) -> Router {
             "/api/setup/api-keys",
             get(list_api_keys).post(create_api_key),
         )
+        .route("/api/setup/api-keys/{id}/rotate", post(rotate_api_key))
         .route(
             "/api/setup/providers",
             get(list_providers).post(create_provider),
@@ -100,10 +229,23 @@ pub fn build_router(state: AppState) -> Router {
             post(fetch_provider_models),
         )
         .route("/api/setup/provider-catalog", get(provider_catalog))
+        .route("/api/doctor", get(doctor))
         .route("/api/setup/combos", get(list_combos).post(create_combo))
         .route(
             "/api/setup/combos/{id}",
             get(get_combo).put(update_combo).delete(delete_combo),
+        )
+        .route(
+            "/api/setup/aliases",
+            get(list_model_aliases).post(create_model_alias),
+        )
+        .route(
+            "/api/setup/aliases/{id}",
+            put(update_model_alias).delete(delete_model_alias),
+        )
+        .route(
+            "/api/setup/lb-strategy",
+            get(get_lb_strategy).put(set_lb_strategy),
         )
         .route("/v1/models", get(v1_models))
         .route("/v1beta/models", get(v1_models))
@@ -112,10 +254,19 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/messages", post(messages_proxy))
         .route("/api/rtk/metrics", get(rtk_metrics))
         .route("/api/rtk/status/{provider}/{model}", get(rtk_status))
+        .route("/metrics", get(metrics))
         .route("/api/usage", get(usage_stats))
         .route("/api/usage/daily", get(list_daily_usage))
         .route("/api/usage/daily/{date}", get(get_daily_usage))
         .route("/api/usage/aggregate", post(aggregate_daily))
+        .route("/telegram/webhook", post(telegram_webhook))
+        .route("/api/oauth/{provider}/start", post(oauth::oauth_start))
+        .route("/api/oauth/{provider}/callback", get(oauth::oauth_callback))
+        .route(
+            "/api/oauth/{provider}/exchange",
+            post(oauth::oauth_exchange),
+        )
+        .route("/api/oauth/{provider}/status", get(oauth::oauth_status))
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES))
         .layer(TimeoutLayer::with_status_code(
@@ -185,6 +336,11 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
 
 async fn version() -> Json<BuildInfo> {
     Json(BuildInfo::default())
+}
+
+async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let body = state.metrics.encode();
+    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body)
 }
 
 #[derive(Serialize)]
@@ -287,6 +443,17 @@ async fn create_api_key(
     Ok(Json(created))
 }
 
+async fn rotate_api_key(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<CreatedApiKey>, ApiErrorResponse> {
+    let rotated = state
+        .storage
+        .rotate_api_key(&id)
+        .map_err(|error| ApiErrorResponse::not_found(format!("API key not found: {error}")))?;
+    Ok(Json(rotated))
+}
+
 #[derive(Serialize)]
 struct ProvidersResponse {
     data: Vec<ProviderConnectionRecord>,
@@ -318,20 +485,6 @@ struct ProviderModelsResponse {
     models: Vec<String>,
     models_url: String,
     message: String,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct ProviderCatalogItem {
-    id: &'static str,
-    alias: &'static str,
-    name: &'static str,
-    category: &'static str,
-    auth_type: &'static str,
-    format: &'static str,
-    base_url: &'static str,
-    api_key_hint: &'static str,
-    website: &'static str,
-    required: bool,
 }
 
 async fn list_providers(
@@ -366,7 +519,11 @@ async fn get_provider(
         .get_provider_connection_raw(&id)
         .map_err(|error| ApiErrorResponse::not_found(format!("{error}")))?;
 
-    Ok(Json(ProviderConnectionRecord {
+    Ok(Json(provider_record_from_raw(raw)))
+}
+
+fn provider_record_from_raw(raw: RawProviderConnection) -> ProviderConnectionRecord {
+    ProviderConnectionRecord {
         id: raw.id,
         provider: raw.provider,
         auth_type: raw.auth_type,
@@ -374,10 +531,13 @@ async fn get_provider(
         email: raw.email,
         priority: raw.priority,
         is_active: raw.is_active,
+        status: raw.status,
+        cooldown_until: raw.cooldown_until,
+        expires_at: raw.expires_at,
         data: mask_for_api(raw.data),
         created_at: raw.created_at,
         updated_at: raw.updated_at,
-    }))
+    }
 }
 
 async fn update_provider(
@@ -430,50 +590,231 @@ async fn test_provider(
 async fn fetch_provider_models(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<ProviderModelsResponse>, ApiErrorResponse> {
     let provider = state
         .storage
         .get_provider_connection_raw(&id)
         .map_err(|error| ApiErrorResponse::not_found(format!("{error}")))?;
 
-    let models_url = provider_models_url(&provider.data)?;
-    let (models, models_url, message) = match fetch_provider_model_ids(&provider, &models_url).await
-    {
-        Ok(models) => {
-            let message = format!("Fetched {} models", models.len());
-            (models, models_url, message)
+    let refresh = params
+        .get("refresh")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let cache_ttl = model_catalog_cache_ttl_seconds(&state.storage);
+    if !refresh {
+        if let Some(cached) = state
+            .storage
+            .cached_provider_models(&id, cache_ttl)
+            .map_err(|error| storage_error_to_api(error, "provider model cache lookup failed"))?
+        {
+            return Ok(Json(provider_models_cache_response(provider, cached)));
         }
-        Err(error) => {
-            let fallback = builtin_provider_models(&provider).ok_or(error)?;
-            let models = fallback
-                .models
-                .iter()
-                .map(|model| (*model).to_string())
-                .collect::<Vec<_>>();
-            let message = format!(
-                "Loaded {} built-in {} models because live model fetch is not supported",
-                models.len(),
-                fallback.label
-            );
-            (models, fallback.source.to_string(), message)
+    }
+
+    let models_url = match provider_models_url(&provider.data) {
+        Ok(url) => Some(url),
+        Err(_) => None,
+    };
+    let (models, resolved_url, message) = if let Some(ref url) = models_url {
+        match fetch_provider_model_ids(&provider, url).await {
+            Ok(models) => {
+                let message = format!("Fetched {} models", models.len());
+                (models, url.clone(), message)
+            }
+            Err(error) => {
+                let fallback = builtin_provider_models(&provider).ok_or(error)?;
+                let models = fallback
+                    .models
+                    .iter()
+                    .map(|model| (*model).to_string())
+                    .collect::<Vec<_>>();
+                let message = format!(
+                    "Loaded {} built-in {} models because live model fetch is not supported",
+                    models.len(),
+                    fallback.label
+                );
+                (models, fallback.source.to_string(), message)
+            }
         }
+    } else {
+        // Can't derive models URL — fall back to builtin immediately
+        let fallback = builtin_provider_models(&provider).ok_or_else(|| {
+            ApiErrorResponse::bad_request(
+                "Could not derive models URL and no built-in models available",
+            )
+        })?;
+        let models = fallback
+            .models
+            .iter()
+            .map(|model| (*model).to_string())
+            .collect::<Vec<_>>();
+        let message = format!(
+            "Loaded {} built-in {} models (live fetch not available)",
+            models.len(),
+            fallback.label
+        );
+        (models, fallback.source.to_string(), message)
     };
     let updated = state
         .storage
-        .set_provider_connection_models(&id, models.clone(), Some(models_url.clone()))
+        .set_provider_connection_models(&id, models.clone(), Some(resolved_url.clone()))
         .map_err(|error| storage_error_to_api(error, "provider model save failed"))?;
 
     Ok(Json(ProviderModelsResponse {
         ok: true,
         provider: updated,
         models: models.clone(),
-        models_url,
+        models_url: resolved_url,
         message,
     }))
 }
 
-async fn provider_catalog() -> Json<Vec<ProviderCatalogItem>> {
-    Json(PROVIDER_CATALOG.to_vec())
+fn provider_models_cache_response(
+    provider: RawProviderConnection,
+    cached: CachedProviderModels,
+) -> ProviderModelsResponse {
+    let models_url = cached
+        .models_url
+        .unwrap_or_else(|| "cache://provider-models".to_string());
+    ProviderModelsResponse {
+        ok: true,
+        provider: provider_record_from_raw(provider),
+        models: cached.models,
+        models_url,
+        message: format!("Loaded cached model catalog (age {}s)", cached.age_seconds),
+    }
+}
+
+fn model_catalog_cache_ttl_seconds(storage: &Storage) -> u64 {
+    storage
+        .settings_json()
+        .ok()
+        .and_then(|settings| {
+            settings
+                .get("modelCatalogCacheTtlSeconds")
+                .or_else(|| settings.get("model_catalog_cache_ttl_seconds"))
+                .and_then(Value::as_u64)
+        })
+        .unwrap_or(6 * 60 * 60)
+}
+
+async fn provider_catalog() -> Json<Vec<ProviderProfile>> {
+    Json(provider_profiles().to_vec())
+}
+
+#[derive(Serialize)]
+struct DoctorResponse {
+    ok: bool,
+    storage: StorageStatus,
+    providers: DoctorProviders,
+    model_catalog: DoctorModelCatalog,
+    cost_guard: CostGuardStatus,
+    warnings: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct DoctorProviders {
+    total: usize,
+    active: usize,
+    available: usize,
+    cooldown: usize,
+    expired: usize,
+}
+
+#[derive(Serialize)]
+struct DoctorModelCatalog {
+    provider_profile_count: usize,
+    remote_cache_ttl_seconds: u64,
+    cached_provider_count: usize,
+}
+
+async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorResponse>, ApiErrorResponse> {
+    let storage = state
+        .storage
+        .status()
+        .map_err(|error| ApiErrorResponse::internal(format!("storage status failed: {error}")))?;
+    let providers = state
+        .storage
+        .list_provider_connections()
+        .map_err(|error| storage_error_to_api(error, "provider listing failed"))?;
+    let now = blackrouter_common::unix_timestamp();
+    let mut provider_status = DoctorProviders {
+        total: providers.len(),
+        active: 0,
+        available: 0,
+        cooldown: 0,
+        expired: 0,
+    };
+    let mut cached_provider_count = 0usize;
+    let cache_ttl = model_catalog_cache_ttl_seconds(&state.storage);
+
+    for provider in &providers {
+        if provider.is_active {
+            provider_status.active += 1;
+        }
+        let cooldown_until = provider
+            .cooldown_until
+            .as_deref()
+            .and_then(|value| value.parse::<u64>().ok());
+        let expires_at = provider
+            .expires_at
+            .as_deref()
+            .and_then(|value| value.parse::<u64>().ok());
+        let is_cooldown = cooldown_until.map(|value| value > now).unwrap_or(false);
+        let is_expired =
+            expires_at.map(|value| value <= now).unwrap_or(false) || provider.status == "expired";
+
+        if is_cooldown {
+            provider_status.cooldown += 1;
+        }
+        if is_expired {
+            provider_status.expired += 1;
+        }
+        if provider.is_active
+            && !is_cooldown
+            && !is_expired
+            && provider.status != "disabled"
+            && provider.status != "expired"
+        {
+            provider_status.available += 1;
+        }
+        if provider
+            .data
+            .get("modelsFetchedAt")
+            .or_else(|| provider.data.get("models_fetched_at"))
+            .is_some()
+        {
+            cached_provider_count += 1;
+        }
+    }
+
+    let cost_guard = cost_guard_status(&state.storage).map_err(|error| {
+        ApiErrorResponse::internal(format!("cost guard status failed: {error}"))
+    })?;
+    let mut warnings = Vec::new();
+    if !storage.schema_compatible {
+        warnings.push("storage schema is missing compatibility tables".to_string());
+    }
+    if provider_status.available == 0 {
+        warnings.push("no available provider connections".to_string());
+    }
+    if cost_guard.enabled && (cost_guard.daily_exceeded || cost_guard.monthly_exceeded) {
+        warnings.push("cost guard budget exceeded".to_string());
+    }
+
+    Ok(Json(DoctorResponse {
+        ok: warnings.is_empty(),
+        storage,
+        providers: provider_status,
+        model_catalog: DoctorModelCatalog {
+            provider_profile_count: provider_profiles().len(),
+            remote_cache_ttl_seconds: cache_ttl,
+            cached_provider_count,
+        },
+        cost_guard,
+        warnings,
+    }))
 }
 
 #[derive(Serialize)]
@@ -536,8 +877,86 @@ async fn delete_combo(
     Ok(Json(DeleteResponse { ok: true }))
 }
 
+// ── Model Aliases (Phase 4.3) ─────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct ModelAliasesResponse {
+    data: Vec<ModelAliasRecord>,
+}
+
+async fn list_model_aliases(
+    State(state): State<AppState>,
+) -> Result<Json<ModelAliasesResponse>, ApiErrorResponse> {
+    let data = state
+        .storage
+        .list_model_aliases()
+        .map_err(|error| storage_error_to_api(error, "alias listing failed"))?;
+    Ok(Json(ModelAliasesResponse { data }))
+}
+
+async fn create_model_alias(
+    State(state): State<AppState>,
+    Json(payload): Json<NewModelAlias>,
+) -> Result<Json<ModelAliasRecord>, ApiErrorResponse> {
+    let created = state
+        .storage
+        .create_model_alias(payload)
+        .map_err(|error| storage_error_to_api(error, "alias creation failed"))?;
+    Ok(Json(created))
+}
+
+async fn update_model_alias(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<NewModelAlias>,
+) -> Result<Json<ModelAliasRecord>, ApiErrorResponse> {
+    let updated = state
+        .storage
+        .update_model_alias(&id, payload)
+        .map_err(|error| storage_error_to_api(error, "alias update failed"))?;
+    Ok(Json(updated))
+}
+
+async fn delete_model_alias(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<DeleteResponse>, ApiErrorResponse> {
+    state
+        .storage
+        .delete_model_alias(&id)
+        .map_err(|error| storage_error_to_api(error, "alias delete failed"))?;
+    Ok(Json(DeleteResponse { ok: true }))
+}
+
+// ── Load Balancing Strategy (Phase 4.1) ───────────────────────────────────
+
+#[derive(Serialize, Deserialize)]
+struct LbStrategyResponse {
+    strategy: LoadBalanceStrategy,
+}
+
+#[derive(Deserialize)]
+struct LbStrategyUpdate {
+    strategy: LoadBalanceStrategy,
+}
+
+async fn get_lb_strategy(State(state): State<AppState>) -> Json<LbStrategyResponse> {
+    Json(LbStrategyResponse {
+        strategy: state.rtk.lb_strategy().await,
+    })
+}
+
+async fn set_lb_strategy(
+    State(state): State<AppState>,
+    Json(payload): Json<LbStrategyUpdate>,
+) -> Json<LbStrategyResponse> {
+    state.rtk.update_lb_strategy(payload.strategy).await;
+    let strategy = state.rtk.lb_strategy().await;
+    Json(LbStrategyResponse { strategy })
+}
+
 async fn check_provider_connection(provider: RawProviderConnection) -> ProviderTestResponse {
-    let url = provider
+    let base_url = provider
         .data
         .get("baseUrl")
         .and_then(Value::as_str)
@@ -545,7 +964,14 @@ async fn check_provider_connection(provider: RawProviderConnection) -> ProviderT
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
 
-    let Some(url) = url else {
+    let format = provider
+        .data
+        .get("format")
+        .and_then(Value::as_str)
+        .unwrap_or("openai")
+        .to_ascii_lowercase();
+
+    let Some(base_url) = base_url else {
         return ProviderTestResponse {
             ok: false,
             reachable: false,
@@ -555,12 +981,22 @@ async fn check_provider_connection(provider: RawProviderConnection) -> ProviderT
         };
     };
 
+    // Some providers expose POST-only endpoints; test the actual POST path.
+    let test_url = if format == "antigravity" {
+        format!(
+            "{}/v1internal:generateContent",
+            base_url.trim_end_matches('/')
+        )
+    } else {
+        base_url.clone()
+    };
+
     if let Err(message) = validate_provider_auth(&provider) {
         return ProviderTestResponse {
             ok: false,
             reachable: false,
             status: None,
-            url: Some(url),
+            url: Some(test_url),
             message,
         };
     }
@@ -576,30 +1012,106 @@ async fn check_provider_connection(provider: RawProviderConnection) -> ProviderT
                 ok: false,
                 reachable: false,
                 status: None,
-                url: Some(url),
+                url: Some(test_url),
                 message: format!("Failed to create HTTP client: {error}"),
             };
         }
     };
 
-    let mut request = client.head(&url);
-    if let Some(token) = provider_token(&provider.data) {
-        request = request.bearer_auth(token);
-    }
+    let auth_type = provider.auth_type.clone();
 
-    match request.send().await {
-        Ok(response) => classify_provider_response(url, response.status().as_u16()),
-        Err(head_error) => match client.get(&url).send().await {
-            Ok(response) => classify_provider_response(url, response.status().as_u16()),
-            Err(get_error) => ProviderTestResponse {
+    let build_request = |client: &reqwest::Client, method: &str| {
+        let request = if method == "HEAD" {
+            client.head(&test_url)
+        } else if method == "POST" {
+            client
+                .post(&test_url)
+                .header("Content-Type", "application/json")
+                .json(&provider_check_post_body(&format))
+        } else {
+            client.get(&test_url)
+        };
+        apply_auth(request, &auth_type, &provider.data)
+    };
+
+    if provider_check_uses_post(&format) {
+        match build_request(&client, "POST").send().await {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                if format == "antigravity" && matches!(status, 400 | 401 | 403) {
+                    classify_antigravity_check_response(test_url, status)
+                } else {
+                    classify_provider_post_response(test_url, status)
+                }
+            }
+            Err(post_error) => ProviderTestResponse {
                 ok: false,
                 reachable: false,
                 status: None,
-                url: Some(url),
-                message: format!("Connection failed: {get_error}; HEAD error: {head_error}"),
+                url: Some(test_url),
+                message: format!("Connection failed: {post_error}"),
             },
+        }
+    } else {
+        match build_request(&client, "HEAD").send().await {
+            Ok(response) => classify_provider_response(test_url, response.status().as_u16()),
+            Err(head_error) => match build_request(&client, "GET").send().await {
+                Ok(response) => classify_provider_response(test_url, response.status().as_u16()),
+                Err(get_error) => ProviderTestResponse {
+                    ok: false,
+                    reachable: false,
+                    status: None,
+                    url: Some(test_url),
+                    message: format!("Connection failed: {get_error}; HEAD error: {head_error}"),
+                },
+            },
+        }
+    }
+}
+
+fn provider_check_uses_post(format: &str) -> bool {
+    matches!(format, "antigravity" | "commandcode" | "kiro" | "cursor")
+}
+
+fn provider_check_post_body(format: &str) -> Value {
+    match format {
+        "antigravity" => serde_json::json!({"requestType": "agent"}),
+        // Intentionally incomplete: this verifies the POST endpoint without asking
+        // the provider to generate a completion.
+        "commandcode" => serde_json::json!({}),
+        "kiro" => serde_json::json!({}),
+        "cursor" => serde_json::json!({}),
+        _ => serde_json::json!({}),
+    }
+}
+
+fn classify_antigravity_check_response(url: String, status: u16) -> ProviderTestResponse {
+    ProviderTestResponse {
+        ok: true,
+        reachable: true,
+        status: Some(status),
+        url: Some(url),
+        message: match status {
+            401 | 403 => "Endpoint reachable — login required".to_string(),
+            _ => format!("Endpoint active (HTTP {}). Login to authenticate.", status),
         },
     }
+}
+
+fn classify_provider_post_response(url: String, status: u16) -> ProviderTestResponse {
+    if matches!(status, 400 | 422) {
+        return ProviderTestResponse {
+            ok: true,
+            reachable: true,
+            status: Some(status),
+            url: Some(url),
+            message: format!(
+                "Provider POST endpoint is reachable; it returned HTTP {status} for the minimal check body"
+            ),
+        };
+    }
+
+    classify_provider_response(url, status)
 }
 
 fn classify_provider_response(url: String, status: u16) -> ProviderTestResponse {
@@ -635,17 +1147,63 @@ fn classify_provider_response(url: String, status: u16) -> ProviderTestResponse 
 
 fn validate_provider_auth(provider: &RawProviderConnection) -> Result<(), String> {
     let auth_type = provider.auth_type.to_ascii_lowercase();
-    if auth_type == "none" {
-        return Ok(());
+    match auth_type.as_str() {
+        "none" => Ok(()),
+        "basic" => {
+            let has_user = provider
+                .data
+                .get("username")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .is_some();
+            let has_pass = provider
+                .data
+                .get("password")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .is_some();
+            if !has_user || !has_pass {
+                Err("Basic auth requires username and password in provider data".to_string())
+            } else {
+                Ok(())
+            }
+        }
+        "header" => {
+            let has_header_name = provider
+                .data
+                .get("headerName")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .is_some();
+            let has_header_value = provider
+                .data
+                .get("headerValue")
+                .and_then(Value::as_str)
+                .or_else(|| provider.data.get("apiKey").and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .is_some();
+            if !has_header_name || !has_header_value {
+                Err(
+                    "Header auth requires headerName and headerValue (or apiKey) in provider data"
+                        .to_string(),
+                )
+            } else {
+                Ok(())
+            }
+        }
+        _ => {
+            // api-key, bearer, oauth, and any custom type — require a token
+            if provider_token(&provider.data).is_none() {
+                Err("Missing API key/access token in provider data".to_string())
+            } else {
+                Ok(())
+            }
+        }
     }
-
-    if (auth_type.contains("api") || auth_type.contains("oauth"))
-        && provider_token(&provider.data).is_none()
-    {
-        return Err("Missing API key/access token in provider data".to_string());
-    }
-
-    Ok(())
 }
 
 fn provider_token(data: &Value) -> Option<&str> {
@@ -656,6 +1214,63 @@ fn provider_token(data: &Value) -> Option<&str> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+/// Apply authentication to a request builder based on auth_type and provider data.
+fn apply_auth(
+    mut request: reqwest::RequestBuilder,
+    auth_type: &str,
+    data: &Value,
+) -> reqwest::RequestBuilder {
+    // Always apply custom headers from data.headers (e.g. x-command-code-version)
+    if let Some(headers) = data.get("headers").and_then(Value::as_object) {
+        for (key, value) in headers {
+            if let Some(value) = value.as_str() {
+                request = request.header(key, value);
+            }
+        }
+    }
+
+    match auth_type.to_ascii_lowercase().as_str() {
+        "none" => {}
+        "basic" => {
+            if let (Some(username), Some(password)) = (
+                data.get("username")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty()),
+                data.get("password")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty()),
+            ) {
+                request = request.basic_auth(username, Some(password));
+            }
+        }
+        "header" => {
+            if let (Some(header_name), Some(header_value)) = (
+                data.get("headerName")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty()),
+                data.get("headerValue")
+                    .and_then(Value::as_str)
+                    .or_else(|| data.get("apiKey").and_then(Value::as_str))
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty()),
+            ) {
+                request = request.header(header_name, header_value);
+            }
+        }
+        _ => {
+            // api-key, bearer, oauth
+            if let Some(token) = provider_token(data) {
+                request = request.bearer_auth(token);
+            }
+        }
+    }
+
+    request
 }
 
 fn provider_models_url(data: &Value) -> Result<String, ApiErrorResponse> {
@@ -802,75 +1417,14 @@ fn collect_model_ids(items: &[Value], out: &mut Vec<String>) {
     }
 }
 
-struct BuiltinProviderModels {
-    label: &'static str,
-    source: &'static str,
-    models: &'static [&'static str],
-}
-
 fn builtin_provider_models(provider: &RawProviderConnection) -> Option<BuiltinProviderModels> {
-    let provider_id = provider.provider.to_ascii_lowercase();
     let alias = provider
         .data
         .get("alias")
         .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+        .or_else(|| provider.data.get("provider_alias").and_then(Value::as_str));
 
-    match (provider_id.as_str(), alias.as_str()) {
-        ("cline", _) | (_, "cl") => Some(BuiltinProviderModels {
-            label: "Cline Router",
-            source: "builtin://cline",
-            models: &[
-                "cline-pass/qwen3.7-max",
-                "cline-pass/qwen3.7-plus",
-                "cline-pass/minimax-m3",
-                "cline-pass/mimo-v2.5-pro",
-                "cline-pass/glm-5.2",
-                "cline-pass/mimo-v2.5",
-                "cline-pass/kimi-k2.7-code",
-                "cline-pass/deepseek-v4-flash",
-                "cline-pass/deepseek-v4-pro",
-                "cline-pass/kimi-k2.6",
-                "stepfun/step-3.7-flash",
-                "deepseek/deepseek-v4-flash",
-                "zai/glm-5.2",
-                "moonshotai/kimi-k2.7-code",
-                "anthropic/claude-opus-4.8",
-                "anthropic/claude-sonnet-4.6",
-                "openai/gpt-5.5",
-            ],
-        }),
-        ("commandcode", _) | (_, "cmc") => Some(BuiltinProviderModels {
-            label: "Command Code",
-            source: "builtin://commandcode",
-            models: &[
-                "claude-sonnet-4-6",
-                "claude-fable-5",
-                "claude-opus-4-8",
-                "claude-opus-4-7",
-                "claude-haiku-4-5-20251001",
-                "gpt-5.5",
-                "gpt-5.4",
-                "gpt-5.3-codex",
-                "gpt-5.4-mini",
-                "moonshotai/Kimi-K2.6",
-                "moonshotai/Kimi-K2.5",
-                "zai-org/GLM-5.2",
-                "zai-org/GLM-5.1",
-                "zai-org/GLM-5",
-                "MiniMaxAI/MiniMax-M3",
-                "MiniMaxAI/MiniMax-M2.7",
-                "MiniMaxAI/MiniMax-M2.5",
-                "deepseek/deepseek-v4-pro",
-                "deepseek/deepseek-v4-flash",
-                "Qwen/Qwen3.6-Max-Preview",
-                "Qwen/Qwen3.6-Plus",
-                "Qwen/Qwen3.7-Max",
-            ],
-        }),
-        _ => None,
-    }
+    registry_builtin_provider_models(&provider.provider, alias)
 }
 
 fn mask_for_api(value: Value) -> Value {
@@ -906,249 +1460,6 @@ fn is_sensitive_key(key: &str) -> bool {
         || key == "authorization"
 }
 
-const PROVIDER_CATALOG: &[ProviderCatalogItem] = &[
-    ProviderCatalogItem {
-        id: "commandcode",
-        alias: "cmc",
-        name: "Command Code",
-        category: "coding",
-        auth_type: "api-key",
-        format: "commandcode",
-        base_url: "https://api.commandcode.ai/alpha/generate",
-        api_key_hint: "user_... from ~/.commandcode/auth.json or commandcode.ai/studio",
-        website: "https://commandcode.ai",
-        required: true,
-    },
-    ProviderCatalogItem {
-        id: "cline",
-        alias: "cl",
-        name: "Cline Router",
-        category: "coding",
-        auth_type: "api-key",
-        format: "openai",
-        base_url: "https://api.cline.bot/api/v1/chat/completions",
-        api_key_hint: "Cline auth token or API key",
-        website: "https://cline.bot",
-        required: true,
-    },
-    ProviderCatalogItem {
-        id: "openrouter",
-        alias: "openrouter",
-        name: "OpenRouter",
-        category: "api-key",
-        auth_type: "api-key",
-        format: "openai",
-        base_url: "https://openrouter.ai/api/v1/chat/completions",
-        api_key_hint: "OpenRouter API key",
-        website: "https://openrouter.ai",
-        required: false,
-    },
-    ProviderCatalogItem {
-        id: "openai",
-        alias: "openai",
-        name: "OpenAI",
-        category: "api-key",
-        auth_type: "api-key",
-        format: "openai",
-        base_url: "https://api.openai.com/v1/chat/completions",
-        api_key_hint: "sk-...",
-        website: "https://platform.openai.com",
-        required: false,
-    },
-    ProviderCatalogItem {
-        id: "anthropic",
-        alias: "anthropic",
-        name: "Anthropic",
-        category: "api-key",
-        auth_type: "api-key",
-        format: "claude",
-        base_url: "https://api.anthropic.com/v1/messages",
-        api_key_hint: "sk-ant-...",
-        website: "https://console.anthropic.com",
-        required: false,
-    },
-    ProviderCatalogItem {
-        id: "gemini",
-        alias: "gemini",
-        name: "Gemini",
-        category: "free-tier",
-        auth_type: "api-key",
-        format: "gemini",
-        base_url: "https://generativelanguage.googleapis.com/v1beta/models",
-        api_key_hint: "Google AI Studio API key",
-        website: "https://ai.google.dev",
-        required: false,
-    },
-    ProviderCatalogItem {
-        id: "deepseek",
-        alias: "ds",
-        name: "DeepSeek",
-        category: "api-key",
-        auth_type: "api-key",
-        format: "openai",
-        base_url: "https://api.deepseek.com/chat/completions",
-        api_key_hint: "DeepSeek API key",
-        website: "https://platform.deepseek.com",
-        required: false,
-    },
-    ProviderCatalogItem {
-        id: "groq",
-        alias: "groq",
-        name: "Groq",
-        category: "api-key",
-        auth_type: "api-key",
-        format: "openai",
-        base_url: "https://api.groq.com/openai/v1/chat/completions",
-        api_key_hint: "Groq API key",
-        website: "https://console.groq.com",
-        required: false,
-    },
-    ProviderCatalogItem {
-        id: "xai",
-        alias: "xai",
-        name: "xAI",
-        category: "api-key",
-        auth_type: "api-key",
-        format: "openai",
-        base_url: "https://api.x.ai/v1/chat/completions",
-        api_key_hint: "xAI API key",
-        website: "https://console.x.ai",
-        required: false,
-    },
-    ProviderCatalogItem {
-        id: "mistral",
-        alias: "mistral",
-        name: "Mistral",
-        category: "api-key",
-        auth_type: "api-key",
-        format: "openai",
-        base_url: "https://api.mistral.ai/v1/chat/completions",
-        api_key_hint: "Mistral API key",
-        website: "https://console.mistral.ai",
-        required: false,
-    },
-    ProviderCatalogItem {
-        id: "perplexity",
-        alias: "pplx",
-        name: "Perplexity",
-        category: "api-key",
-        auth_type: "api-key",
-        format: "openai",
-        base_url: "https://api.perplexity.ai/chat/completions",
-        api_key_hint: "Perplexity API key",
-        website: "https://www.perplexity.ai/settings/api",
-        required: false,
-    },
-    ProviderCatalogItem {
-        id: "together",
-        alias: "together",
-        name: "Together AI",
-        category: "api-key",
-        auth_type: "api-key",
-        format: "openai",
-        base_url: "https://api.together.xyz/v1/chat/completions",
-        api_key_hint: "Together API key",
-        website: "https://api.together.xyz",
-        required: false,
-    },
-    ProviderCatalogItem {
-        id: "fireworks",
-        alias: "fireworks",
-        name: "Fireworks",
-        category: "api-key",
-        auth_type: "api-key",
-        format: "openai",
-        base_url: "https://api.fireworks.ai/inference/v1/chat/completions",
-        api_key_hint: "Fireworks API key",
-        website: "https://fireworks.ai",
-        required: false,
-    },
-    ProviderCatalogItem {
-        id: "nvidia",
-        alias: "nvidia",
-        name: "NVIDIA NIM",
-        category: "free-tier",
-        auth_type: "api-key",
-        format: "openai",
-        base_url: "https://integrate.api.nvidia.com/v1/chat/completions",
-        api_key_hint: "NVIDIA API key",
-        website: "https://build.nvidia.com",
-        required: false,
-    },
-    ProviderCatalogItem {
-        id: "github",
-        alias: "gh",
-        name: "GitHub Copilot",
-        category: "subscription",
-        auth_type: "oauth",
-        format: "openai",
-        base_url: "https://api.githubcopilot.com/chat/completions",
-        api_key_hint: "OAuth access token",
-        website: "https://github.com/features/copilot",
-        required: false,
-    },
-    ProviderCatalogItem {
-        id: "codex",
-        alias: "cx",
-        name: "Codex",
-        category: "subscription",
-        auth_type: "oauth",
-        format: "openai-responses",
-        base_url: "https://chatgpt.com/backend-api/codex/responses",
-        api_key_hint: "OAuth access token",
-        website: "https://chatgpt.com",
-        required: false,
-    },
-    ProviderCatalogItem {
-        id: "cursor",
-        alias: "cu",
-        name: "Cursor",
-        category: "subscription",
-        auth_type: "oauth",
-        format: "cursor",
-        base_url: "https://api2.cursor.sh",
-        api_key_hint: "Cursor session token",
-        website: "https://cursor.com",
-        required: false,
-    },
-    ProviderCatalogItem {
-        id: "kiro",
-        alias: "kr",
-        name: "Kiro",
-        category: "subscription",
-        auth_type: "oauth",
-        format: "kiro",
-        base_url: "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse",
-        api_key_hint: "Kiro OAuth token",
-        website: "https://kiro.dev",
-        required: false,
-    },
-    ProviderCatalogItem {
-        id: "opencode",
-        alias: "oc",
-        name: "OpenCode Free",
-        category: "local",
-        auth_type: "none",
-        format: "openai",
-        base_url: "http://localhost:4096/v1/chat/completions",
-        api_key_hint: "No auth",
-        website: "https://opencode.ai",
-        required: false,
-    },
-    ProviderCatalogItem {
-        id: "ollama-local",
-        alias: "ollama-local",
-        name: "Ollama Local",
-        category: "local",
-        auth_type: "none",
-        format: "openai",
-        base_url: "http://localhost:11434/v1/chat/completions",
-        api_key_hint: "No auth",
-        website: "https://ollama.com",
-        required: false,
-    },
-];
-
 #[derive(Serialize)]
 struct ModelListResponse {
     object: &'static str,
@@ -1175,24 +1486,112 @@ async fn v1_models(
 async fn chat_completions_shell(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    Json(mut body): Json<Value>,
 ) -> Result<Response, ApiErrorResponse> {
     authorize_v1(&state, &headers)?;
-    let model = body
-        .get("model")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ApiErrorResponse::bad_request("missing model"))?;
+    let api_key = extract_api_key(&headers);
+    let route = normalize_model_request_body(&state.storage, &mut body)?;
 
-    let route = state
-        .storage
-        .resolve_model_route(model)
-        .map_err(|error| storage_error_to_api(error, "model route resolution failed"))?;
-
-    proxy_chat_completions(&state, body, route).await
+    proxy_chat_completions(&state, body, route, api_key).await
 }
 
 fn format_model_ref(model: &ModelRef) -> String {
     format!("{}/{}", model.provider, model.model)
+}
+
+fn normalize_model_request_body(
+    storage: &Storage,
+    body: &mut Value,
+) -> Result<RouteKind, ApiErrorResponse> {
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiErrorResponse::bad_request("missing model"))?;
+
+    let route = storage
+        .resolve_model_route(model)
+        .map_err(|error| storage_error_to_api(error, "model route resolution failed"))?;
+
+    let normalized = normalized_route_model(&route);
+    if let Some(object) = body.as_object_mut() {
+        object.insert("model".to_string(), Value::String(normalized));
+    }
+
+    Ok(route)
+}
+
+fn normalized_route_model(route: &RouteKind) -> String {
+    match route {
+        RouteKind::Single(model) => format_model_ref(model),
+        RouteKind::Combo { name, .. } => name.clone(),
+    }
+}
+
+/// Generate rate limit headers compatible with OpenAI format
+async fn rate_limit_headers(rtk: &Rtk, provider: &str, model: &str) -> Vec<(&'static str, String)> {
+    let key = RequestKey {
+        provider: provider.to_string(),
+        model: model.to_string(),
+        api_key: None,
+    };
+    let status = rtk.rate_limit_status(&key).await;
+    vec![
+        ("x-ratelimit-limit-requests", "60".to_string()),
+        (
+            "x-ratelimit-remaining-requests",
+            status.requests_remaining.to_string(),
+        ),
+        (
+            "x-ratelimit-reset-requests",
+            status
+                .retry_after
+                .map_or("0".to_string(), |r| r.as_secs().to_string()),
+        ),
+        ("x-ratelimit-limit-tokens", "100000".to_string()),
+        (
+            "x-ratelimit-remaining-tokens",
+            status.tokens_remaining.to_string(),
+        ),
+    ]
+}
+
+/// Map upstream provider error to a meaningful OpenAI-compatible error message
+fn map_provider_error(status: u16, bytes: &[u8], provider: &str) -> String {
+    // Try to parse common error formats from providers
+    if let Ok(body) = serde_json::from_slice::<Value>(bytes) {
+        // Claude error format: {"type":"error","error":{"type":"...","message":"..."}}
+        if let Some(msg) = body
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(Value::as_str)
+        {
+            return format!("{} error: {}", provider, msg);
+        }
+        // OpenAI error format: {"error":{"message":"..."}}
+        if let Some(msg) = body.get("error").and_then(Value::as_str) {
+            return format!("{} error: {}", provider, msg);
+        }
+        // Gemini error format: [{"error":{"message":"..."}}]
+        if let Some(arr) = body.as_array() {
+            if let Some(msg) = arr
+                .first()
+                .and_then(|e| e.get("error"))
+                .and_then(|e| e.get("message"))
+                .and_then(Value::as_str)
+            {
+                return format!("{} error: {}", provider, msg);
+            }
+        }
+        // Generic: try "message" field
+        if let Some(msg) = body.get("message").and_then(Value::as_str) {
+            return format!("{} error: {}", provider, msg);
+        }
+    }
+    // Fallback: show truncated body
+    let preview = String::from_utf8_lossy(&bytes[..bytes.len().min(200)]);
+    format!("{} returned HTTP {}: {}", provider, status, preview.trim())
 }
 
 /// Parse token usage from upstream response bytes (before translation)
@@ -1216,7 +1615,12 @@ fn parse_token_usage(bytes: &[u8], upstream_format: WireFormat) -> (u64, u64) {
                 .unwrap_or(0);
             (prompt, completion)
         }
-        WireFormat::Gemini => {
+        WireFormat::Gemini | WireFormat::Antigravity => {
+            let value = if upstream_format == WireFormat::Antigravity {
+                value.get("response").unwrap_or(&value)
+            } else {
+                &value
+            };
             let prompt = value
                 .get("usageMetadata")
                 .and_then(|m| m.get("promptTokenCount"))
@@ -1326,7 +1730,7 @@ fn price_per_million(provider: &str, model: &str) -> (f64, f64) {
     }
 
     // Gemini models
-    if p == "gemini" || p == "google" {
+    if p == "gemini" || p == "google" || p == "antigravity" {
         if m.contains("gemini-2.0-flash-lite") {
             return (0.075, 0.30);
         }
@@ -1371,9 +1775,102 @@ fn price_per_million(provider: &str, model: &str) -> (f64, f64) {
     (0.0, 0.0)
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct CostGuardStatus {
+    enabled: bool,
+    deny_on_exceeded: bool,
+    daily_budget_usd: Option<f64>,
+    monthly_budget_usd: Option<f64>,
+    daily_spend_usd: f64,
+    monthly_spend_usd: f64,
+    daily_exceeded: bool,
+    monthly_exceeded: bool,
+}
+
+#[derive(Clone, Debug)]
+struct CostGuardConfig {
+    enabled: bool,
+    deny_on_exceeded: bool,
+    daily_budget_usd: Option<f64>,
+    monthly_budget_usd: Option<f64>,
+}
+
+fn enforce_cost_guard(state: &AppState) -> Result<(), ApiErrorResponse> {
+    let status = cost_guard_status(&state.storage)
+        .map_err(|error| ApiErrorResponse::internal(format!("cost guard failed: {error}")))?;
+    if status.enabled
+        && status.deny_on_exceeded
+        && (status.daily_exceeded || status.monthly_exceeded)
+    {
+        return Err(ApiErrorResponse::new(
+            StatusCode::PAYMENT_REQUIRED,
+            "cost guard budget exceeded",
+            "budget_exceeded",
+        ));
+    }
+    Ok(())
+}
+
+fn cost_guard_status(storage: &Storage) -> Result<CostGuardStatus, StorageError> {
+    let config = cost_guard_config(storage)?;
+    let now = blackrouter_common::unix_timestamp();
+    let day_start = now - (now % 86_400);
+    let (_, _, day) = days_to_date((now / 86_400) as i64);
+    let month_start = day_start.saturating_sub((day.saturating_sub(1) as u64) * 86_400);
+    let daily_spend_usd = storage.total_cost_since(day_start)?;
+    let monthly_spend_usd = storage.total_cost_since(month_start)?;
+
+    Ok(CostGuardStatus {
+        enabled: config.enabled,
+        deny_on_exceeded: config.deny_on_exceeded,
+        daily_budget_usd: config.daily_budget_usd,
+        monthly_budget_usd: config.monthly_budget_usd,
+        daily_spend_usd,
+        monthly_spend_usd,
+        daily_exceeded: config
+            .daily_budget_usd
+            .map(|budget| daily_spend_usd >= budget)
+            .unwrap_or(false),
+        monthly_exceeded: config
+            .monthly_budget_usd
+            .map(|budget| monthly_spend_usd >= budget)
+            .unwrap_or(false),
+    })
+}
+
+fn cost_guard_config(storage: &Storage) -> Result<CostGuardConfig, StorageError> {
+    let settings = storage.settings_json()?;
+    let guard = settings
+        .get("costGuard")
+        .or_else(|| settings.get("cost_guard"))
+        .unwrap_or(&Value::Null);
+
+    Ok(CostGuardConfig {
+        enabled: guard
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        deny_on_exceeded: guard
+            .get("denyOnExceeded")
+            .or_else(|| guard.get("deny_on_exceeded"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        daily_budget_usd: guard
+            .get("dailyBudgetUsd")
+            .or_else(|| guard.get("daily_budget_usd"))
+            .or_else(|| guard.get("dailyBudget"))
+            .and_then(Value::as_f64),
+        monthly_budget_usd: guard
+            .get("monthlyBudgetUsd")
+            .or_else(|| guard.get("monthly_budget_usd"))
+            .or_else(|| guard.get("monthlyBudget"))
+            .and_then(Value::as_f64),
+    })
+}
+
 /// Record usage to storage asynchronously (non-blocking, fire-and-forget)
 fn record_usage_async(
-    storage: &Storage,
+    usage_tx: &tokio::sync::mpsc::UnboundedSender<UsageEntry>,
     provider: &str,
     model: &str,
     endpoint: &str,
@@ -1397,13 +1894,7 @@ fn record_usage_async(
         tokens: None,
         meta: None,
     };
-
-    let storage = storage.clone();
-    tokio::spawn(async move {
-        if let Err(e) = storage.record_usage(&entry) {
-            tracing::warn!("failed to record usage: {e}");
-        }
-    });
+    let _ = usage_tx.send(entry);
 }
 
 /// Record request details asynchronously
@@ -1436,6 +1927,7 @@ async fn proxy_chat_completions(
     state: &AppState,
     body: Value,
     route: RouteKind,
+    api_key: Option<String>,
 ) -> Result<Response, ApiErrorResponse> {
     let is_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
 
@@ -1446,7 +1938,9 @@ async fn proxy_chat_completions(
 
     let mut last_error = None;
     for model in models {
-        match proxy_single_chat_completion(state, &body, &model, is_stream).await {
+        match proxy_single_chat_completion(state, &body, &model, is_stream, api_key.as_deref())
+            .await
+        {
             Ok(response) => return Ok(response),
             Err(error) => {
                 last_error = Some(format!(
@@ -1465,17 +1959,181 @@ async fn proxy_chat_completions(
     ))
 }
 
+/// Generate a cache key for a request (Phase 4.2 — response caching)
+/// Only used for non-streaming, deterministic requests (temp=0, no tools)
+fn generate_cache_key(model: &ModelRef, body: &Value) -> Option<String> {
+    // Only cache non-streaming requests
+    if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
+        return None;
+    }
+    // Only cache requests with no tools
+    if body.get("tools").is_some() || body.get("tool_choice").is_some() {
+        return None;
+    }
+    // Only cache requests with temperature=0 or absent (deterministic)
+    if let Some(temp) = body.get("temperature") {
+        if temp.as_f64().map(|t| t != 0.0).unwrap_or(true) {
+            return None;
+        }
+    }
+
+    // Build cache key from model + messages + key params
+    let messages = body
+        .get("messages")
+        .map(|m| m.to_string())
+        .unwrap_or_default();
+    let max_tokens = body
+        .get("max_tokens")
+        .map(|m| m.to_string())
+        .unwrap_or_default();
+    let top_p = body.get("top_p").map(|m| m.to_string()).unwrap_or_default();
+
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(format!(
+        "{}/{}/{}/{}/{}/{}",
+        model.provider,
+        model.model,
+        messages,
+        max_tokens,
+        top_p,
+        body.get("frequency_penalty")
+            .map(|v| v.to_string())
+            .unwrap_or_default()
+    ));
+    let hash = hasher.finalize();
+    use base64::Engine;
+    Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash))
+}
+
+/// Proxy a single model with load balancing, circuit breaker, and caching (Phase 4)
 async fn proxy_single_chat_completion(
     state: &AppState,
     body: &Value,
     model: &ModelRef,
     is_stream: bool,
+    api_key: Option<&str>,
 ) -> Result<Response, ApiErrorResponse> {
-    let provider = state
-        .storage
-        .get_active_provider_connection_raw(&model.provider)
-        .map_err(|error| storage_error_to_api(error, "provider lookup failed"))?;
+    // ── Response Cache check (Phase 4.2) ──────────────────────────────
+    if !is_stream {
+        if let Some(cache_key) = generate_cache_key(model, body) {
+            if let Some((cached_body, content_type)) = state.response_cache.get(&cache_key).await {
+                tracing::debug!("cache hit for model {}/{}", model.provider, model.model);
+                state
+                    .metrics
+                    .requests_total
+                    .with_label_values(&[&model.provider, &model.model, "cache_hit"])
+                    .inc();
+                let mut builder = Response::builder().status(StatusCode::OK);
+                if let Some(ct) = content_type {
+                    builder = builder.header(header::CONTENT_TYPE, ct);
+                }
+                return builder.body(Body::from(cached_body)).map_err(|error| {
+                    ApiErrorResponse::internal(format!("cache response: {error}"))
+                });
+            }
+        }
+    }
 
+    enforce_cost_guard(state)?;
+
+    // ── Load Balancing + Circuit Breaker (Phase 4.1) ──────────────────
+    let providers = state
+        .storage
+        .list_active_provider_connections(&model.provider)
+        .map_err(|error| storage_error_to_api(error, "provider listing failed"))?;
+
+    if providers.is_empty() {
+        // Fall back to single provider lookup for error message
+        let _ = state
+            .storage
+            .get_active_provider_connection_raw(&model.provider)
+            .map_err(|error| storage_error_to_api(error, "provider lookup failed"))?;
+        return Err(ApiErrorResponse::new(
+            StatusCode::BAD_GATEWAY,
+            "no active providers available",
+            "provider_error",
+        ));
+    }
+
+    // Filter out circuit-broken providers
+    let mut available: Vec<&RawProviderConnection> = Vec::new();
+    for p in &providers {
+        if !state.rtk.is_circuit_open(&p.id).await {
+            available.push(p);
+        }
+    }
+
+    // If all are circuit-broken, try the first one anyway (half-open recovery)
+    if available.is_empty() {
+        tracing::warn!(
+            "All providers circuit-broken for {}, attempting recovery",
+            model.provider
+        );
+        available.push(&providers[0]);
+    }
+
+    // Select starting index via load balancing strategy
+    let start_idx = state
+        .rtk
+        .select_provider_index(&model.provider, available.len())
+        .await;
+
+    // Try providers starting from selected index
+    let mut last_error = None;
+    for i in 0..available.len() {
+        let idx = (start_idx + i) % available.len();
+        let provider = available[idx];
+
+        match proxy_with_specific_provider(state, body, model, is_stream, api_key, provider).await {
+            Ok(response) => {
+                let _ = state.storage.set_provider_runtime_status(
+                    &provider.id,
+                    "healthy",
+                    None,
+                    provider.expires_at.clone(),
+                );
+                state.rtk.record_circuit_success(&provider.id).await;
+                return Ok(response);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "provider {} ({}) failed: {}, trying next",
+                    idx,
+                    provider.id,
+                    error.message
+                );
+                let cooldown_until = (blackrouter_common::unix_timestamp() + 30).to_string();
+                let _ = state.storage.set_provider_runtime_status(
+                    &provider.id,
+                    "cooldown",
+                    Some(cooldown_until),
+                    provider.expires_at.clone(),
+                );
+                state.rtk.record_circuit_failure(&provider.id).await;
+                last_error = Some(error);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        ApiErrorResponse::new(
+            StatusCode::BAD_GATEWAY,
+            "all providers failed",
+            "provider_error",
+        )
+    }))
+}
+
+/// Send request to a specific provider (extracted from proxy_single_chat_completion)
+async fn proxy_with_specific_provider(
+    state: &AppState,
+    body: &Value,
+    model: &ModelRef,
+    is_stream: bool,
+    api_key: Option<&str>,
+    provider: &RawProviderConnection,
+) -> Result<Response, ApiErrorResponse> {
     let format = provider
         .data
         .get("format")
@@ -1535,31 +2193,68 @@ async fn proxy_single_chat_completion(
     // No longer strip stream flag — upstream gets stream=true and we translate SSE events
 
     // Use shared HTTP client (Phase 1.2 — connection pooling)
-    let mut request = state.http_client.post(base_url).json(&upstream_body);
-    if let Some(headers) = provider.data.get("headers").and_then(Value::as_object) {
-        for (key, value) in headers {
-            if let Some(value) = value.as_str() {
-                request = request.header(key, value);
-            }
+    // Antigravity uses different endpoints for streaming vs non-streaming
+    let request_url = if target_format == WireFormat::Antigravity {
+        if is_stream {
+            format!("{}/v1internal:streamGenerateContent?alt=sse", base_url)
+        } else {
+            format!("{}/v1internal:generateContent", base_url)
+        }
+    } else {
+        base_url.to_string()
+    };
+    // Add Antigravity-specific body fields before serializing the request body.
+    if target_format == WireFormat::Antigravity {
+        // Add project (from provider data or generate fallback) and requestId
+        if let Some(object) = upstream_body.as_object_mut() {
+            let project = provider
+                .data
+                .get("projectId")
+                .and_then(Value::as_str)
+                .unwrap_or("blackrouter");
+            object.insert("project".to_string(), Value::String(project.to_string()));
+            object.insert(
+                "requestId".to_string(),
+                Value::String(format!("agent-{}", uuid::Uuid::new_v4())),
+            );
         }
     }
-    if let Some(token) = provider_token(&provider.data) {
-        request = request.bearer_auth(token);
+
+    let request = state.http_client.post(&request_url).json(&upstream_body);
+    let mut request = apply_auth(request, &provider.auth_type, &provider.data);
+
+    // Add Antigravity-specific headers.
+    if target_format == WireFormat::Antigravity {
+        request = request
+            .header("User-Agent", "antigravity/1.107.0")
+            .header("x-request-source", "local");
     }
 
     let request_key = RequestKey {
         provider: model.provider.clone(),
         model: model.model.clone(),
-        api_key: None,
+        api_key: api_key.map(|k| k.to_string()),
     };
 
-    // Check rate limit
-    if !state.rtk.check_rate_limit(&request_key).await {
-        return Err(ApiErrorResponse::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "Rate limit exceeded",
-            "rate_limit_error",
-        ));
+    // Check rate limit (with request queuing — Phase 4.3)
+    let mut rate_limit_retries = 0u32;
+    loop {
+        if state.rtk.check_rate_limit(&request_key).await {
+            break;
+        }
+        rate_limit_retries += 1;
+        if rate_limit_retries >= 3 {
+            return Err(ApiErrorResponse::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Rate limit exceeded after queuing retries",
+                "rate_limit_error",
+            ));
+        }
+        tracing::debug!(
+            "rate limited, queuing request (retry {})",
+            rate_limit_retries
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
     // Record request start
@@ -1574,6 +2269,16 @@ async fn proxy_single_chat_completion(
                 .rtk
                 .record_request_end(&request_key, false, start_time.elapsed(), 0, 0, 0.0)
                 .await;
+            state
+                .metrics
+                .requests_total
+                .with_label_values(&[&model.provider, &model.model, "error"])
+                .inc();
+            state
+                .metrics
+                .request_duration
+                .with_label_values(&[&model.provider, &model.model])
+                .observe(start_time.elapsed().as_secs_f64());
             return Err(ApiErrorResponse::new(
                 StatusCode::BAD_GATEWAY,
                 format!("provider request failed: {error}"),
@@ -1590,13 +2295,21 @@ async fn proxy_single_chat_completion(
             .rtk
             .record_request_end(&request_key, false, start_time.elapsed(), 0, 0, 0.0)
             .await;
+        state
+            .metrics
+            .requests_total
+            .with_label_values(&[&model.provider, &model.model, &status.as_u16().to_string()])
+            .inc();
+        state
+            .metrics
+            .request_duration
+            .with_label_values(&[&model.provider, &model.model])
+            .observe(start_time.elapsed().as_secs_f64());
+        let error_bytes = response.bytes().await.unwrap_or_default();
+        let error_msg = map_provider_error(status.as_u16(), &error_bytes, &model.provider);
         return Err(ApiErrorResponse::new(
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-            format!(
-                "{} returned HTTP {}",
-                format_model_ref(model),
-                status.as_u16()
-            ),
+            error_msg,
             "provider_error",
         ));
     }
@@ -1704,9 +2417,31 @@ async fn proxy_single_chat_completion(
         )
         .await;
 
-    // Record to usage storage (async, non-blocking)
+    // Record prometheus metrics
+    state
+        .metrics
+        .requests_total
+        .with_label_values(&[&model.provider, &model.model, "success"])
+        .inc();
+    state
+        .metrics
+        .request_duration
+        .with_label_values(&[&model.provider, &model.model])
+        .observe(start_time.elapsed().as_secs_f64());
+    state
+        .metrics
+        .tokens_total
+        .with_label_values(&[&model.provider, &model.model, "prompt"])
+        .inc_by(prompt_tokens);
+    state
+        .metrics
+        .tokens_total
+        .with_label_values(&[&model.provider, &model.model, "completion"])
+        .inc_by(completion_tokens);
+
+    // Record to usage storage (async, non-blocking, batched)
     record_usage_async(
-        &state.storage,
+        &state.usage_tx,
         &model.provider,
         &model.model,
         "/v1/chat/completions",
@@ -1744,10 +2479,26 @@ async fn proxy_single_chat_completion(
         bytes.to_vec()
     };
 
+    let content_type_for_cache = content_type.clone();
     let mut builder = Response::builder().status(status);
     if let Some(content_type) = content_type {
         builder = builder.header(header::CONTENT_TYPE, content_type);
     }
+    // Add rate limit headers
+    for (key, value) in rate_limit_headers(&state.rtk, &model.provider, &model.model).await {
+        builder = builder.header(key, value);
+    }
+
+    // Cache response if cacheable (Phase 4.2)
+    if !is_stream {
+        if let Some(cache_key) = generate_cache_key(model, body) {
+            state
+                .response_cache
+                .put(cache_key, response_body.clone(), content_type_for_cache)
+                .await;
+        }
+    }
+
     builder.body(Body::from(response_body)).map_err(|error| {
         ApiErrorResponse::internal(format!("failed to build provider response: {error}"))
     })
@@ -1767,6 +2518,45 @@ async fn rtk_metrics(State(state): State<AppState>) -> Json<RtkMetricsResponse> 
         metrics,
         uptime_seconds: uptime,
     })
+}
+
+async fn telegram_webhook(
+    State(state): State<AppState>,
+    Json(update): Json<TelegramUpdate>,
+) -> impl IntoResponse {
+    if !state.config.telegram.enabled {
+        tracing::debug!("Telegram webhook received while telegram is disabled");
+        return (StatusCode::OK, "ok");
+    }
+
+    let Some(bot_token) = state.config.telegram.bot_token.clone() else {
+        tracing::warn!("Telegram webhook received but bot token is not configured");
+        return (StatusCode::OK, "ok");
+    };
+
+    let runtime = TelegramRuntime::new(
+        state.storage.clone(),
+        state.config.telegram.admin_ids.clone(),
+    );
+    let bot = match TelegramBot::new(TelegramBotConfig {
+        bot_token,
+        admin_ids: state.config.telegram.admin_ids.clone(),
+        webhook_url: state.config.telegram.webhook_url.clone(),
+        polling_interval_ms: 1000,
+        max_connections: 40,
+    }) {
+        Ok(bot) => bot,
+        Err(error) => {
+            tracing::warn!("Telegram webhook bot init failed: {}", error);
+            return (StatusCode::OK, "ok");
+        }
+    };
+
+    if let Err(error) = runtime.dispatch_update(&bot, update).await {
+        tracing::warn!("Telegram webhook handling failed: {}", error);
+    }
+
+    (StatusCode::OK, "ok")
 }
 
 #[derive(Serialize)]
@@ -1912,17 +2702,20 @@ async fn responses_proxy(
         .ok_or_else(|| ApiErrorResponse::bad_request("missing model"))?;
 
     // Convert Responses API request → Chat Completions request
-    let chat_body = responses_request_to_chat(&body).map_err(|error| {
+    let mut chat_body = responses_request_to_chat(&body).map_err(|error| {
         ApiErrorResponse::bad_request(format!("responses conversion failed: {error}"))
     })?;
 
-    let route = state
-        .storage
-        .resolve_model_route(model)
-        .map_err(|error| storage_error_to_api(error, "model route resolution failed"))?;
+    let route = normalize_model_request_body(&state.storage, &mut chat_body)?;
+    let normalized_model = chat_body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or(model)
+        .to_string();
 
     // Proxy through chat completions (reuse all streaming/translation/pooling logic)
-    let response = proxy_chat_completions(&state, chat_body, route).await?;
+    let response =
+        proxy_chat_completions(&state, chat_body, route, extract_api_key(&headers)).await?;
 
     // For non-streaming responses, convert chat completion → Responses API format
     let is_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
@@ -1945,9 +2738,10 @@ async fn responses_proxy(
     let chat_response: Value = serde_json::from_slice(&bytes)
         .map_err(|e| ApiErrorResponse::internal(format!("failed to parse chat response: {e}")))?;
 
-    let responses_body = chat_response_to_responses(&chat_response, model).map_err(|error| {
-        ApiErrorResponse::internal(format!("responses conversion failed: {error}"))
-    })?;
+    let responses_body =
+        chat_response_to_responses(&chat_response, &normalized_model).map_err(|error| {
+            ApiErrorResponse::internal(format!("responses conversion failed: {error}"))
+        })?;
 
     let body_bytes = serde_json::to_vec(&responses_body).unwrap_or_else(|_| bytes.to_vec());
 
@@ -1962,19 +2756,12 @@ async fn responses_proxy(
 async fn messages_proxy(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    Json(mut body): Json<Value>,
 ) -> Result<Response, ApiErrorResponse> {
     authorize_v1(&state, &headers)?;
+    let api_key = extract_api_key(&headers);
 
-    let model = body
-        .get("model")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ApiErrorResponse::bad_request("missing model"))?;
-
-    let route = state
-        .storage
-        .resolve_model_route(model)
-        .map_err(|error| storage_error_to_api(error, "model route resolution failed"))?;
+    let route = normalize_model_request_body(&state.storage, &mut body)?;
 
     // Check if target provider is Claude — if so, passthrough directly
     let models = match &route {
@@ -2020,23 +2807,16 @@ async fn messages_proxy(
             .filter(|v| !v.is_empty())
             .ok_or_else(|| ApiErrorResponse::bad_request("Missing provider data.baseUrl"))?;
 
-        let mut request = state.http_client.post(base_url).json(&upstream_body);
-        if let Some(hdrs) = provider.data.get("headers").and_then(Value::as_object) {
-            for (key, value) in hdrs {
-                if let Some(value) = value.as_str() {
-                    request = request.header(key, value);
-                }
-            }
-        }
-        if let Some(token) = provider_token(&provider.data) {
-            request = request.bearer_auth(token);
-        }
+        let request = state.http_client.post(base_url).json(&upstream_body);
+        let request = apply_auth(request, &provider.auth_type, &provider.data);
 
         let request_key = RequestKey {
             provider: first_model.provider.clone(),
             model: first_model.model.clone(),
-            api_key: None,
+            api_key: api_key.clone(),
         };
+
+        enforce_cost_guard(&state)?;
 
         if !state.rtk.check_rate_limit(&request_key).await {
             return Err(ApiErrorResponse::new(
@@ -2135,9 +2915,9 @@ async fn messages_proxy(
             )
             .await;
 
-        // Record to usage storage (async, non-blocking)
+        // Record to usage storage (async, non-blocking, batched)
         record_usage_async(
-            &state.storage,
+            &state.usage_tx,
             &first_model.provider,
             &first_model.model,
             "/v1/messages",
@@ -2166,7 +2946,7 @@ async fn messages_proxy(
             ApiErrorResponse::bad_request(format!("claude→openai translation failed: {error}"))
         })?;
 
-    let chat_response = proxy_chat_completions(&state, chat_body, route).await?;
+    let chat_response = proxy_chat_completions(&state, chat_body, route, api_key.clone()).await?;
 
     // For non-streaming, convert OpenAI response → Claude Messages format
     if is_stream {
@@ -2309,7 +3089,10 @@ impl IntoResponse for ApiErrorResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{builtin_provider_models, derive_models_url, extract_api_key, extract_model_ids};
+    use super::{
+        builtin_provider_models, classify_provider_post_response, derive_models_url,
+        extract_api_key, extract_model_ids, provider_check_post_body, provider_check_uses_post,
+    };
     use axum::http::HeaderMap;
     use blackrouter_storage::RawProviderConnection;
     use serde_json::json;
@@ -2368,6 +3151,27 @@ mod tests {
     }
 
     #[test]
+    fn commandcode_check_uses_post_only_probe() {
+        assert!(provider_check_uses_post("commandcode"));
+        assert_eq!(provider_check_post_body("commandcode"), json!({}));
+
+        let response = classify_provider_post_response(
+            "https://api.commandcode.ai/alpha/generate".into(),
+            400,
+        );
+        assert!(response.ok);
+        assert!(response.reachable);
+        assert_eq!(response.status, Some(400));
+
+        let not_found = classify_provider_post_response(
+            "https://api.commandcode.ai/alpha/generate".into(),
+            404,
+        );
+        assert!(!not_found.ok);
+        assert!(not_found.message.contains("not found"));
+    }
+
+    #[test]
     fn finds_builtin_provider_model_catalogs() {
         let cline = RawProviderConnection {
             id: "1".to_string(),
@@ -2377,6 +3181,9 @@ mod tests {
             email: None,
             priority: None,
             is_active: true,
+            status: "healthy".to_string(),
+            cooldown_until: None,
+            expires_at: None,
             data: json!({ "alias": "cl" }),
             created_at: "1".to_string(),
             updated_at: "1".to_string(),
@@ -2395,5 +3202,25 @@ mod tests {
             .unwrap()
             .models
             .contains(&"claude-sonnet-4-6"));
+
+        let antigravity = RawProviderConnection {
+            provider: "antigravity".to_string(),
+            data: json!({ "alias": "ag" }),
+            ..commandcode
+        };
+        assert!(builtin_provider_models(&antigravity)
+            .unwrap()
+            .models
+            .contains(&"gemini-2.5-pro"));
+
+        let gemini_cli = RawProviderConnection {
+            provider: "gemini-cli".to_string(),
+            data: json!({}),
+            ..antigravity
+        };
+        assert!(builtin_provider_models(&gemini_cli)
+            .unwrap()
+            .models
+            .contains(&"gemini-2.0-flash-lite"));
     }
 }

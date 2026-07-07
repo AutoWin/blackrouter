@@ -8,6 +8,7 @@ license.workspace = true
 blackrouter-common = { path = "../blackrouter-common" }
 blackrouter-config = { path = "../blackrouter-config" }
 blackrouter-core = { path = "../blackrouter-core" }
+blackrouter-providers = { path = "../blackrouter-providers" }
 blackrouter-rtk = { path = "../blackrouter-rtk" }
 blackrouter-storage = { path = "../blackrouter-storage" }
 blackrouter-telegram = { path = "../blackrouter-telegram" }
@@ -23,3 +24,9 @@ tokio.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+prometheus.workspace = true
+opentelemetry.workspace = true
+tracing-opentelemetry.workspace = true
+rand = "0.8"
+sha2 = "0.10"
+base64 = "0.22"
