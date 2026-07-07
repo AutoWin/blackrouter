@@ -4,6 +4,7 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use base64::Engine;
 use blackrouter_common::{unix_timestamp, BuildInfo};
 use blackrouter_config::AppConfig;
 use blackrouter_core::{ModelRef, RouteKind};
@@ -22,8 +23,9 @@ use blackrouter_telegram::{
     TelegramBot, TelegramBotConfig, TelegramRuntime, Update as TelegramUpdate,
 };
 use blackrouter_translator::{
-    chat_response_to_responses, responses_request_to_chat, stream::translate_sse_stream,
-    translate_request, translate_response, WireFormat,
+    chat_response_to_responses, commandcode_stream_text_to_openai, commandcode_stream_token_usage,
+    responses_request_to_chat, stream::translate_sse_stream, translate_request, translate_response,
+    WireFormat,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -42,6 +44,10 @@ use prometheus::{
 mod oauth;
 
 const MAX_REQUEST_BYTES: usize = 50 * 1024 * 1024;
+const COMMANDCODE_VERSION: &str = "0.25.7";
+const CODEX_MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0";
+const CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+const CODEX_USER_AGENT: &str = "codex_cli_rs/0.136.0";
 
 #[derive(Clone)]
 pub struct Metrics {
@@ -620,7 +626,12 @@ async fn fetch_provider_models(
         match fetch_provider_model_ids(&provider, url).await {
             Ok(models) => {
                 let message = format!("Fetched {} models", models.len());
-                (models, url.clone(), message)
+                let resolved_url = if provider_uses_codex_model_catalog(&provider) {
+                    CODEX_MODELS_URL.to_string()
+                } else {
+                    url.clone()
+                };
+                (models, resolved_url, message)
             }
             Err(error) => {
                 let fallback = builtin_provider_models(&provider).ok_or(error)?;
@@ -1031,7 +1042,12 @@ async fn check_provider_connection(provider: RawProviderConnection) -> ProviderT
         } else {
             client.get(&test_url)
         };
-        apply_auth(request, &auth_type, &provider.data)
+        let request = apply_auth(request, &auth_type, &provider.data);
+        if format == "commandcode" {
+            apply_commandcode_headers(request)
+        } else {
+            request
+        }
     };
 
     if provider_check_uses_post(&format) {
@@ -1070,7 +1086,16 @@ async fn check_provider_connection(provider: RawProviderConnection) -> ProviderT
 }
 
 fn provider_check_uses_post(format: &str) -> bool {
-    matches!(format, "antigravity" | "commandcode" | "kiro" | "cursor")
+    matches!(
+        format,
+        "antigravity"
+            | "commandcode"
+            | "kiro"
+            | "cursor"
+            | "openai"
+            | "openai-chat"
+            | "openai-responses"
+    )
 }
 
 fn provider_check_post_body(format: &str) -> Value {
@@ -1081,6 +1106,7 @@ fn provider_check_post_body(format: &str) -> Value {
         "commandcode" => serde_json::json!({}),
         "kiro" => serde_json::json!({}),
         "cursor" => serde_json::json!({}),
+        "openai" | "openai-chat" | "openai-responses" => serde_json::json!({}),
         _ => serde_json::json!({}),
     }
 }
@@ -1273,6 +1299,21 @@ fn apply_auth(
     request
 }
 
+fn apply_commandcode_headers(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    request
+        .header("x-command-code-version", COMMANDCODE_VERSION)
+        .header("x-cli-environment", "cli")
+        .header("x-session-id", uuid::Uuid::new_v4().to_string())
+        .header(header::ACCEPT, "text/event-stream")
+}
+
+fn apply_codex_headers(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    request
+        .header("originator", "codex_cli_rs")
+        .header("User-Agent", CODEX_USER_AGENT)
+        .header(header::ACCEPT, "application/json, text/event-stream")
+}
+
 fn provider_models_url(data: &Value) -> Result<String, ApiErrorResponse> {
     if let Some(models_url) = data
         .get("modelsUrl")
@@ -1329,6 +1370,12 @@ async fn fetch_provider_model_ids(
             ApiErrorResponse::internal(format!("Failed to create HTTP client: {error}"))
         })?;
 
+    if provider_uses_codex_model_catalog(provider) {
+        if let Ok(models) = fetch_codex_model_ids(&client, provider).await {
+            return Ok(models);
+        }
+    }
+
     let mut request_url = models_url.to_string();
     if provider
         .data
@@ -1381,6 +1428,119 @@ async fn fetch_provider_model_ids(
         ));
     }
     Ok(models)
+}
+
+async fn fetch_codex_model_ids(
+    client: &reqwest::Client,
+    provider: &RawProviderConnection,
+) -> Result<Vec<String>, ApiErrorResponse> {
+    let token = provider_token(&provider.data).ok_or_else(|| {
+        ApiErrorResponse::bad_request("No ChatGPT/Codex access token found for model fetch")
+    })?;
+    let response = client
+        .get(CODEX_MODELS_URL)
+        .header(header::ACCEPT, "application/json")
+        .header(header::CONTENT_TYPE, "application/json")
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|error| {
+            ApiErrorResponse::bad_request(format!("Codex model fetch failed: {error}"))
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(ApiErrorResponse::bad_request(format!(
+            "Codex model fetch returned HTTP {}",
+            status.as_u16()
+        )));
+    }
+    let payload = response.json::<Value>().await.map_err(|error| {
+        ApiErrorResponse::bad_request(format!("Codex model fetch returned invalid JSON: {error}"))
+    })?;
+    let models = extract_codex_model_ids(&payload);
+    if models.is_empty() {
+        return Err(ApiErrorResponse::bad_request(
+            "Codex model fetch succeeded but no model ids were found",
+        ));
+    }
+    Ok(models)
+}
+
+fn provider_uses_codex_model_catalog(provider: &RawProviderConnection) -> bool {
+    if provider.provider.eq_ignore_ascii_case("codex") {
+        return true;
+    }
+
+    let Some(token) = provider_token(&provider.data) else {
+        return false;
+    };
+    let Some(payload) = decode_jwt_payload(token) else {
+        return false;
+    };
+
+    payload
+        .get("https://api.openai.com/auth")
+        .and_then(Value::as_object)
+        .map(|auth| {
+            auth.contains_key("chatgpt_account_id")
+                || auth.contains_key("chatgpt_plan_type")
+                || auth.contains_key("chatgpt_user_id")
+        })
+        .unwrap_or(false)
+}
+
+fn decode_jwt_payload(token: &str) -> Option<Value> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn extract_codex_model_ids(payload: &Value) -> Vec<String> {
+    let mut models = Vec::new();
+    for item in codex_model_items(payload) {
+        let Some(id) = item
+            .get("id")
+            .or_else(|| item.get("slug"))
+            .or_else(|| item.get("model"))
+            .or_else(|| item.get("name"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        models.push(id.to_string());
+
+        let is_chat_model = item
+            .get("type")
+            .and_then(Value::as_str)
+            .map(|kind| kind != "image")
+            .unwrap_or(true)
+            && !id.to_ascii_lowercase().contains("embed");
+        if is_chat_model && !id.ends_with("-review") {
+            models.push(format!("{id}-review"));
+        }
+    }
+    models.sort();
+    models.dedup();
+    models
+}
+
+fn codex_model_items(payload: &Value) -> Vec<&serde_json::Map<String, Value>> {
+    let mut items = Vec::new();
+    for key in ["data", "models", "results"] {
+        if let Some(array) = payload.get(key).and_then(Value::as_array) {
+            items.extend(array.iter().filter_map(Value::as_object));
+        }
+    }
+    if items.is_empty() {
+        if let Some(array) = payload.as_array() {
+            items.extend(array.iter().filter_map(Value::as_object));
+        }
+    }
+    items
 }
 
 fn extract_model_ids(payload: &Value) -> Vec<String> {
@@ -1629,6 +1789,22 @@ fn parse_token_usage(bytes: &[u8], upstream_format: WireFormat) -> (u64, u64) {
             let completion = value
                 .get("usageMetadata")
                 .and_then(|m| m.get("candidatesTokenCount"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            (prompt, completion)
+        }
+        WireFormat::OpenAiResponses => {
+            let prompt = value
+                .get("usage")
+                .and_then(|u| u.get("input_tokens").or_else(|| u.get("prompt_tokens")))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let completion = value
+                .get("usage")
+                .and_then(|u| {
+                    u.get("output_tokens")
+                        .or_else(|| u.get("completion_tokens"))
+                })
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
             (prompt, completion)
@@ -2006,6 +2182,15 @@ fn generate_cache_key(model: &ModelRef, body: &Value) -> Option<String> {
     Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash))
 }
 
+fn provider_cooldown_remaining(provider: &RawProviderConnection) -> Option<u64> {
+    let cooldown_until = provider.cooldown_until.as_deref()?.parse::<u64>().ok()?;
+    cooldown_until.checked_sub(blackrouter_common::unix_timestamp())
+}
+
+fn should_cooldown_provider(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
 /// Proxy a single model with load balancing, circuit breaker, and caching (Phase 4)
 async fn proxy_single_chat_completion(
     state: &AppState,
@@ -2044,27 +2229,43 @@ async fn proxy_single_chat_completion(
         .map_err(|error| storage_error_to_api(error, "provider listing failed"))?;
 
     if providers.is_empty() {
-        // Fall back to single provider lookup for error message
-        let _ = state
-            .storage
-            .get_active_provider_connection_raw(&model.provider)
-            .map_err(|error| storage_error_to_api(error, "provider lookup failed"))?;
         return Err(ApiErrorResponse::new(
             StatusCode::BAD_GATEWAY,
-            "no active providers available",
+            format!("no active provider connections for {}", model.provider),
             "provider_error",
         ));
     }
 
-    // Filter out circuit-broken providers
+    // Filter out cooling down and circuit-broken providers.
     let mut available: Vec<&RawProviderConnection> = Vec::new();
+    let mut shortest_cooldown: Option<u64> = None;
     for p in &providers {
+        if let Some(remaining) = provider_cooldown_remaining(p) {
+            shortest_cooldown = Some(
+                shortest_cooldown
+                    .map(|current| current.min(remaining))
+                    .unwrap_or(remaining),
+            );
+            continue;
+        }
         if !state.rtk.is_circuit_open(&p.id).await {
             available.push(p);
         }
     }
 
-    // If all are circuit-broken, try the first one anyway (half-open recovery)
+    if available.is_empty() && shortest_cooldown.is_some() {
+        let retry_after = shortest_cooldown.unwrap_or(1).max(1);
+        return Err(ApiErrorResponse::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "provider {} is cooling down, retry after {retry_after}s",
+                model.provider
+            ),
+            "provider_cooldown",
+        ));
+    }
+
+    // If all are circuit-broken, try the first non-cooldown provider anyway (half-open recovery).
     if available.is_empty() {
         tracing::warn!(
             "All providers circuit-broken for {}, attempting recovery",
@@ -2103,14 +2304,16 @@ async fn proxy_single_chat_completion(
                     provider.id,
                     error.message
                 );
-                let cooldown_until = (blackrouter_common::unix_timestamp() + 30).to_string();
-                let _ = state.storage.set_provider_runtime_status(
-                    &provider.id,
-                    "cooldown",
-                    Some(cooldown_until),
-                    provider.expires_at.clone(),
-                );
-                state.rtk.record_circuit_failure(&provider.id).await;
+                if should_cooldown_provider(error.status) {
+                    let cooldown_until = (blackrouter_common::unix_timestamp() + 30).to_string();
+                    let _ = state.storage.set_provider_runtime_status(
+                        &provider.id,
+                        "cooldown",
+                        Some(cooldown_until),
+                        provider.expires_at.clone(),
+                    );
+                    state.rtk.record_circuit_failure(&provider.id).await;
+                }
                 last_error = Some(error);
             }
         }
@@ -2134,12 +2337,27 @@ async fn proxy_with_specific_provider(
     api_key: Option<&str>,
     provider: &RawProviderConnection,
 ) -> Result<Response, ApiErrorResponse> {
-    let format = provider
+    let mut format = provider
         .data
         .get("format")
         .and_then(Value::as_str)
         .unwrap_or("openai")
         .to_ascii_lowercase();
+
+    let mut base_url = provider
+        .data
+        .get("baseUrl")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| ApiErrorResponse::bad_request("Missing provider data.baseUrl"))?;
+
+    let uses_codex_backend = provider_uses_codex_model_catalog(provider);
+    if uses_codex_backend {
+        format = "openai-responses".to_string();
+        base_url = CODEX_RESPONSES_URL.to_string();
+    }
 
     // Determine target wire format
     let target_format = match format.as_str() {
@@ -2174,17 +2392,16 @@ async fn proxy_with_specific_provider(
         body.clone()
     };
 
-    let base_url = provider
-        .data
-        .get("baseUrl")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiErrorResponse::bad_request("Missing provider data.baseUrl"))?;
-
     let mut upstream_body = translated_body;
     if let Some(object) = upstream_body.as_object_mut() {
-        object.insert("model".to_string(), Value::String(model.model.clone()));
+        if target_format == WireFormat::CommandCode {
+            if let Some(params) = object.get_mut("params").and_then(Value::as_object_mut) {
+                params.insert("model".to_string(), Value::String(model.model.clone()));
+                params.insert("stream".to_string(), Value::Bool(true));
+            }
+        } else {
+            object.insert("model".to_string(), Value::String(model.model.clone()));
+        }
     }
 
     // For translated streaming (OpenAI→Claude/Gemini with stream=true),
@@ -2201,7 +2418,7 @@ async fn proxy_with_specific_provider(
             format!("{}/v1internal:generateContent", base_url)
         }
     } else {
-        base_url.to_string()
+        base_url
     };
     // Add Antigravity-specific body fields before serializing the request body.
     if target_format == WireFormat::Antigravity {
@@ -2228,6 +2445,10 @@ async fn proxy_with_specific_provider(
         request = request
             .header("User-Agent", "antigravity/1.107.0")
             .header("x-request-source", "local");
+    } else if target_format == WireFormat::CommandCode {
+        request = apply_commandcode_headers(request);
+    } else if uses_codex_backend {
+        request = apply_codex_headers(request);
     }
 
     let request_key = RequestKey {
@@ -2359,21 +2580,24 @@ async fn proxy_with_specific_provider(
             .record_request_end(&request_key, true, start_time.elapsed(), 0, 0, 0.0)
             .await;
 
-        let upstream_stream = response.bytes_stream();
-        let translated = translate_sse_stream(upstream_stream, target_format, model.model.clone());
-        let body = Body::from_stream(translated);
+        if is_stream {
+            let upstream_stream = response.bytes_stream();
+            let translated =
+                translate_sse_stream(upstream_stream, target_format, model.model.clone());
+            let body = Body::from_stream(translated);
 
-        return Response::builder()
-            .status(status)
-            .header(header::CONTENT_TYPE, "text/event-stream")
-            .header("Cache-Control", "no-cache")
-            .header("Connection", "keep-alive")
-            .body(body)
-            .map_err(|error| {
-                ApiErrorResponse::internal(format!(
-                    "failed to build translated stream response: {error}"
-                ))
-            });
+            return Response::builder()
+                .status(status)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .header("Cache-Control", "no-cache")
+                .header("Connection", "keep-alive")
+                .body(body)
+                .map_err(|error| {
+                    ApiErrorResponse::internal(format!(
+                        "failed to build translated stream response: {error}"
+                    ))
+                });
+        }
     }
 
     // ============================================================
@@ -2395,7 +2619,11 @@ async fn proxy_with_specific_provider(
     };
 
     // Parse token usage from upstream response (Phase 3.1)
-    let (prompt_tokens, completion_tokens) = parse_token_usage(&bytes, target_format);
+    let (prompt_tokens, completion_tokens) = if target_format == WireFormat::CommandCode {
+        commandcode_stream_token_usage(&String::from_utf8_lossy(&bytes))
+    } else {
+        parse_token_usage(&bytes, target_format)
+    };
 
     // Cost calculation (Phase 3.1)
     let cost = calculate_cost(
@@ -2467,21 +2695,33 @@ async fn proxy_with_specific_provider(
 
     // Translate response back to OpenAI format if needed
     let response_body = if target_format != WireFormat::OpenAiChat {
-        let response_value: Value = serde_json::from_slice(&bytes).unwrap_or_else(
-            |_| serde_json::json!({"raw": String::from_utf8_lossy(&bytes).to_string()}),
-        );
+        if target_format == WireFormat::CommandCode {
+            let translated =
+                commandcode_stream_text_to_openai(&String::from_utf8_lossy(&bytes), &model.model);
+            serde_json::to_vec(&translated).unwrap_or_else(|_| bytes.to_vec())
+        } else {
+            let response_value: Value = serde_json::from_slice(&bytes).unwrap_or_else(
+                |_| serde_json::json!({"raw": String::from_utf8_lossy(&bytes).to_string()}),
+            );
 
-        match translate_response(&response_value, target_format, WireFormat::OpenAiChat) {
-            Ok(translated) => serde_json::to_vec(&translated).unwrap_or_else(|_| bytes.to_vec()),
-            Err(_) => bytes.to_vec(),
+            match translate_response(&response_value, target_format, WireFormat::OpenAiChat) {
+                Ok(translated) => {
+                    serde_json::to_vec(&translated).unwrap_or_else(|_| bytes.to_vec())
+                }
+                Err(_) => bytes.to_vec(),
+            }
         }
     } else {
         bytes.to_vec()
     };
 
-    let content_type_for_cache = content_type.clone();
+    let content_type_for_cache = if target_format != WireFormat::OpenAiChat {
+        Some("application/json".to_string())
+    } else {
+        content_type.clone()
+    };
     let mut builder = Response::builder().status(status);
-    if let Some(content_type) = content_type {
+    if let Some(content_type) = content_type_for_cache.clone() {
         builder = builder.header(header::CONTENT_TYPE, content_type);
     }
     // Add rate limit headers
@@ -3091,9 +3331,11 @@ impl IntoResponse for ApiErrorResponse {
 mod tests {
     use super::{
         builtin_provider_models, classify_provider_post_response, derive_models_url,
-        extract_api_key, extract_model_ids, provider_check_post_body, provider_check_uses_post,
+        extract_api_key, extract_codex_model_ids, extract_model_ids, provider_check_post_body,
+        provider_check_uses_post, provider_uses_codex_model_catalog, should_cooldown_provider,
     };
-    use axum::http::HeaderMap;
+    use axum::http::{HeaderMap, StatusCode};
+    use base64::Engine;
     use blackrouter_storage::RawProviderConnection;
     use serde_json::json;
 
@@ -3151,6 +3393,16 @@ mod tests {
     }
 
     #[test]
+    fn cooldown_provider_only_for_retryable_errors() {
+        assert!(should_cooldown_provider(StatusCode::TOO_MANY_REQUESTS));
+        assert!(should_cooldown_provider(StatusCode::BAD_GATEWAY));
+        assert!(should_cooldown_provider(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(!should_cooldown_provider(StatusCode::BAD_REQUEST));
+        assert!(!should_cooldown_provider(StatusCode::UNPROCESSABLE_ENTITY));
+        assert!(!should_cooldown_provider(StatusCode::UNAUTHORIZED));
+    }
+
+    #[test]
     fn commandcode_check_uses_post_only_probe() {
         assert!(provider_check_uses_post("commandcode"));
         assert_eq!(provider_check_post_body("commandcode"), json!({}));
@@ -3169,6 +3421,62 @@ mod tests {
         );
         assert!(!not_found.ok);
         assert!(not_found.message.contains("not found"));
+    }
+
+    #[test]
+    fn openai_check_uses_post_only_probe() {
+        assert!(provider_check_uses_post("openai"));
+        assert!(provider_check_uses_post("openai-chat"));
+        assert!(provider_check_uses_post("openai-responses"));
+        assert_eq!(provider_check_post_body("openai"), json!({}));
+
+        let response = classify_provider_post_response(
+            "https://api.openai.com/v1/chat/completions".into(),
+            400,
+        );
+        assert!(response.ok);
+        assert!(response.reachable);
+        assert_eq!(response.status, Some(400));
+    }
+
+    #[test]
+    fn detects_codex_jwt_for_model_catalog() {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"none"}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct","chatgpt_plan_type":"plus"}}"#,
+        );
+        let provider = RawProviderConnection {
+            id: "1".to_string(),
+            provider: "openai".to_string(),
+            auth_type: "oauth".to_string(),
+            name: None,
+            email: None,
+            priority: None,
+            is_active: true,
+            status: "healthy".to_string(),
+            cooldown_until: None,
+            expires_at: None,
+            data: json!({ "apiKey": format!("{header}.{payload}.sig") }),
+            created_at: "1".to_string(),
+            updated_at: "1".to_string(),
+        };
+
+        assert!(provider_uses_codex_model_catalog(&provider));
+    }
+
+    #[test]
+    fn extracts_codex_models_and_review_variants() {
+        let models = extract_codex_model_ids(&json!({
+            "data": [
+                { "id": "gpt-5.3-codex", "type": "llm" },
+                { "slug": "gpt-image-2", "type": "image" }
+            ]
+        }));
+
+        assert!(models.contains(&"gpt-5.3-codex".to_string()));
+        assert!(models.contains(&"gpt-5.3-codex-review".to_string()));
+        assert!(models.contains(&"gpt-image-2".to_string()));
+        assert!(!models.contains(&"gpt-image-2-review".to_string()));
     }
 
     #[test]

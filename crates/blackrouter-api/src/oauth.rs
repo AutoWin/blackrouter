@@ -1,10 +1,14 @@
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Json, Response};
+use axum::routing::get;
+use axum::Router;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::Duration;
+use tokio::sync::oneshot;
 
 use crate::AppState;
 
@@ -35,14 +39,22 @@ fn antigravity_client_secret() -> String {
 const ANTIGRAVITY_SCOPES: &str = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs";
 
 /// Codex / OpenAI OAuth (Authorization Code Flow with PKCE)
+const CODEX_CLIENT_ID_FALLBACK: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const CODEX_LOOPBACK_PORT: u16 = 1455;
+const CODEX_CALLBACK_PATH: &str = "/auth/callback";
+const CODEX_LOOPBACK_TIMEOUT: Duration = Duration::from_secs(300);
+
 fn codex_client_id() -> String {
-    std::env::var("OAUTH_CODEX_CLIENT_ID").unwrap_or_default()
+    std::env::var("OAUTH_CODEX_CLIENT_ID").unwrap_or_else(|_| CODEX_CLIENT_ID_FALLBACK.to_string())
 }
 
 // ── Session store for OAuth tokens ────────────────────────────────────
 
 static OAUTH_SESSIONS: std::sync::LazyLock<Mutex<HashMap<String, OAuthSession>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+static CODEX_LOOPBACK_SHUTDOWN: std::sync::LazyLock<Mutex<Option<oneshot::Sender<()>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
 
 #[derive(Clone, Debug)]
 struct OAuthSession {
@@ -156,6 +168,54 @@ fn redirect_uri(port: u16, provider: &str) -> String {
     )
 }
 
+fn codex_redirect_uri() -> String {
+    format!("http://localhost:{CODEX_LOOPBACK_PORT}{CODEX_CALLBACK_PATH}")
+}
+
+fn oauth_json_error(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<Value>) {
+    (status, Json(json!({ "error": message.into() })))
+}
+
+async fn start_codex_loopback_callback(state: AppState) -> Result<(), String> {
+    if CODEX_LOOPBACK_SHUTDOWN.lock().unwrap().is_some() {
+        return Ok(());
+    }
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", CODEX_LOOPBACK_PORT))
+        .await
+        .map_err(|err| {
+            format!("OpenAI OAuth callback port {CODEX_LOOPBACK_PORT} is not available: {err}")
+        })?;
+    let (tx, rx) = oneshot::channel();
+    *CODEX_LOOPBACK_SHUTDOWN.lock().unwrap() = Some(tx);
+
+    let app = Router::new()
+        .route(CODEX_CALLBACK_PATH, get(codex_loopback_callback))
+        .route("/callback", get(codex_loopback_callback))
+        .with_state(state);
+
+    tokio::spawn(async move {
+        let server = axum::serve(listener, app).with_graceful_shutdown(async {
+            tokio::select! {
+                _ = rx => {}
+                _ = tokio::time::sleep(CODEX_LOOPBACK_TIMEOUT) => {}
+            }
+        });
+        if let Err(err) = server.await {
+            tracing::warn!("OpenAI OAuth loopback callback server failed: {err}");
+        }
+        CODEX_LOOPBACK_SHUTDOWN.lock().unwrap().take();
+    });
+
+    Ok(())
+}
+
+fn stop_codex_loopback_callback() {
+    if let Some(tx) = CODEX_LOOPBACK_SHUTDOWN.lock().unwrap().take() {
+        let _ = tx.send(());
+    }
+}
+
 // ── Generic OAuth Start ─────────────────────────────────────────────────
 
 /// POST /api/oauth/{provider}/start
@@ -163,7 +223,7 @@ fn redirect_uri(port: u16, provider: &str) -> String {
 pub async fn oauth_start(
     Path(provider): Path<String>,
     State(state): State<AppState>,
-) -> Result<Json<OAuthStartResponse>, (StatusCode, String)> {
+) -> Result<Json<OAuthStartResponse>, (StatusCode, Json<Value>)> {
     let port = state.config.port;
     let session_state = generate_state();
 
@@ -176,7 +236,7 @@ pub async fn oauth_start(
         _ => false,
     };
     if !configured {
-        return Err((
+        return Err(oauth_json_error(
             StatusCode::SERVICE_UNAVAILABLE,
             format!(
                 "OAuth for {} is not configured. Set the required OAUTH_*_CLIENT_ID env vars.\n\
@@ -200,12 +260,13 @@ pub async fn oauth_start(
                 }))
                 .send()
                 .await
-                .map_err(|e| (StatusCode::BAD_GATEWAY, format!("GitHub device flow: {e}")))?;
+                .map_err(|e| {
+                    oauth_json_error(StatusCode::BAD_GATEWAY, format!("GitHub device flow: {e}"))
+                })?;
 
-            let body: Value = resp
-                .json()
-                .await
-                .map_err(|e| (StatusCode::BAD_GATEWAY, format!("GitHub response: {e}")))?;
+            let body: Value = resp.json().await.map_err(|e| {
+                oauth_json_error(StatusCode::BAD_GATEWAY, format!("GitHub response: {e}"))
+            })?;
 
             let device_code = body["device_code"].as_str().unwrap_or("").to_string();
             let user_code = body["user_code"].as_str().unwrap_or("").to_string();
@@ -339,7 +400,10 @@ pub async fn oauth_start(
 
         "codex" | "openai" => {
             // Codex/OpenAI: Authorization Code Flow with PKCE
-            let callback_url = redirect_uri(port, &provider);
+            start_codex_loopback_callback(state.clone())
+                .await
+                .map_err(|err| oauth_json_error(StatusCode::CONFLICT, err))?;
+            let callback_url = codex_redirect_uri();
             let code_verifier = generate_code_verifier();
             let code_challenge = base64_url(&sha256_digest(&code_verifier));
             let client_id = codex_client_id();
@@ -389,11 +453,90 @@ pub async fn oauth_start(
             }))
         }
 
-        _ => Err((
+        _ => Err(oauth_json_error(
             StatusCode::BAD_REQUEST,
             format!("Unsupported OAuth provider: {}", provider),
         )),
     }
+}
+
+async fn codex_loopback_callback(
+    State(state): State<AppState>,
+    Query(query): Query<OAuthCallbackQuery>,
+) -> Response {
+    let session_state = query.state.clone().unwrap_or_default();
+
+    let result = async {
+        if let Some(error) = &query.error {
+            return Err(error.clone());
+        }
+        let code = query
+            .code
+            .as_deref()
+            .ok_or_else(|| "Missing code parameter".to_string())?;
+        if session_state.is_empty() {
+            return Err("Missing state parameter".to_string());
+        }
+
+        exchange_code_for_token(&state, "openai", code, &session_state).await
+    }
+    .await;
+
+    match result {
+        Ok(access_token) => {
+            if let Some(session) = OAUTH_SESSIONS.lock().unwrap().get_mut(&session_state) {
+                session.access_token = Some(access_token);
+                session.status = "done".to_string();
+            }
+            stop_codex_loopback_callback();
+            Html(oauth_result_html(true, "You can close this window now.")).into_response()
+        }
+        Err(err) => {
+            if let Some(session) = OAUTH_SESSIONS.lock().unwrap().get_mut(&session_state) {
+                session.status = "error".to_string();
+                session.error = Some(err.clone());
+            }
+            stop_codex_loopback_callback();
+            Html(oauth_result_html(false, &err)).into_response()
+        }
+    }
+}
+
+fn oauth_result_html(success: bool, message: &str) -> String {
+    let title = if success {
+        "OAuth Success"
+    } else {
+        "OAuth Error"
+    };
+    let heading = if success {
+        "Authorization Complete"
+    } else {
+        "Authorization Failed"
+    };
+    let color = if success { "#2f7d5b" } else { "#b5453f" };
+    format!(
+        r#"<!DOCTYPE html>
+<html><head><title>{title}</title>
+<style>
+body {{ font-family: system-ui; max-width: 500px; margin: 100px auto; text-align: center; }}
+h1 {{ color: {color}; }}
+</style></head>
+<body>
+<h1>{heading}</h1>
+<p>{}</p>
+<script>setTimeout(() => window.close(), 1500);</script>
+</body></html>"#,
+        html_escape(message)
+    )
+}
+
+fn html_escape(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 // ── OAuth Callback ──────────────────────────────────────────────────────
@@ -563,7 +706,7 @@ async fn exchange_code_for_token(
         }
 
         "codex" | "openai" => {
-            let callback_url = redirect_uri(state.config.port, provider);
+            let callback_url = codex_redirect_uri();
             let code_verifier = OAUTH_SESSIONS
                 .lock()
                 .unwrap()
@@ -742,7 +885,7 @@ pub async fn oauth_exchange(
         }
 
         "codex" | "openai" => {
-            let callback_url = redirect_uri(port, &provider);
+            let callback_url = codex_redirect_uri();
 
             // Get code_verifier from session
             let code_verifier = {

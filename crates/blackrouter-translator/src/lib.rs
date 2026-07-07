@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use thiserror::Error;
 
 pub mod stream;
@@ -32,6 +32,29 @@ pub enum TranslationError {
 
 pub type Result<T> = std::result::Result<T, TranslationError>;
 
+const COMMANDCODE_MAX_TOKENS_LIMIT: u64 = 200_000;
+
+#[derive(Debug, Clone)]
+struct CommandCodeAccumulated {
+    content: String,
+    reasoning_content: String,
+    finish_reason: String,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+}
+
+impl Default for CommandCodeAccumulated {
+    fn default() -> Self {
+        Self {
+            content: String::new(),
+            reasoning_content: String::new(),
+            finish_reason: "stop".to_string(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+        }
+    }
+}
+
 /// Check if translation is a passthrough (same format)
 pub fn is_passthrough(source: WireFormat, target: WireFormat) -> bool {
     source == target
@@ -50,6 +73,8 @@ pub fn translate_request(body: &Value, from: WireFormat, to: WireFormat) -> Resu
         (WireFormat::OpenAiChat, WireFormat::Gemini) => openai_to_gemini(body),
         // OpenAI Chat -> Gemini CLI
         (WireFormat::OpenAiChat, WireFormat::GeminiCli) => openai_to_gemini_cli(body),
+        // OpenAI Chat -> OpenAI Responses
+        (WireFormat::OpenAiChat, WireFormat::OpenAiResponses) => openai_chat_to_responses(body),
         // Claude Messages -> OpenAI Chat
         (WireFormat::ClaudeMessages, WireFormat::OpenAiChat) => claude_to_openai(body),
         // Gemini -> OpenAI Chat
@@ -85,11 +110,154 @@ pub fn translate_response(body: &Value, from: WireFormat, to: WireFormat) -> Res
         (WireFormat::Kiro, WireFormat::OpenAiChat) => kiro_response_to_openai(body),
         // Antigravity -> OpenAI response
         (WireFormat::Antigravity, WireFormat::OpenAiChat) => antigravity_response_to_openai(body),
+        // OpenAI Responses -> OpenAI Chat response
+        (WireFormat::OpenAiResponses, WireFormat::OpenAiChat) => openai_responses_to_chat(body),
         // OpenAI Chat -> Claude response (for /v1/messages endpoint)
         (WireFormat::OpenAiChat, WireFormat::ClaudeMessages) => openai_response_to_claude(body),
         // Passthrough for same format or unsupported reverse
         _ => Ok(body.clone()),
     }
+}
+
+fn commandcode_finish_reason(reason: Option<&str>) -> &'static str {
+    match reason {
+        Some("length") => "length",
+        Some("tool-calls") | Some("tool_use") => "tool_calls",
+        Some("content-filter") => "content_filter",
+        _ => "stop",
+    }
+}
+
+fn commandcode_event_line(line: &str) -> Option<Value> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let json = trimmed
+        .strip_prefix("data:")
+        .map(str::trim)
+        .unwrap_or(trimmed);
+    if json.is_empty() || json == "[DONE]" {
+        return None;
+    }
+    serde_json::from_str(json).ok()
+}
+
+fn accumulate_commandcode_event(state: &mut CommandCodeAccumulated, event: &Value) {
+    match event.get("type").and_then(Value::as_str).unwrap_or("") {
+        "text-delta" => {
+            if let Some(text) = event
+                .get("text")
+                .or_else(|| event.get("delta"))
+                .and_then(Value::as_str)
+            {
+                state.content.push_str(text);
+            }
+        }
+        "reasoning-delta" => {
+            if let Some(text) = event.get("text").and_then(Value::as_str) {
+                state.reasoning_content.push_str(text);
+            }
+        }
+        "finish-step" => {
+            state.finish_reason =
+                commandcode_finish_reason(event.get("finishReason").and_then(Value::as_str))
+                    .to_string();
+            if let Some(usage) = event.get("usage") {
+                state.prompt_tokens = usage
+                    .get("inputTokens")
+                    .or_else(|| usage.get("prompt_tokens"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(state.prompt_tokens);
+                state.completion_tokens = usage
+                    .get("outputTokens")
+                    .or_else(|| usage.get("completion_tokens"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(state.completion_tokens);
+            }
+        }
+        "finish" => {
+            state.finish_reason =
+                commandcode_finish_reason(event.get("finishReason").and_then(Value::as_str))
+                    .to_string();
+            if let Some(usage) = event.get("totalUsage").or_else(|| event.get("usage")) {
+                state.prompt_tokens = usage
+                    .get("inputTokens")
+                    .or_else(|| usage.get("prompt_tokens"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(state.prompt_tokens);
+                state.completion_tokens = usage
+                    .get("outputTokens")
+                    .or_else(|| usage.get("completion_tokens"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(state.completion_tokens);
+            }
+        }
+        "error" => {
+            let message = event
+                .get("error")
+                .or_else(|| event.get("message"))
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_else(|| value.to_string())
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+            state
+                .content
+                .push_str(&format!("\n\n[CommandCode error: {message}]"));
+            state.finish_reason = "stop".to_string();
+        }
+        _ => {}
+    }
+}
+
+pub fn commandcode_stream_text_to_openai(text: &str, model: &str) -> Value {
+    let mut state = CommandCodeAccumulated::default();
+    for line in text.lines() {
+        if let Some(event) = commandcode_event_line(line) {
+            accumulate_commandcode_event(&mut state, &event);
+        }
+    }
+
+    let mut message = serde_json::json!({
+        "role": "assistant",
+        "content": state.content,
+    });
+    if !state.reasoning_content.is_empty() {
+        message.as_object_mut().unwrap().insert(
+            "reasoning_content".to_string(),
+            Value::String(state.reasoning_content),
+        );
+    }
+
+    serde_json::json!({
+        "id": format!("chatcmpl-commandcode-{}", blackrouter_common::unix_timestamp()),
+        "object": "chat.completion",
+        "created": blackrouter_common::unix_timestamp(),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": state.finish_reason
+        }],
+        "usage": {
+            "prompt_tokens": state.prompt_tokens,
+            "completion_tokens": state.completion_tokens,
+            "total_tokens": state.prompt_tokens + state.completion_tokens
+        }
+    })
+}
+
+pub fn commandcode_stream_token_usage(text: &str) -> (u64, u64) {
+    let mut state = CommandCodeAccumulated::default();
+    for line in text.lines() {
+        if let Some(event) = commandcode_event_line(line) {
+            accumulate_commandcode_event(&mut state, &event);
+        }
+    }
+    (state.prompt_tokens, state.completion_tokens)
 }
 
 // ============================================================
@@ -325,6 +493,201 @@ fn openai_to_gemini_cli(body: &Value) -> Result<Value> {
     }))
 }
 
+fn commandcode_flatten_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(value)) => value.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| match part {
+                Value::String(value) => Some(value.clone()),
+                Value::Object(object) => object
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Some(value) if !value.is_null() => value.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn commandcode_content_blocks(content: Option<&Value>) -> Vec<Value> {
+    match content {
+        Some(Value::String(value)) => vec![serde_json::json!({"type": "text", "text": value})],
+        Some(Value::Array(parts)) => {
+            let blocks: Vec<Value> = parts
+                .iter()
+                .filter_map(|part| match part {
+                    Value::String(value) => {
+                        Some(serde_json::json!({"type": "text", "text": value}))
+                    }
+                    Value::Object(object) => {
+                        if object.get("type").and_then(Value::as_str) == Some("text") {
+                            object
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .map(|text| serde_json::json!({"type": "text", "text": text}))
+                        } else if matches!(
+                            object.get("type").and_then(Value::as_str),
+                            Some("image_url" | "image")
+                        ) {
+                            Some(serde_json::json!({"type": "text", "text": "[image omitted]"}))
+                        } else {
+                            object
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .map(|text| serde_json::json!({"type": "text", "text": text}))
+                        }
+                    }
+                    _ => None,
+                })
+                .collect();
+            if blocks.is_empty() {
+                vec![serde_json::json!({"type": "text", "text": ""})]
+            } else {
+                blocks
+            }
+        }
+        Some(value) if !value.is_null() => {
+            vec![serde_json::json!({"type": "text", "text": value.to_string()})]
+        }
+        _ => vec![serde_json::json!({"type": "text", "text": ""})],
+    }
+}
+
+fn commandcode_json_arguments(value: Option<&Value>) -> Value {
+    match value {
+        Some(Value::String(raw)) => {
+            serde_json::from_str(raw).unwrap_or_else(|_| serde_json::json!({}))
+        }
+        Some(value) => value.clone(),
+        None => serde_json::json!({}),
+    }
+}
+
+fn commandcode_messages(messages: &[Value]) -> (Vec<Value>, Option<String>) {
+    let mut out = Vec::new();
+    let mut system = Vec::new();
+
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user");
+
+        match role {
+            "system" => {
+                let text = commandcode_flatten_text(message.get("content"));
+                if !text.is_empty() {
+                    system.push(text);
+                }
+            }
+            "tool" => {
+                let value = commandcode_flatten_text(message.get("content"));
+                out.push(serde_json::json!({
+                    "role": "tool",
+                    "content": [{
+                        "type": "tool-result",
+                        "toolCallId": message.get("tool_call_id").and_then(Value::as_str).unwrap_or(""),
+                        "toolName": message.get("name").and_then(Value::as_str).unwrap_or(""),
+                        "output": {"type": "text", "value": value}
+                    }]
+                }));
+            }
+            "assistant" => {
+                let mut blocks = Vec::new();
+                let text = commandcode_flatten_text(message.get("content"));
+                if !text.is_empty() {
+                    blocks.push(serde_json::json!({"type": "text", "text": text}));
+                }
+                if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+                    for tool_call in tool_calls {
+                        let function = tool_call.get("function");
+                        blocks.push(serde_json::json!({
+                            "type": "tool-call",
+                            "toolCallId": tool_call.get("id").and_then(Value::as_str).unwrap_or(""),
+                            "toolName": function
+                                .and_then(|value| value.get("name"))
+                                .and_then(Value::as_str)
+                                .unwrap_or(""),
+                            "input": commandcode_json_arguments(
+                                function
+                                    .and_then(|value| value.get("arguments"))
+                            )
+                        }));
+                    }
+                }
+                if blocks.is_empty() {
+                    blocks.push(serde_json::json!({"type": "text", "text": ""}));
+                }
+                out.push(serde_json::json!({"role": "assistant", "content": blocks}));
+            }
+            _ => {
+                out.push(serde_json::json!({
+                    "role": "user",
+                    "content": commandcode_content_blocks(message.get("content"))
+                }));
+            }
+        }
+    }
+
+    let system = if system.is_empty() {
+        None
+    } else {
+        Some(system.join("\n\n"))
+    };
+    (out, system)
+}
+
+fn commandcode_tools(tools: Option<&Value>) -> Option<Value> {
+    let tools = tools.and_then(Value::as_array)?;
+    let converted: Vec<Value> = tools
+        .iter()
+        .filter_map(|tool| {
+            if tool.get("type").and_then(Value::as_str) == Some("function") {
+                let function = tool.get("function")?;
+                Some(serde_json::json!({
+                    "name": function.get("name").cloned().unwrap_or(Value::String(String::new())),
+                    "description": function.get("description").cloned().unwrap_or(Value::Null),
+                    "input_schema": function
+                        .get("parameters")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({"type": "object"}))
+                }))
+            } else if tool.get("name").is_some() {
+                Some(serde_json::json!({
+                    "name": tool.get("name").cloned().unwrap_or(Value::String(String::new())),
+                    "description": tool.get("description").cloned().unwrap_or(Value::Null),
+                    "input_schema": tool
+                        .get("input_schema")
+                        .or_else(|| tool.get("parameters"))
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({"type": "object"}))
+                }))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if converted.is_empty() {
+        None
+    } else {
+        Some(Value::Array(converted))
+    }
+}
+
+fn commandcode_max_tokens(body: &Value) -> Value {
+    let requested = body
+        .get("max_tokens")
+        .or_else(|| body.get("max_completion_tokens"))
+        .or_else(|| body.get("max_output_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(64_000);
+    Value::Number(requested.min(COMMANDCODE_MAX_TOKENS_LIMIT).into())
+}
+
 fn openai_to_commandcode(body: &Value) -> Result<Value> {
     let messages = body
         .get("messages")
@@ -332,36 +695,55 @@ fn openai_to_commandcode(body: &Value) -> Result<Value> {
         .ok_or_else(|| TranslationError::MissingField("messages".into()))?;
 
     let model = body.get("model").and_then(Value::as_str).unwrap_or("");
+    let (cc_messages, system) = commandcode_messages(messages);
 
-    // CommandCode uses a different message format with role/content
-    let cc_messages: Vec<Value> = messages
-        .iter()
-        .filter_map(|msg| {
-            let role = msg.get("role").and_then(Value::as_str)?;
-            let content = msg.get("content")?;
-            Some(serde_json::json!({
-                "role": role,
-                "content": content
-            }))
-        })
-        .collect();
+    let mut params = Map::new();
+    params.insert("model".to_string(), Value::String(model.to_string()));
+    params.insert("messages".to_string(), Value::Array(cc_messages));
+    params.insert(
+        "stream".to_string(),
+        body.get("stream").cloned().unwrap_or(Value::Bool(false)),
+    );
+    params.insert("max_tokens".to_string(), commandcode_max_tokens(body));
+    params.insert(
+        "temperature".to_string(),
+        body.get("temperature")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!(0.3)),
+    );
 
-    let mut result = serde_json::json!({
-        "model": model,
-        "messages": cc_messages,
-    });
-
-    if let Some(max_tokens) = body
-        .get("max_tokens")
-        .or_else(|| body.get("max_completion_tokens"))
-    {
-        result
-            .as_object_mut()
-            .unwrap()
-            .insert("max_tokens".to_string(), max_tokens.clone());
+    if let Some(system) = system {
+        params.insert("system".to_string(), Value::String(system));
+    }
+    if let Some(top_p) = body.get("top_p") {
+        params.insert("top_p".to_string(), top_p.clone());
+    }
+    if let Some(tools) = commandcode_tools(body.get("tools")) {
+        params.insert("tools".to_string(), tools);
     }
 
-    Ok(result)
+    let working_dir = std::env::current_dir()
+        .ok()
+        .and_then(|path| path.to_str().map(ToOwned::to_owned))
+        .unwrap_or_default();
+    let now = blackrouter_common::unix_timestamp();
+
+    Ok(serde_json::json!({
+        "threadId": uuid::Uuid::new_v4().to_string(),
+        "memory": body.get("memory").and_then(Value::as_str).unwrap_or(""),
+        "config": {
+            "workingDir": working_dir,
+            "date": now.to_string(),
+            "environment": std::env::consts::OS,
+            "structure": [],
+            "isGitRepo": false,
+            "currentBranch": "",
+            "mainBranch": "",
+            "gitStatus": "",
+            "recentCommits": [],
+        },
+        "params": Value::Object(params),
+    }))
 }
 
 fn openai_to_cursor(body: &Value) -> Result<Value> {
@@ -940,6 +1322,174 @@ fn openai_response_to_claude(body: &Value) -> Result<Value> {
 // OpenAI Responses API conversion (for /v1/responses endpoint)
 // ============================================================
 
+/// Convert OpenAI Chat Completions request → OpenAI Responses API request.
+pub fn openai_chat_to_responses(body: &Value) -> Result<Value> {
+    let messages = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| TranslationError::MissingField("messages".to_string()))?;
+
+    let mut input = Vec::new();
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user");
+
+        if role == "tool" {
+            let output = message
+                .get("content")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| {
+                    message
+                        .get("content")
+                        .map(Value::to_string)
+                        .unwrap_or_default()
+                });
+            input.push(serde_json::json!({
+                "type": "function_call_output",
+                "call_id": message.get("tool_call_id").and_then(Value::as_str).unwrap_or("call"),
+                "output": output,
+            }));
+            continue;
+        }
+
+        if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+            for tool_call in tool_calls {
+                let id = tool_call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("call");
+                let function = tool_call.get("function").unwrap_or(&Value::Null);
+                input.push(serde_json::json!({
+                    "type": "function_call",
+                    "call_id": id,
+                    "name": function.get("name").and_then(Value::as_str).unwrap_or(""),
+                    "arguments": function.get("arguments").and_then(Value::as_str).unwrap_or("{}"),
+                }));
+            }
+        }
+
+        let content = chat_content_to_responses_content(role, message.get("content"));
+        input.push(serde_json::json!({
+            "role": role,
+            "content": content,
+        }));
+    }
+
+    let mut result = serde_json::json!({
+        "input": input,
+        "store": false,
+    });
+
+    for key in [
+        "model",
+        "temperature",
+        "top_p",
+        "stream",
+        "parallel_tool_calls",
+    ] {
+        if let Some(value) = body.get(key) {
+            result
+                .as_object_mut()
+                .unwrap()
+                .insert(key.to_string(), value.clone());
+        }
+    }
+
+    if let Some(max_tokens) = body
+        .get("max_output_tokens")
+        .or_else(|| body.get("max_completion_tokens"))
+        .or_else(|| body.get("max_tokens"))
+    {
+        result
+            .as_object_mut()
+            .unwrap()
+            .insert("max_output_tokens".to_string(), max_tokens.clone());
+    }
+
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        let converted = tools
+            .iter()
+            .map(chat_tool_to_responses_tool)
+            .collect::<Vec<_>>();
+        result
+            .as_object_mut()
+            .unwrap()
+            .insert("tools".to_string(), Value::Array(converted));
+    }
+    if let Some(tool_choice) = body.get("tool_choice") {
+        result
+            .as_object_mut()
+            .unwrap()
+            .insert("tool_choice".to_string(), tool_choice.clone());
+    }
+
+    Ok(result)
+}
+
+fn chat_content_to_responses_content(role: &str, content: Option<&Value>) -> Value {
+    match content {
+        Some(Value::Array(parts)) => Value::Array(
+            parts
+                .iter()
+                .filter_map(|part| {
+                    if let Some(text) = part.get("text").and_then(Value::as_str) {
+                        let part_type = if role == "assistant" {
+                            "output_text"
+                        } else {
+                            "input_text"
+                        };
+                        return Some(serde_json::json!({"type": part_type, "text": text}));
+                    }
+                    if let Some(image_url) = part.get("image_url") {
+                        return Some(serde_json::json!({
+                            "type": "input_image",
+                            "image_url": image_url.get("url").cloned().unwrap_or_else(|| image_url.clone())
+                        }));
+                    }
+                    None
+                })
+                .collect(),
+        ),
+        Some(Value::String(text)) => {
+            let part_type = if role == "assistant" {
+                "output_text"
+            } else {
+                "input_text"
+            };
+            serde_json::json!([{"type": part_type, "text": text}])
+        }
+        Some(other) => serde_json::json!([{"type": "input_text", "text": other.to_string()}]),
+        None => Value::Array(Vec::new()),
+    }
+}
+
+fn chat_tool_to_responses_tool(tool: &Value) -> Value {
+    if tool.get("type").and_then(Value::as_str) != Some("function") {
+        return tool.clone();
+    }
+    let function = tool.get("function").unwrap_or(tool);
+    let mut converted = serde_json::json!({
+        "type": "function",
+        "name": function.get("name").and_then(Value::as_str).unwrap_or(""),
+    });
+    if let Some(description) = function.get("description") {
+        converted
+            .as_object_mut()
+            .unwrap()
+            .insert("description".to_string(), description.clone());
+    }
+    if let Some(parameters) = function.get("parameters") {
+        converted
+            .as_object_mut()
+            .unwrap()
+            .insert("parameters".to_string(), parameters.clone());
+    }
+    converted
+}
+
 /// Convert OpenAI Responses API request → Chat Completions request
 pub fn responses_request_to_chat(body: &Value) -> Result<Value> {
     let model = body.get("model").and_then(Value::as_str).unwrap_or("");
@@ -1013,6 +1563,121 @@ pub fn responses_request_to_chat(body: &Value) -> Result<Value> {
     }
 
     Ok(chat_body)
+}
+
+/// Convert OpenAI Responses API response → Chat Completions response.
+pub fn openai_responses_to_chat(body: &Value) -> Result<Value> {
+    let id = body
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("chatcmpl_responses");
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("");
+
+    let mut content = String::new();
+    let mut tool_calls = Vec::new();
+    if let Some(output) = body.get("output").and_then(Value::as_array) {
+        for item in output {
+            match item.get("type").and_then(Value::as_str).unwrap_or("") {
+                "message" => {
+                    if let Some(parts) = item.get("content").and_then(Value::as_array) {
+                        for part in parts {
+                            if let Some(text) = part
+                                .get("text")
+                                .or_else(|| part.get("output_text"))
+                                .and_then(Value::as_str)
+                            {
+                                content.push_str(text);
+                            }
+                        }
+                    }
+                }
+                "function_call" => {
+                    let call_id = item
+                        .get("call_id")
+                        .or_else(|| item.get("id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("call");
+                    tool_calls.push(serde_json::json!({
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": item.get("name").and_then(Value::as_str).unwrap_or(""),
+                            "arguments": item.get("arguments").and_then(Value::as_str).unwrap_or("{}"),
+                        }
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut message = serde_json::json!({
+        "role": "assistant",
+        "content": content,
+    });
+    if !tool_calls.is_empty() {
+        message
+            .as_object_mut()
+            .unwrap()
+            .insert("tool_calls".to_string(), Value::Array(tool_calls));
+    }
+
+    let mut result = serde_json::json!({
+        "id": id,
+        "object": "chat.completion",
+        "created": blackrouter_common::unix_timestamp(),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": responses_finish_reason(body),
+        }],
+    });
+
+    if let Some(usage) = body.get("usage") {
+        let prompt_tokens = usage
+            .get("input_tokens")
+            .or_else(|| usage.get("prompt_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let completion_tokens = usage
+            .get("output_tokens")
+            .or_else(|| usage.get("completion_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        result.as_object_mut().unwrap().insert(
+            "usage".to_string(),
+            serde_json::json!({
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            }),
+        );
+    }
+
+    Ok(result)
+}
+
+fn responses_finish_reason(body: &Value) -> &'static str {
+    match body.get("status").and_then(Value::as_str) {
+        Some("incomplete") => "length",
+        _ => {
+            if body
+                .get("output")
+                .and_then(Value::as_array)
+                .map(|output| {
+                    output.iter().any(|item| {
+                        item.get("type").and_then(Value::as_str) == Some("function_call")
+                    })
+                })
+                .unwrap_or(false)
+            {
+                "tool_calls"
+            } else {
+                "stop"
+            }
+        }
+    }
 }
 
 /// Convert Chat Completions response → OpenAI Responses API response
@@ -1530,6 +2195,93 @@ mod tests {
             .get("generationConfig")
             .is_some());
         assert!(result.get("contents").is_none());
+    }
+
+    #[test]
+    fn test_openai_to_commandcode_wraps_params_memory_and_config() {
+        let body = json!({
+            "model": "black-deepseek",
+            "messages": [
+                {"role": "system", "content": "You are helpful"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "Hello"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+                ]},
+                {"role": "assistant", "content": "Let me check", "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{\"q\":\"x\"}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_1", "name": "lookup", "content": "done"}
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {"type": "object"}
+                }
+            }],
+            "stream": false,
+            "max_tokens": 123,
+            "temperature": 0.2
+        });
+
+        let result =
+            translate_request(&body, WireFormat::OpenAiChat, WireFormat::CommandCode).unwrap();
+
+        assert!(result.get("threadId").and_then(Value::as_str).is_some());
+        assert_eq!(result.get("memory").unwrap(), "");
+        assert!(result.get("config").unwrap().is_object());
+        assert!(result.get("model").is_none());
+
+        let params = result.get("params").unwrap();
+        assert_eq!(params.get("model").unwrap(), "black-deepseek");
+        assert_eq!(params.get("system").unwrap(), "You are helpful");
+        assert_eq!(params.get("stream").unwrap(), false);
+        assert_eq!(params.get("max_tokens").unwrap(), 123);
+        assert_eq!(params.get("temperature").unwrap(), 0.2);
+        assert!(params.get("tools").unwrap().is_array());
+
+        let messages = params.get("messages").unwrap().as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].get("role").unwrap(), "user");
+        assert!(messages[0].get("content").unwrap().is_array());
+        assert_eq!(
+            messages[0]["content"][1],
+            json!({"type": "text", "text": "[image omitted]"})
+        );
+        assert_eq!(messages[1]["content"][1]["type"], "tool-call");
+        assert_eq!(messages[1]["content"][1]["input"], json!({"q": "x"}));
+        assert_eq!(messages[2]["content"][0]["type"], "tool-result");
+    }
+
+    #[test]
+    fn test_openai_to_commandcode_defaults_to_non_streaming() {
+        let body = json!({
+            "model": "black-deepseek",
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+
+        let result =
+            translate_request(&body, WireFormat::OpenAiChat, WireFormat::CommandCode).unwrap();
+
+        assert_eq!(result["params"]["stream"], false);
+    }
+
+    #[test]
+    fn test_openai_to_commandcode_clamps_oversized_max_tokens() {
+        let body = json!({
+            "model": "black-deepseek",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 1_000_000,
+            "max_output_tokens": 250_000,
+            "max_completion_tokens": 300_000
+        });
+
+        let result =
+            translate_request(&body, WireFormat::OpenAiChat, WireFormat::CommandCode).unwrap();
+
+        assert_eq!(result["params"]["max_tokens"], 200_000);
     }
 
     #[test]

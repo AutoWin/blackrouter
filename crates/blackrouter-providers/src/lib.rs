@@ -130,6 +130,25 @@ const COMMANDCODE_MODELS: &[&str] = &[
     "Qwen/Qwen3.7-Max",
 ];
 
+const CODEX_MODELS: &[&str] = &[
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.3-codex",
+    "gpt-5.3-codex-review",
+    "gpt-5.3-codex-xhigh",
+    "gpt-5.3-codex-high",
+    "gpt-5.3-codex-low",
+    "gpt-5.3-codex-none",
+    "gpt-5.3-codex-spark",
+    "gpt-5.2-codex",
+    "gpt-5.2-codex-review",
+    "gpt-5.1-codex-max",
+    "gpt-5.1-codex",
+    "gpt-5.1-codex-mini",
+    "gpt-5-codex",
+    "gpt-5-codex-mini",
+];
+
 pub const PROVIDER_PROFILES: &[ProviderProfile] = &[
     ProviderProfile {
         id: "commandcode",
@@ -142,7 +161,10 @@ pub const PROVIDER_PROFILES: &[ProviderProfile] = &[
         api_key_hint: "user_... from ~/.commandcode/auth.json or commandcode.ai/studio",
         website: "https://commandcode.ai",
         models_url: "",
-        default_headers: &[],
+        default_headers: &[
+            ("x-command-code-version", "0.25.7"),
+            ("x-cli-environment", "cli"),
+        ],
         fallback_models: COMMANDCODE_MODELS,
     },
     ProviderProfile {
@@ -200,7 +222,7 @@ pub const PROVIDER_PROFILES: &[ProviderProfile] = &[
         website: "https://platform.openai.com",
         models_url: "",
         default_headers: &[],
-        fallback_models: &[],
+        fallback_models: CODEX_MODELS,
     },
     ProviderProfile {
         id: "anthropic",
@@ -368,7 +390,7 @@ pub const PROVIDER_PROFILES: &[ProviderProfile] = &[
         website: "https://chatgpt.com",
         models_url: "",
         default_headers: &[],
-        fallback_models: &[],
+        fallback_models: CODEX_MODELS,
     },
     ProviderProfile {
         id: "cursor",
@@ -467,6 +489,16 @@ pub fn builtin_provider_models(
             source: "builtin://gemini-cli",
             models: GEMINI_CLI_MODELS,
         }),
+        ("codex", _) | (_, "cx") => Some(BuiltinProviderModels {
+            label: "Codex",
+            source: "builtin://codex",
+            models: CODEX_MODELS,
+        }),
+        ("openai", _) => Some(BuiltinProviderModels {
+            label: "OpenAI/Codex",
+            source: "builtin://openai-codex",
+            models: CODEX_MODELS,
+        }),
         _ => None,
     }
 }
@@ -508,5 +540,13 @@ mod tests {
         let gemini_cli = builtin_provider_models("gemini-cli", None).unwrap();
         assert_eq!(gemini_cli.source, "builtin://gemini-cli");
         assert!(gemini_cli.models.contains(&"gemini-2.5-pro"));
+
+        let codex = builtin_provider_models("codex", None).unwrap();
+        assert_eq!(codex.source, "builtin://codex");
+        assert!(codex.models.contains(&"gpt-5.3-codex"));
+
+        let openai = builtin_provider_models("openai", None).unwrap();
+        assert_eq!(openai.source, "builtin://openai-codex");
+        assert!(openai.models.contains(&"gpt-5.3-codex"));
     }
 }

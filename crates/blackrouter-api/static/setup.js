@@ -66,6 +66,22 @@ async function getJson(path) {
   return response.json();
 }
 
+async function readResponsePayload(response) {
+  const contentType = response.headers.get("content-type") || "";
+  if (contentType.includes("application/json")) {
+    return response.json().catch(() => ({}));
+  }
+  const text = await response.text().catch(() => "");
+  return text ? { error: text } : {};
+}
+
+function responseErrorMessage(payload, fallback) {
+  if (typeof payload?.error === "string") return payload.error;
+  if (typeof payload?.error?.message === "string") return payload.error.message;
+  if (typeof payload?.message === "string") return payload.message;
+  return fallback;
+}
+
 async function sendJson(path, method, body) {
   const options = {
     method,
@@ -73,10 +89,9 @@ async function sendJson(path, method, body) {
   };
   if (body !== undefined) options.body = JSON.stringify(body);
   const response = await fetch(path, options);
-  const payload = await response.json().catch(() => ({}));
+  const payload = await readResponsePayload(response);
   if (!response.ok) {
-    const message = payload?.error?.message || `${path} ${response.status}`;
-    throw new Error(message);
+    throw new Error(responseErrorMessage(payload, `${path} ${response.status}`));
   }
   return payload;
 }
@@ -774,10 +789,11 @@ async function startOAuth(providerId) {
       `/api/oauth/${encodeURIComponent(providerId)}/start`,
       { method: "POST" },
     );
-    const result = await resp.json();
+    const result = await readResponsePayload(resp);
 
     if (!resp.ok) {
-      notice.textContent = "❌ " + (result.error || "Failed to start OAuth");
+      notice.textContent =
+        "❌ " + responseErrorMessage(result, "Failed to start OAuth");
       notice.classList.add("error");
       return;
     }

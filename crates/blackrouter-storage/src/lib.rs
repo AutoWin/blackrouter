@@ -548,7 +548,6 @@ impl Storage {
             WHERE provider = ?1
               AND isActive = 1
               AND COALESCE(status, 'unknown') NOT IN ('disabled', 'expired')
-              AND (cooldownUntil IS NULL OR cooldownUntil = '' OR CAST(cooldownUntil AS INTEGER) <= ?2)
               AND (expiresAt IS NULL OR expiresAt = '' OR CAST(expiresAt AS INTEGER) > ?2)
             ORDER BY COALESCE(priority, 999999) ASC, createdAt DESC
             LIMIT 1
@@ -599,7 +598,6 @@ impl Storage {
             WHERE provider = ?1
               AND isActive = 1
               AND COALESCE(status, 'unknown') NOT IN ('disabled', 'expired')
-              AND (cooldownUntil IS NULL OR cooldownUntil = '' OR CAST(cooldownUntil AS INTEGER) <= ?2)
               AND (expiresAt IS NULL OR expiresAt = '' OR CAST(expiresAt AS INTEGER) > ?2)
             ORDER BY COALESCE(priority, 999999) ASC, createdAt DESC
             "#,
@@ -1643,7 +1641,6 @@ fn ensure_active_provider(conn: &Connection, provider: &str) -> Result<()> {
             WHERE provider = ?1
               AND isActive = 1
               AND COALESCE(status, 'unknown') NOT IN ('disabled', 'expired')
-              AND (cooldownUntil IS NULL OR cooldownUntil = '' OR CAST(cooldownUntil AS INTEGER) <= ?2)
               AND (expiresAt IS NULL OR expiresAt = '' OR CAST(expiresAt AS INTEGER) > ?2)
             LIMIT 1
             "#,
@@ -2078,7 +2075,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_cooldown_and_expiry_block_active_routes() {
+    fn provider_cooldown_keeps_active_routes_but_expiry_blocks_them() {
         let (storage, path) = temp_storage("provider-runtime-status");
         let future = (blackrouter_common::unix_timestamp() + 60).to_string();
         let mut provider = active_provider("cline");
@@ -2088,8 +2085,8 @@ mod tests {
             .create_provider_connection(provider)
             .expect("provider creates");
 
-        assert!(storage.get_active_provider_connection_raw("cline").is_err());
-        assert!(storage.resolve_model_route("cline/model-a").is_err());
+        assert!(storage.get_active_provider_connection_raw("cline").is_ok());
+        assert!(storage.resolve_model_route("cline/model-a").is_ok());
 
         let record = storage.list_provider_connections().unwrap().remove(0);
         storage
