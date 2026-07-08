@@ -432,9 +432,74 @@ h2 {
     font-size: 14px;
 }
 
+.provider-email {
+    display: block;
+    color: var(--accent);
+    font-size: 12px;
+    font-weight: 600;
+    margin-top: 2px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
 .row span {
     color: var(--muted);
     font-size: 13px;
+}
+
+.limit-summary {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 10px;
+    margin-bottom: 12px;
+}
+
+.metric-tile,
+.limit-cell {
+    min-width: 0;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--panel);
+    padding: 10px;
+}
+
+.metric-tile span,
+.limit-cell span {
+    display: block;
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 800;
+    text-transform: uppercase;
+}
+
+.metric-tile strong,
+.limit-cell strong {
+    display: block;
+    margin-top: 4px;
+    overflow-wrap: anywhere;
+    font-size: 15px;
+}
+
+.metric-tile.danger {
+    border-color: var(--danger);
+    background: var(--danger-soft);
+    color: var(--danger);
+}
+
+.limit-list {
+    margin-top: 16px;
+}
+
+.limit-row {
+    align-items: stretch;
+    grid-template-columns: minmax(220px, 0.8fr) minmax(0, 1.8fr);
+}
+
+.limit-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 8px;
 }
 
 .model-stack {
@@ -501,7 +566,7 @@ h2 {
     }
 
     .tabs {
-        grid-template-columns: repeat(6, minmax(0, 1fr));
+        grid-template-columns: repeat(7, minmax(0, 1fr));
         overflow-x: auto;
     }
 
@@ -519,6 +584,12 @@ h2 {
     }
 
     .grid.two {
+        grid-template-columns: 1fr;
+    }
+
+    .limit-summary,
+    .limit-grid,
+    .limit-row {
         grid-template-columns: 1fr;
     }
 }

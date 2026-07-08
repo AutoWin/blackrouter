@@ -17,7 +17,7 @@ use blackrouter_storage::{
     ApiKeyRecord, CachedProviderModels, ComboRecord, CreatedApiKey, DailyUsage, ModelAliasRecord,
     ModelListItem, NewApiKey, NewCombo, NewModelAlias, NewProviderConnection,
     ProviderConnectionRecord, RawProviderConnection, RequestDetailEntry, Storage, StorageError,
-    StorageStatus, UsageEntry,
+    StorageStatus, UsageEntry, UsageRow,
 };
 use blackrouter_telegram::{
     TelegramBot, TelegramBotConfig, TelegramRuntime, Update as TelegramUpdate,
@@ -253,6 +253,7 @@ pub fn build_router(state: AppState) -> Router {
             "/api/setup/lb-strategy",
             get(get_lb_strategy).put(set_lb_strategy),
         )
+        .route("/api/provider-limits", get(provider_limits))
         .route("/v1/models", get(v1_models))
         .route("/v1beta/models", get(v1_models))
         .route("/v1/chat/completions", post(chat_completions_shell))
@@ -966,6 +967,148 @@ async fn set_lb_strategy(
     Json(LbStrategyResponse { strategy })
 }
 
+#[derive(Serialize)]
+struct ProviderLimitsResponse {
+    data: Vec<ProviderLimitRow>,
+    usage: Vec<UsageRow>,
+    metrics: blackrouter_rtk::RequestMetrics,
+    cost_guard: CostGuardStatus,
+}
+
+#[derive(Serialize)]
+struct ProviderLimitRow {
+    id: String,
+    provider: String,
+    name: Option<String>,
+    email: Option<String>,
+    is_active: bool,
+    status: String,
+    model: Option<String>,
+    upstream_rate_limit: Option<Value>,
+    rtk: Option<ProviderRtkLimit>,
+    usage: ProviderLimitUsage,
+}
+
+#[derive(Serialize)]
+struct ProviderRtkLimit {
+    limited: bool,
+    requests_remaining: u32,
+    tokens_remaining: u64,
+    concurrent_remaining: u32,
+    retry_after_seconds: Option<u64>,
+}
+
+#[derive(Default, Serialize)]
+struct ProviderLimitUsage {
+    requests: u64,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    cost: f64,
+}
+
+async fn provider_limits(
+    State(state): State<AppState>,
+) -> Result<Json<ProviderLimitsResponse>, ApiErrorResponse> {
+    let providers = state
+        .storage
+        .list_provider_connections()
+        .map_err(|error| storage_error_to_api(error, "provider listing failed"))?;
+    let usage = state
+        .storage
+        .usage_stats(None)
+        .map_err(|error| storage_error_to_api(error, "usage listing failed"))?;
+    let metrics = state.rtk.metrics().await;
+    let cost_guard = cost_guard_status(&state.storage)
+        .map_err(|error| ApiErrorResponse::internal(format!("cost guard failed: {error}")))?;
+
+    let mut rows = Vec::with_capacity(providers.len());
+    for provider in providers {
+        let upstream_rate_limit = provider
+            .data
+            .get("rateLimit")
+            .or_else(|| provider.data.get("rate_limit"))
+            .cloned();
+        let model = upstream_rate_limit
+            .as_ref()
+            .and_then(|value| value.get("model"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .or_else(|| first_provider_model(&provider.data));
+
+        let rtk = if let Some(model) = &model {
+            let status = state
+                .rtk
+                .rate_limit_status(&RequestKey {
+                    provider: provider.provider.clone(),
+                    model: model.clone(),
+                    api_key: None,
+                })
+                .await;
+            Some(ProviderRtkLimit {
+                limited: status.limited,
+                requests_remaining: status.requests_remaining,
+                tokens_remaining: status.tokens_remaining,
+                concurrent_remaining: status.concurrent_remaining,
+                retry_after_seconds: status.retry_after.map(|duration| duration.as_secs()),
+            })
+        } else {
+            None
+        };
+
+        let mut provider_usage = ProviderLimitUsage::default();
+        for row in usage.iter().filter(|row| row.provider == provider.provider) {
+            provider_usage.requests += row.count;
+            provider_usage.prompt_tokens += row.prompt_tokens;
+            provider_usage.completion_tokens += row.completion_tokens;
+            provider_usage.cost += row.cost;
+        }
+
+        rows.push(ProviderLimitRow {
+            id: provider.id,
+            provider: provider.provider,
+            name: provider.name,
+            email: provider.email,
+            is_active: provider.is_active,
+            status: provider.status,
+            model,
+            upstream_rate_limit,
+            rtk,
+            usage: provider_usage,
+        });
+    }
+
+    Ok(Json(ProviderLimitsResponse {
+        data: rows,
+        usage,
+        metrics,
+        cost_guard,
+    }))
+}
+
+fn first_provider_model(data: &Value) -> Option<String> {
+    let models = data.get("models")?.as_array()?;
+    models.iter().find_map(|model| {
+        if let Some(value) = model
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(value.to_string());
+        }
+        if let Some(object) = model.as_object() {
+            return object
+                .get("id")
+                .or_else(|| object.get("name"))
+                .or_else(|| object.get("model"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned);
+        }
+        None
+    })
+}
+
 async fn check_provider_connection(provider: RawProviderConnection) -> ProviderTestResponse {
     let base_url = provider
         .data
@@ -1314,6 +1457,150 @@ fn apply_codex_headers(request: reqwest::RequestBuilder) -> reqwest::RequestBuil
         .header(header::ACCEPT, "application/json, text/event-stream")
 }
 
+fn sanitize_codex_responses_body(body: &mut Value) {
+    if let Some(object) = body.as_object_mut() {
+        for key in CODEX_UNSUPPORTED_REQUEST_PARAMS {
+            object.remove(*key);
+        }
+        object.insert("stream".to_string(), Value::Bool(true));
+    }
+}
+
+const CODEX_UNSUPPORTED_REQUEST_PARAMS: &[&str] = &[
+    "max_output_tokens",
+    "temperature",
+    "top_p",
+    "frequency_penalty",
+    "presence_penalty",
+    "logprobs",
+    "top_logprobs",
+    "seed",
+];
+
+fn codex_stream_to_chat_response(
+    bytes: &[u8],
+    model: &str,
+) -> Result<(Value, u64, u64), ApiErrorResponse> {
+    let raw = String::from_utf8_lossy(bytes);
+    let mut content = String::new();
+    let mut reasoning_content = String::new();
+    let mut prompt_tokens = 0;
+    let mut completion_tokens = 0;
+
+    for event in raw.split("\n\n") {
+        let Some(data) = sse_data(event) else {
+            continue;
+        };
+        if data == "[DONE]" {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&data) else {
+            continue;
+        };
+        match value.get("type").and_then(Value::as_str).unwrap_or("") {
+            "response.output_text.delta" => {
+                if let Some(delta) = value
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .or_else(|| value.get("text").and_then(Value::as_str))
+                {
+                    content.push_str(delta);
+                }
+            }
+            "response.reasoning_text.delta" => {
+                if let Some(delta) = value
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .or_else(|| value.get("text").and_then(Value::as_str))
+                {
+                    reasoning_content.push_str(delta);
+                }
+            }
+            "response.output_text.done" => {
+                if content.is_empty() {
+                    if let Some(text) = value.get("text").and_then(Value::as_str) {
+                        content.push_str(text);
+                    }
+                }
+            }
+            "response.completed" => {
+                if let Some(usage) = value
+                    .get("response")
+                    .and_then(|response| response.get("usage"))
+                {
+                    prompt_tokens = usage
+                        .get("input_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(prompt_tokens);
+                    completion_tokens = usage
+                        .get("output_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(completion_tokens);
+                }
+            }
+            "response.failed" | "error" => {
+                let message = value
+                    .get("error")
+                    .and_then(|error| error.get("message").or_else(|| error.get("error")))
+                    .and_then(Value::as_str)
+                    .or_else(|| value.get("message").and_then(Value::as_str))
+                    .unwrap_or("Codex stream error");
+                return Err(ApiErrorResponse::new(
+                    StatusCode::BAD_GATEWAY,
+                    format!("codex stream failed: {message}"),
+                    "provider_error",
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    let mut message = json!({
+        "role": "assistant",
+        "content": content,
+    });
+    if !reasoning_content.is_empty() {
+        message.as_object_mut().unwrap().insert(
+            "reasoning_content".to_string(),
+            Value::String(reasoning_content),
+        );
+    }
+
+    Ok((
+        json!({
+            "id": format!("chatcmpl-codex-{}", unix_timestamp()),
+            "object": "chat.completion",
+            "created": unix_timestamp(),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": message,
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens
+            }
+        }),
+        prompt_tokens,
+        completion_tokens,
+    ))
+}
+
+fn sse_data(event: &str) -> Option<String> {
+    let lines = event
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("data:").map(str::trim))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
 fn provider_models_url(data: &Value) -> Result<String, ApiErrorResponse> {
     if let Some(models_url) = data
         .get("modelsUrl")
@@ -1512,16 +1799,6 @@ fn extract_codex_model_ids(payload: &Value) -> Vec<String> {
             continue;
         };
         models.push(id.to_string());
-
-        let is_chat_model = item
-            .get("type")
-            .and_then(Value::as_str)
-            .map(|kind| kind != "image")
-            .unwrap_or(true)
-            && !id.to_ascii_lowercase().contains("embed");
-        if is_chat_model && !id.ends_with("-review") {
-            models.push(format!("{id}-review"));
-        }
     }
     models.sort();
     models.dedup();
@@ -2099,6 +2376,263 @@ fn record_request_details_async(
     });
 }
 
+fn upstream_rate_limit_snapshot(
+    headers: &reqwest::header::HeaderMap,
+    status: u16,
+    model: &str,
+) -> Option<Value> {
+    let mut values = serde_json::Map::new();
+    for header_name in [
+        "x-ratelimit-limit-requests",
+        "x-ratelimit-remaining-requests",
+        "x-ratelimit-reset-requests",
+        "x-ratelimit-limit-tokens",
+        "x-ratelimit-remaining-tokens",
+        "x-ratelimit-reset-tokens",
+        "retry-after",
+    ] {
+        if let Some(value) = headers
+            .get(header_name)
+            .and_then(|value| value.to_str().ok())
+        {
+            values.insert(header_name.to_string(), Value::String(value.to_string()));
+        }
+    }
+
+    if values.is_empty() {
+        return None;
+    }
+
+    Some(json!({
+        "observedAt": blackrouter_common::unix_timestamp().to_string(),
+        "status": status,
+        "model": model,
+        "headers": values,
+    }))
+}
+
+fn record_provider_rate_limit_async(storage: &Storage, provider_id: &str, snapshot: Value) {
+    let storage = storage.clone();
+    let provider_id = provider_id.to_string();
+    tokio::spawn(async move {
+        if let Err(error) = storage.set_provider_rate_limit_snapshot(&provider_id, snapshot) {
+            tracing::warn!("failed to record provider rate-limit snapshot: {error}");
+        }
+    });
+}
+
+fn apply_upstream_rate_limit_headers(
+    mut builder: axum::http::response::Builder,
+    snapshot: Option<&Value>,
+) -> axum::http::response::Builder {
+    let Some(headers) = snapshot
+        .and_then(|value| value.get("headers"))
+        .and_then(Value::as_object)
+    else {
+        return builder;
+    };
+
+    for (source, target) in [
+        (
+            "x-ratelimit-limit-requests",
+            "x-upstream-ratelimit-limit-requests",
+        ),
+        (
+            "x-ratelimit-remaining-requests",
+            "x-upstream-ratelimit-remaining-requests",
+        ),
+        (
+            "x-ratelimit-reset-requests",
+            "x-upstream-ratelimit-reset-requests",
+        ),
+        (
+            "x-ratelimit-limit-tokens",
+            "x-upstream-ratelimit-limit-tokens",
+        ),
+        (
+            "x-ratelimit-remaining-tokens",
+            "x-upstream-ratelimit-remaining-tokens",
+        ),
+        (
+            "x-ratelimit-reset-tokens",
+            "x-upstream-ratelimit-reset-tokens",
+        ),
+        ("retry-after", "x-upstream-retry-after"),
+    ] {
+        if let Some(value) = headers.get(source).and_then(Value::as_str) {
+            builder = builder.header(target, value);
+        }
+    }
+
+    builder
+}
+
+fn oauth_refresh_token(data: &Value) -> Option<&str> {
+    data.get("refreshToken")
+        .or_else(|| data.get("refresh_token"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn oauth_token_needs_refresh(data: &Value) -> bool {
+    let Some(expires_at) = data
+        .get("tokenExpiresAt")
+        .or_else(|| data.get("token_expires_at"))
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        // Older saved OAuth providers may not have an expiry timestamp.
+        // If a refresh token is available, refresh proactively instead of
+        // waiting for the upstream request to fail with invalid credentials.
+        return oauth_refresh_token(data).is_some();
+    };
+    expires_at <= blackrouter_common::unix_timestamp().saturating_add(60)
+}
+
+async fn refresh_google_oauth_access_token(
+    state: &AppState,
+    provider: &RawProviderConnection,
+    data: &mut Value,
+) -> Result<bool, ApiErrorResponse> {
+    let Some(refresh_token) = oauth_refresh_token(data).map(ToOwned::to_owned) else {
+        return Ok(false);
+    };
+
+    let provider_kind = provider.provider.to_ascii_lowercase();
+    let (client_id, client_secret) = if provider_kind == "antigravity"
+        || data.get("format").and_then(Value::as_str) == Some("antigravity")
+    {
+        (
+            std::env::var("OAUTH_ANTIGRAVITY_CLIENT_ID").unwrap_or_default(),
+            std::env::var("OAUTH_ANTIGRAVITY_CLIENT_SECRET").unwrap_or_default(),
+        )
+    } else if provider_kind == "gemini"
+        || data.get("format").and_then(Value::as_str) == Some("gemini-cli")
+    {
+        (
+            std::env::var("OAUTH_GOOGLE_CLIENT_ID").unwrap_or_default(),
+            std::env::var("OAUTH_GOOGLE_CLIENT_SECRET").unwrap_or_default(),
+        )
+    } else {
+        return Ok(false);
+    };
+
+    if client_id.is_empty() || client_secret.is_empty() {
+        return Err(ApiErrorResponse::new(
+            StatusCode::BAD_GATEWAY,
+            "oauth refresh failed: missing OAuth client credentials",
+            "provider_error",
+        ));
+    }
+
+    let response = state
+        .http_client
+        .post("https://oauth2.googleapis.com/token")
+        .form(&[
+            ("client_id", client_id.as_str()),
+            ("client_secret", client_secret.as_str()),
+            ("refresh_token", refresh_token.as_str()),
+            ("grant_type", "refresh_token"),
+        ])
+        .send()
+        .await
+        .map_err(|error| {
+            ApiErrorResponse::new(
+                StatusCode::BAD_GATEWAY,
+                format!("oauth refresh request failed: {error}"),
+                "provider_error",
+            )
+        })?;
+
+    let status = response.status();
+    let body: Value = response.json().await.unwrap_or_else(|_| json!({}));
+    if !status.is_success() {
+        let message = body
+            .get("error_description")
+            .or_else(|| body.get("error"))
+            .and_then(Value::as_str)
+            .unwrap_or("token refresh rejected");
+        return Err(ApiErrorResponse::new(
+            StatusCode::BAD_GATEWAY,
+            format!("oauth refresh failed: {message}"),
+            "provider_error",
+        ));
+    }
+
+    let access_token = body
+        .get("access_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ApiErrorResponse::new(
+                StatusCode::BAD_GATEWAY,
+                "oauth refresh failed: no access_token in response",
+                "provider_error",
+            )
+        })?;
+    let token_expires_at = body
+        .get("expires_in")
+        .and_then(Value::as_u64)
+        .map(|seconds| {
+            blackrouter_common::unix_timestamp()
+                .saturating_add(seconds)
+                .to_string()
+        });
+
+    if let Some(object) = data.as_object_mut() {
+        if object.contains_key("apiKey") {
+            object.insert(
+                "apiKey".to_string(),
+                Value::String(access_token.to_string()),
+            );
+        }
+        object.insert(
+            "accessToken".to_string(),
+            Value::String(access_token.to_string()),
+        );
+        if let Some(token_expires_at) = &token_expires_at {
+            object.insert(
+                "tokenExpiresAt".to_string(),
+                Value::String(token_expires_at.clone()),
+            );
+        }
+    }
+
+    state
+        .storage
+        .set_provider_oauth_access_token(&provider.id, access_token, token_expires_at)
+        .map_err(|error| storage_error_to_api(error, "oauth token save failed"))?;
+
+    Ok(true)
+}
+
+fn build_upstream_request(
+    state: &AppState,
+    provider: &RawProviderConnection,
+    request_url: &str,
+    upstream_body: &Value,
+    auth_data: &Value,
+    target_format: WireFormat,
+    uses_codex_backend: bool,
+) -> reqwest::RequestBuilder {
+    let request = state.http_client.post(request_url).json(upstream_body);
+    let mut request = apply_auth(request, &provider.auth_type, auth_data);
+
+    if target_format == WireFormat::Antigravity {
+        request = request
+            .header("User-Agent", "antigravity/1.107.0")
+            .header("x-request-source", "local");
+    } else if target_format == WireFormat::CommandCode {
+        request = apply_commandcode_headers(request);
+    } else if uses_codex_backend {
+        request = apply_codex_headers(request);
+    }
+
+    request
+}
+
 async fn proxy_chat_completions(
     state: &AppState,
     body: Value,
@@ -2337,6 +2871,7 @@ async fn proxy_with_specific_provider(
     api_key: Option<&str>,
     provider: &RawProviderConnection,
 ) -> Result<Response, ApiErrorResponse> {
+    let mut auth_data = provider.data.clone();
     let mut format = provider
         .data
         .get("format")
@@ -2403,6 +2938,9 @@ async fn proxy_with_specific_provider(
             object.insert("model".to_string(), Value::String(model.model.clone()));
         }
     }
+    if uses_codex_backend {
+        sanitize_codex_responses_body(&mut upstream_body);
+    }
 
     // For translated streaming (OpenAI→Claude/Gemini with stream=true),
     // keep stream flag and use SSE event-by-event translation (Phase 2.3).
@@ -2424,8 +2962,7 @@ async fn proxy_with_specific_provider(
     if target_format == WireFormat::Antigravity {
         // Add project (from provider data or generate fallback) and requestId
         if let Some(object) = upstream_body.as_object_mut() {
-            let project = provider
-                .data
+            let project = auth_data
                 .get("projectId")
                 .and_then(Value::as_str)
                 .unwrap_or("blackrouter");
@@ -2437,18 +2974,8 @@ async fn proxy_with_specific_provider(
         }
     }
 
-    let request = state.http_client.post(&request_url).json(&upstream_body);
-    let mut request = apply_auth(request, &provider.auth_type, &provider.data);
-
-    // Add Antigravity-specific headers.
-    if target_format == WireFormat::Antigravity {
-        request = request
-            .header("User-Agent", "antigravity/1.107.0")
-            .header("x-request-source", "local");
-    } else if target_format == WireFormat::CommandCode {
-        request = apply_commandcode_headers(request);
-    } else if uses_codex_backend {
-        request = apply_codex_headers(request);
+    if target_format == WireFormat::Antigravity && oauth_token_needs_refresh(&auth_data) {
+        refresh_google_oauth_access_token(state, provider, &mut auth_data).await?;
     }
 
     let request_key = RequestKey {
@@ -2483,7 +3010,16 @@ async fn proxy_with_specific_provider(
     let start_time = std::time::Instant::now();
 
     // Send request
-    let response = match request.send().await {
+    let request = build_upstream_request(
+        state,
+        provider,
+        &request_url,
+        &upstream_body,
+        &auth_data,
+        target_format,
+        uses_codex_backend,
+    );
+    let mut response = match request.send().await {
         Ok(r) => r,
         Err(error) => {
             state
@@ -2508,7 +3044,41 @@ async fn proxy_with_specific_provider(
         }
     };
 
-    let status = response.status();
+    let mut status = response.status();
+    let mut upstream_rate_limit =
+        upstream_rate_limit_snapshot(response.headers(), status.as_u16(), &model.model);
+    if let Some(snapshot) = upstream_rate_limit.clone() {
+        record_provider_rate_limit_async(&state.storage, &provider.id, snapshot);
+    }
+
+    if target_format == WireFormat::Antigravity
+        && matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+        && oauth_refresh_token(&auth_data).is_some()
+    {
+        refresh_google_oauth_access_token(state, provider, &mut auth_data).await?;
+        let retry_request = build_upstream_request(
+            state,
+            provider,
+            &request_url,
+            &upstream_body,
+            &auth_data,
+            target_format,
+            uses_codex_backend,
+        );
+        response = retry_request.send().await.map_err(|error| {
+            ApiErrorResponse::new(
+                StatusCode::BAD_GATEWAY,
+                format!("provider retry after oauth refresh failed: {error}"),
+                "provider_error",
+            )
+        })?;
+        status = response.status();
+        upstream_rate_limit =
+            upstream_rate_limit_snapshot(response.headers(), status.as_u16(), &model.model);
+        if let Some(snapshot) = upstream_rate_limit.clone() {
+            record_provider_rate_limit_async(&state.storage, &provider.id, snapshot);
+        }
+    }
 
     // Non-success: record failure and return error (allows combo fallback)
     if !status.is_success() {
@@ -2555,18 +3125,18 @@ async fn proxy_with_specific_provider(
         let stream = response.bytes_stream();
         let body = Body::from_stream(stream);
 
-        return Response::builder()
+        let builder = Response::builder()
             .status(status)
             .header(
                 header::CONTENT_TYPE,
                 content_type.unwrap_or_else(|| "text/event-stream".to_string()),
             )
             .header("Cache-Control", "no-cache")
-            .header("Connection", "keep-alive")
-            .body(body)
-            .map_err(|error| {
-                ApiErrorResponse::internal(format!("failed to build stream response: {error}"))
-            });
+            .header("Connection", "keep-alive");
+        let builder = apply_upstream_rate_limit_headers(builder, upstream_rate_limit.as_ref());
+        return builder.body(body).map_err(|error| {
+            ApiErrorResponse::internal(format!("failed to build stream response: {error}"))
+        });
     }
 
     // ============================================================
@@ -2586,17 +3156,17 @@ async fn proxy_with_specific_provider(
                 translate_sse_stream(upstream_stream, target_format, model.model.clone());
             let body = Body::from_stream(translated);
 
-            return Response::builder()
+            let builder = Response::builder()
                 .status(status)
                 .header(header::CONTENT_TYPE, "text/event-stream")
                 .header("Cache-Control", "no-cache")
-                .header("Connection", "keep-alive")
-                .body(body)
-                .map_err(|error| {
-                    ApiErrorResponse::internal(format!(
-                        "failed to build translated stream response: {error}"
-                    ))
-                });
+                .header("Connection", "keep-alive");
+            let builder = apply_upstream_rate_limit_headers(builder, upstream_rate_limit.as_ref());
+            return builder.body(body).map_err(|error| {
+                ApiErrorResponse::internal(format!(
+                    "failed to build translated stream response: {error}"
+                ))
+            });
         }
     }
 
@@ -2618,12 +3188,22 @@ async fn proxy_with_specific_provider(
         }
     };
 
-    // Parse token usage from upstream response (Phase 3.1)
-    let (prompt_tokens, completion_tokens) = if target_format == WireFormat::CommandCode {
-        commandcode_stream_token_usage(&String::from_utf8_lossy(&bytes))
+    let codex_chat_response = if uses_codex_backend && target_format == WireFormat::OpenAiResponses
+    {
+        Some(codex_stream_to_chat_response(&bytes, &model.model)?)
     } else {
-        parse_token_usage(&bytes, target_format)
+        None
     };
+
+    // Parse token usage from upstream response (Phase 3.1)
+    let (prompt_tokens, completion_tokens) =
+        if let Some((_, prompt, completion)) = &codex_chat_response {
+            (*prompt, *completion)
+        } else if target_format == WireFormat::CommandCode {
+            commandcode_stream_token_usage(&String::from_utf8_lossy(&bytes))
+        } else {
+            parse_token_usage(&bytes, target_format)
+        };
 
     // Cost calculation (Phase 3.1)
     let cost = calculate_cost(
@@ -2690,11 +3270,14 @@ async fn proxy_with_specific_provider(
             "completion_tokens": completion_tokens,
             "cost": cost,
             "latency_ms": start_time.elapsed().as_millis(),
+            "upstream_rate_limit": upstream_rate_limit.clone(),
         }),
     );
 
     // Translate response back to OpenAI format if needed
-    let response_body = if target_format != WireFormat::OpenAiChat {
+    let response_body = if let Some((response_value, _, _)) = codex_chat_response {
+        serde_json::to_vec(&response_value).unwrap_or_else(|_| bytes.to_vec())
+    } else if target_format != WireFormat::OpenAiChat {
         if target_format == WireFormat::CommandCode {
             let translated =
                 commandcode_stream_text_to_openai(&String::from_utf8_lossy(&bytes), &model.model);
@@ -2724,6 +3307,7 @@ async fn proxy_with_specific_provider(
     if let Some(content_type) = content_type_for_cache.clone() {
         builder = builder.header(header::CONTENT_TYPE, content_type);
     }
+    builder = apply_upstream_rate_limit_headers(builder, upstream_rate_limit.as_ref());
     // Add rate limit headers
     for (key, value) in rate_limit_headers(&state.rtk, &model.provider, &model.model).await {
         builder = builder.header(key, value);
@@ -3330,9 +3914,10 @@ impl IntoResponse for ApiErrorResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        builtin_provider_models, classify_provider_post_response, derive_models_url,
-        extract_api_key, extract_codex_model_ids, extract_model_ids, provider_check_post_body,
-        provider_check_uses_post, provider_uses_codex_model_catalog, should_cooldown_provider,
+        builtin_provider_models, classify_provider_post_response, codex_stream_to_chat_response,
+        derive_models_url, extract_api_key, extract_codex_model_ids, extract_model_ids,
+        provider_check_post_body, provider_check_uses_post, provider_uses_codex_model_catalog,
+        sanitize_codex_responses_body, should_cooldown_provider,
     };
     use axum::http::{HeaderMap, StatusCode};
     use base64::Engine;
@@ -3465,10 +4050,11 @@ mod tests {
     }
 
     #[test]
-    fn extracts_codex_models_and_review_variants() {
+    fn extracts_codex_models_without_synthesizing_review_variants() {
         let models = extract_codex_model_ids(&json!({
             "data": [
                 { "id": "gpt-5.3-codex", "type": "llm" },
+                { "id": "gpt-5.3-codex-review", "type": "llm" },
                 { "slug": "gpt-image-2", "type": "image" }
             ]
         }));
@@ -3477,6 +4063,47 @@ mod tests {
         assert!(models.contains(&"gpt-5.3-codex-review".to_string()));
         assert!(models.contains(&"gpt-image-2".to_string()));
         assert!(!models.contains(&"gpt-image-2-review".to_string()));
+        assert!(!models.contains(&"gpt-5.5-review".to_string()));
+    }
+
+    #[test]
+    fn codex_backend_body_drops_unsupported_max_output_tokens() {
+        let mut body = json!({
+            "model": "gpt-5.5",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+            "max_output_tokens": 16,
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "stream": false
+        });
+
+        sanitize_codex_responses_body(&mut body);
+
+        assert!(body.get("max_output_tokens").is_none());
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("top_p").is_none());
+        assert_eq!(body.get("model").unwrap(), "gpt-5.5");
+        assert_eq!(body.get("stream").unwrap(), true);
+    }
+
+    #[test]
+    fn codex_stream_converts_to_non_stream_chat_response() {
+        let raw = concat!(
+            "data: {\"type\":\"response.created\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"o\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"k\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        let (body, prompt_tokens, completion_tokens) =
+            codex_stream_to_chat_response(raw.as_bytes(), "gpt-5.5").unwrap();
+
+        assert_eq!(prompt_tokens, 3);
+        assert_eq!(completion_tokens, 1);
+        assert_eq!(body["model"], "gpt-5.5");
+        assert_eq!(body["choices"][0]["message"]["content"], "ok");
+        assert_eq!(body["usage"]["total_tokens"], 4);
     }
 
     #[test]

@@ -1461,7 +1461,14 @@ fn chat_content_to_responses_content(role: &str, content: Option<&Value>) -> Val
             };
             serde_json::json!([{"type": part_type, "text": text}])
         }
-        Some(other) => serde_json::json!([{"type": "input_text", "text": other.to_string()}]),
+        Some(other) => {
+            let part_type = if role == "assistant" {
+                "output_text"
+            } else {
+                "input_text"
+            };
+            serde_json::json!([{"type": part_type, "text": other.to_string()}])
+        }
         None => Value::Array(Vec::new()),
     }
 }
@@ -2266,6 +2273,25 @@ mod tests {
             translate_request(&body, WireFormat::OpenAiChat, WireFormat::CommandCode).unwrap();
 
         assert_eq!(result["params"]["stream"], false);
+    }
+
+    #[test]
+    fn test_openai_to_responses_uses_output_text_for_non_string_assistant_content() {
+        let body = json!({
+            "model": "gpt-5.5",
+            "messages": [{
+                "role": "assistant",
+                "content": {"text": "previous answer"}
+            }]
+        });
+
+        let result =
+            translate_request(&body, WireFormat::OpenAiChat, WireFormat::OpenAiResponses).unwrap();
+
+        assert_eq!(
+            result["input"][0]["content"][0]["type"],
+            json!("output_text")
+        );
     }
 
     #[test]

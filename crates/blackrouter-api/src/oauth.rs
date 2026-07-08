@@ -102,6 +102,7 @@ pub(crate) struct OAuthPollResponse {
     status: String,
     access_token: Option<String>,
     refresh_token: Option<String>,
+    token_expires_at: Option<String>,
     email: Option<String>,
     project_id: Option<String>,
     error: Option<String>,
@@ -539,6 +540,35 @@ fn html_escape(input: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+fn oauth_redirect_html(success: bool, message: &str) -> String {
+    let title = if success {
+        "OAuth Success"
+    } else {
+        "OAuth Error"
+    };
+    let heading = if success {
+        "Authorization Complete"
+    } else {
+        "Authorization Failed"
+    };
+    let color = if success { "#2f7d5b" } else { "#b5453f" };
+    format!(
+        r#"<!DOCTYPE html>
+<html><head><title>{title}</title>
+<style>
+body {{ font-family: system-ui; max-width: 500px; margin: 100px auto; text-align: center; }}
+h1 {{ color: {color}; }}
+</style></head>
+<body>
+<h1>{heading}</h1>
+<p>{}</p>
+<p>Returning to BlackRouter setup...</p>
+<script>setTimeout(() => window.location.replace('/setup'), 1200);</script>
+</body></html>"#,
+        html_escape(message)
+    )
+}
+
 // ── OAuth Callback ──────────────────────────────────────────────────────
 
 /// GET /api/oauth/{provider}/callback
@@ -549,12 +579,7 @@ pub async fn oauth_callback(
     Query(query): Query<OAuthCallbackQuery>,
 ) -> Response {
     if let Some(error) = &query.error {
-        let html = format!(
-            r#"<!DOCTYPE html><html><head><title>OAuth Error</title></head>
-<body style="font-family:system-ui;max-width:500px;margin:100px auto;text-align:center">
-<h1 style="color:#b5453f">❌ OAuth Failed</h1><p>{}</p></body></html>"#,
-            error
-        );
+        let html = oauth_redirect_html(false, error);
         return Html(html).into_response();
     }
 
@@ -570,49 +595,41 @@ pub async fn oauth_callback(
 
     match token_result {
         Ok(access_token) => {
-            // Store in session
-            if let Some(session) = OAUTH_SESSIONS.lock().unwrap().get_mut(&session_state) {
-                session.access_token = Some(access_token.clone());
-                session.status = "done".to_string();
-            }
-
-            // For antigravity, run onboarding in background to get project_id
             if provider == "antigravity" {
-                let state_clone = state.clone();
-                let token = access_token;
-                let state_key = session_state.clone();
-                tokio::spawn(async move {
-                    match antigravity_onboard(&state_clone, &token).await {
-                        Ok(project_id) => {
-                            if let Some(session) =
-                                OAUTH_SESSIONS.lock().unwrap().get_mut(&state_key)
-                            {
-                                session.project_id = Some(project_id);
-                                tracing::info!("Antigravity onboarding complete");
-                            }
-                        }
-                        Err(err) => {
-                            tracing::warn!("Antigravity onboarding failed: {err}");
+                match antigravity_onboard(&state, &access_token).await {
+                    Ok(project_id) => {
+                        if let Some(session) =
+                            OAUTH_SESSIONS.lock().unwrap().get_mut(&session_state)
+                        {
+                            session.access_token = Some(access_token.clone());
+                            session.project_id = Some(project_id);
+                            session.status = "done".to_string();
+                            tracing::info!("Antigravity onboarding complete");
                         }
                     }
-                });
+                    Err(err) => {
+                        if let Some(session) =
+                            OAUTH_SESSIONS.lock().unwrap().get_mut(&session_state)
+                        {
+                            session.status = "error".to_string();
+                            session.error = Some(format!("Antigravity onboarding failed: {err}"));
+                        }
+                        tracing::warn!("Antigravity onboarding failed: {err}");
+                    }
+                }
+            } else {
+                // Store in session
+                if let Some(session) = OAUTH_SESSIONS.lock().unwrap().get_mut(&session_state) {
+                    session.access_token = Some(access_token.clone());
+                    session.status = "done".to_string();
+                }
             }
 
-            let success_html = format!(
-                r#"<!DOCTYPE html>
-<html><head><title>OAuth Success</title>
-<style>
-body {{ font-family: system-ui; max-width: 500px; margin: 100px auto; text-align: center; }}
-.success {{ color: #2f7d5b; }}
-</style></head>
-<body>
-<h1 class="success">✅ Authorization Complete</h1>
-<p>You can close this window now.</p>
-<p>Token has been sent to BlackRouter. Return to Setup to save your provider.</p>
-<script>window.close();</script>
-</body></html>"#
-            );
-            Html(success_html).into_response()
+            Html(oauth_redirect_html(
+                true,
+                "Token has been sent to BlackRouter. Returning to Setup.",
+            ))
+            .into_response()
         }
         Err(err_msg) => {
             // Store error in session
@@ -620,12 +637,7 @@ body {{ font-family: system-ui; max-width: 500px; margin: 100px auto; text-align
                 session.status = "error".to_string();
                 session.error = Some(err_msg.clone());
             }
-            let html = format!(
-                r#"<!DOCTYPE html><html><head><title>OAuth Error</title></head>
-<body style="font-family:system-ui;max-width:500px;margin:100px auto;text-align:center">
-<h1 style="color:#b5453f">❌ Token Exchange Failed</h1><p>{}</p></body></html>"#,
-                err_msg
-            );
+            let html = oauth_redirect_html(false, &format!("Token exchange failed: {err_msg}"));
             Html(html).into_response()
         }
     }
@@ -661,7 +673,7 @@ async fn exchange_code_for_token(
                 .json()
                 .await
                 .map_err(|e| format!("Invalid response: {e}"))?;
-            token["access_token"]
+            let access_token = token["access_token"]
                 .as_str()
                 .map(String::from)
                 .ok_or_else(|| {
@@ -669,7 +681,14 @@ async fn exchange_code_for_token(
                         .as_str()
                         .unwrap_or("No access token")
                         .to_string()
-                })
+                })?;
+            if let Some(session) = OAUTH_SESSIONS.lock().unwrap().get_mut(session_state) {
+                session.refresh_token = token["refresh_token"].as_str().map(String::from);
+                session.expires_at = token["expires_in"].as_u64().map(|seconds| {
+                    (blackrouter_common::unix_timestamp().saturating_add(seconds)).to_string()
+                });
+            }
+            Ok(access_token)
         }
 
         "antigravity" => {
@@ -694,7 +713,7 @@ async fn exchange_code_for_token(
                 .json()
                 .await
                 .map_err(|e| format!("Invalid response: {e}"))?;
-            token["access_token"]
+            let access_token = token["access_token"]
                 .as_str()
                 .map(String::from)
                 .ok_or_else(|| {
@@ -702,7 +721,14 @@ async fn exchange_code_for_token(
                         .as_str()
                         .unwrap_or("No access token")
                         .to_string()
-                })
+                })?;
+            if let Some(session) = OAUTH_SESSIONS.lock().unwrap().get_mut(session_state) {
+                session.refresh_token = token["refresh_token"].as_str().map(String::from);
+                session.expires_at = token["expires_in"].as_u64().map(|seconds| {
+                    (blackrouter_common::unix_timestamp().saturating_add(seconds)).to_string()
+                });
+            }
+            Ok(access_token)
         }
 
         "codex" | "openai" => {
@@ -738,6 +764,23 @@ async fn exchange_code_for_token(
                 .json()
                 .await
                 .map_err(|e| format!("Invalid response: {e}"))?;
+
+            // Extract email from id_token JWT
+            let email = token["id_token"].as_str().and_then(|jwt| {
+                jwt.split('.').nth(1).and_then(|payload| {
+                    let padded = format!("{}{}", payload, "=".repeat((4 - payload.len() % 4) % 4));
+                    base64_decode(&padded).ok().and_then(|json_str| {
+                        serde_json::from_str::<Value>(&json_str)
+                            .ok()
+                            .and_then(|v| v.get("email").and_then(|e| e.as_str().map(String::from)))
+                    })
+                })
+            });
+
+            if let Some(session) = OAUTH_SESSIONS.lock().unwrap().get_mut(session_state) {
+                session.email = email.clone();
+            }
+
             token["access_token"]
                 .as_str()
                 .map(String::from)
@@ -800,6 +843,9 @@ pub async fn oauth_exchange(
                 } else {
                     Some(refresh_token)
                 };
+                session.expires_at = token["expires_in"].as_u64().map(|seconds| {
+                    (blackrouter_common::unix_timestamp().saturating_add(seconds)).to_string()
+                });
                 session.status = "done".to_string();
             }
 
@@ -807,6 +853,9 @@ pub async fn oauth_exchange(
                 status: "done".to_string(),
                 access_token: Some(access_token),
                 refresh_token: None,
+                token_expires_at: token["expires_in"].as_u64().map(|seconds| {
+                    (blackrouter_common::unix_timestamp().saturating_add(seconds)).to_string()
+                }),
                 email: None,
                 project_id: None,
                 error: None,
@@ -866,6 +915,9 @@ pub async fn oauth_exchange(
                 } else {
                     Some(refresh_token.clone())
                 };
+                session.expires_at = token["expires_in"].as_u64().map(|seconds| {
+                    (blackrouter_common::unix_timestamp().saturating_add(seconds)).to_string()
+                });
                 session.project_id = Some(project_id.clone());
                 session.status = "done".to_string();
             }
@@ -878,6 +930,9 @@ pub async fn oauth_exchange(
                 } else {
                     Some(refresh_token)
                 },
+                token_expires_at: token["expires_in"].as_u64().map(|seconds| {
+                    (blackrouter_common::unix_timestamp().saturating_add(seconds)).to_string()
+                }),
                 email: None,
                 project_id: Some(project_id),
                 error: None,
@@ -954,6 +1009,7 @@ pub async fn oauth_exchange(
                 status: "done".to_string(),
                 access_token: Some(access_token),
                 refresh_token: None,
+                token_expires_at: None,
                 email,
                 project_id: None,
                 error: None,
@@ -995,6 +1051,7 @@ pub async fn oauth_exchange(
                         status: "pending".to_string(),
                         access_token: None,
                         refresh_token: None,
+                        token_expires_at: None,
                         email: None,
                         project_id: None,
                         error: None,
@@ -1030,6 +1087,7 @@ pub async fn oauth_exchange(
                 status: "done".to_string(),
                 access_token: Some(access_token),
                 refresh_token: None,
+                token_expires_at: None,
                 email: None,
                 project_id: None,
                 error: None,
@@ -1058,6 +1116,7 @@ pub async fn oauth_status(
         status: session.status.clone(),
         access_token: session.access_token.clone(),
         refresh_token: session.refresh_token.clone(),
+        token_expires_at: session.expires_at.clone(),
         email: session.email.clone(),
         project_id: session.project_id.clone(),
         error: session.error.clone(),

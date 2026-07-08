@@ -774,6 +774,68 @@ impl Storage {
         self.update_provider_connection(id, input)
     }
 
+    pub fn set_provider_rate_limit_snapshot(&self, id: &str, snapshot: Value) -> Result<()> {
+        let existing = self.get_provider_connection_raw(id)?;
+        let mut data = match existing.data {
+            Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        };
+        data.insert("rateLimit".to_string(), snapshot);
+        let raw_data = serde_json::to_string_pretty(&Value::Object(data))?;
+        let conn = self.open()?;
+        conn.execute(
+            r#"
+            UPDATE providerConnections
+            SET data = ?2,
+                updatedAt = ?3
+            WHERE id = ?1
+            "#,
+            params![id, raw_data, now_text()],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_provider_oauth_access_token(
+        &self,
+        id: &str,
+        access_token: &str,
+        token_expires_at: Option<String>,
+    ) -> Result<()> {
+        let existing = self.get_provider_connection_raw(id)?;
+        let mut data = match existing.data {
+            Value::Object(map) => map,
+            _ => serde_json::Map::new(),
+        };
+        if data.contains_key("apiKey") {
+            data.insert(
+                "apiKey".to_string(),
+                Value::String(access_token.to_string()),
+            );
+        }
+        data.insert(
+            "accessToken".to_string(),
+            Value::String(access_token.to_string()),
+        );
+        if let Some(token_expires_at) = token_expires_at {
+            data.insert(
+                "tokenExpiresAt".to_string(),
+                Value::String(token_expires_at),
+            );
+        }
+        let raw_data = serde_json::to_string_pretty(&Value::Object(data))?;
+        let conn = self.open()?;
+        conn.execute(
+            r#"
+            UPDATE providerConnections
+            SET data = ?2,
+                updatedAt = ?3
+            WHERE id = ?1
+            "#,
+            params![id, raw_data, now_text()],
+        )?;
+        Ok(())
+    }
+
     pub fn cached_provider_models(
         &self,
         id: &str,
@@ -2136,6 +2198,76 @@ mod tests {
             .cached_provider_models(&record.id, 10)
             .expect("cache lookup")
             .is_none());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn stores_provider_rate_limit_snapshot_without_dropping_data() {
+        let (storage, path) = temp_storage("provider-rate-limit");
+        let mut provider = active_provider("openai");
+        provider.data = Some(json!({
+            "baseUrl": "https://api.openai.com/v1/chat/completions",
+            "format": "openai",
+            "models": ["gpt-5.5"]
+        }));
+        let record = storage
+            .create_provider_connection(provider)
+            .expect("provider creates");
+
+        storage
+            .set_provider_rate_limit_snapshot(
+                &record.id,
+                json!({
+                    "model": "gpt-5.5",
+                    "headers": {
+                        "x-ratelimit-remaining-requests": "59"
+                    }
+                }),
+            )
+            .expect("snapshot stores");
+
+        let provider = storage
+            .get_provider_connection_raw(&record.id)
+            .expect("provider loads");
+        assert_eq!(provider.data["models"][0], "gpt-5.5");
+        assert_eq!(
+            provider.data["rateLimit"]["headers"]["x-ratelimit-remaining-requests"],
+            "59"
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn updates_provider_oauth_access_token_without_dropping_refresh_metadata() {
+        let (storage, path) = temp_storage("provider-oauth-token");
+        let mut provider = active_provider("antigravity");
+        provider.auth_type = "oauth".to_string();
+        provider.data = Some(json!({
+            "baseUrl": "https://cloudcode-pa.googleapis.com",
+            "format": "antigravity",
+            "apiKey": "old-access",
+            "refreshToken": "refresh-token",
+            "projectId": "blackrouter",
+            "models": ["gemini-3-flash-agent"]
+        }));
+        let record = storage
+            .create_provider_connection(provider)
+            .expect("provider creates");
+
+        storage
+            .set_provider_oauth_access_token(&record.id, "new-access", Some("12345".to_string()))
+            .expect("access token updates");
+
+        let provider = storage
+            .get_provider_connection_raw(&record.id)
+            .expect("provider loads");
+        assert_eq!(provider.data["apiKey"], "new-access");
+        assert_eq!(provider.data["accessToken"], "new-access");
+        assert_eq!(provider.data["refreshToken"], "refresh-token");
+        assert_eq!(provider.data["projectId"], "blackrouter");
+        assert_eq!(provider.data["tokenExpiresAt"], "12345");
 
         let _ = fs::remove_file(path);
     }

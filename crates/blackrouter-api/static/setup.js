@@ -7,6 +7,7 @@ const state = {
   apiKeys: null,
   providers: null,
   providerCatalog: null,
+  providerLimits: null,
   combos: null,
 };
 
@@ -60,6 +61,20 @@ function formatSeconds(seconds) {
   return `${Math.floor(value / 3600)}h ${Math.floor((value % 3600) / 60)}m`;
 }
 
+function formatNumber(value) {
+  return Number(value || 0).toLocaleString();
+}
+
+function formatUsd(value) {
+  return `$${Number(value || 0).toFixed(4)}`;
+}
+
+function formatUnixSeconds(value) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds <= 0) return value || "-";
+  return new Date(seconds * 1000).toLocaleString();
+}
+
 async function getJson(path) {
   const response = await fetch(path, { cache: "no-store" });
   if (!response.ok) throw new Error(`${path} ${response.status}`);
@@ -91,7 +106,9 @@ async function sendJson(path, method, body) {
   const response = await fetch(path, options);
   const payload = await readResponsePayload(response);
   if (!response.ok) {
-    throw new Error(responseErrorMessage(payload, `${path} ${response.status}`));
+    throw new Error(
+      responseErrorMessage(payload, `${path} ${response.status}`),
+    );
   }
   return payload;
 }
@@ -108,6 +125,7 @@ async function refresh() {
     apiKeys,
     providers,
     providerCatalog,
+    providerLimits,
     combos,
   ] = await Promise.all([
     getJson("/health"),
@@ -118,6 +136,7 @@ async function refresh() {
     getJson("/api/setup/api-keys"),
     getJson("/api/setup/providers"),
     getJson("/api/setup/provider-catalog"),
+    getJson("/api/provider-limits"),
     getJson("/api/setup/combos"),
   ]);
 
@@ -129,6 +148,7 @@ async function refresh() {
   state.apiKeys = apiKeys;
   state.providers = providers;
   state.providerCatalog = providerCatalog;
+  state.providerLimits = providerLimits;
   state.combos = combos;
 
   render();
@@ -149,6 +169,7 @@ function render() {
   const catalog = Array.isArray(state.providerCatalog)
     ? state.providerCatalog
     : [];
+  const providerLimits = state.providerLimits || {};
   const combos = Array.isArray(state.combos?.data) ? state.combos.data : [];
   const tableCounts = storage.table_counts || {};
 
@@ -235,6 +256,7 @@ function render() {
     "No API keys",
   );
   renderProviders(providers);
+  renderLimits(providerLimits);
   renderRows(
     "modelsList",
     models.map((model) => ({
@@ -253,6 +275,115 @@ function render() {
     })),
     "No models",
   );
+}
+
+function renderLimits(payload) {
+  const rows = Array.isArray(payload?.data) ? payload.data : [];
+  const rowsWithUpstream = rows.filter((row) => row.upstream_rate_limit).length;
+  setBadge(
+    "limitsBadge",
+    rowsWithUpstream
+      ? `${rowsWithUpstream} upstream snapshots`
+      : "No upstream data",
+    rowsWithUpstream ? "ok" : "muted",
+  );
+
+  const metrics = payload?.metrics || {};
+  $("limitsSummary").innerHTML = `
+    <div class="metric-tile">
+      <span>Total Requests</span>
+      <strong>${formatNumber(metrics.total_requests)}</strong>
+    </div>
+    <div class="metric-tile">
+      <span>Prompt Tokens</span>
+      <strong>${formatNumber(metrics.total_prompt_tokens)}</strong>
+    </div>
+    <div class="metric-tile">
+      <span>Completion Tokens</span>
+      <strong>${formatNumber(metrics.total_completion_tokens)}</strong>
+    </div>
+    <div class="metric-tile">
+      <span>Tracked Cost</span>
+      <strong>${formatUsd(metrics.total_cost)}</strong>
+    </div>
+  `;
+
+  const guard = payload?.cost_guard || {};
+  $("costGuardSummary").innerHTML = `
+    <div class="metric-tile">
+      <span>Cost Guard</span>
+      <strong>${guard.enabled ? "Enabled" : "Disabled"}</strong>
+    </div>
+    <div class="metric-tile">
+      <span>Today</span>
+      <strong>${formatUsd(guard.daily_spend_usd)}</strong>
+    </div>
+    <div class="metric-tile">
+      <span>This Month</span>
+      <strong>${formatUsd(guard.monthly_spend_usd)}</strong>
+    </div>
+    <div class="metric-tile ${guard.daily_exceeded || guard.monthly_exceeded ? "danger" : ""}">
+      <span>Budget</span>
+      <strong>${guard.daily_exceeded || guard.monthly_exceeded ? "Exceeded" : "OK"}</strong>
+    </div>
+  `;
+
+  const root = $("limitsList");
+  if (!root) return;
+  if (!rows.length) {
+    root.innerHTML = `<div class="empty">No providers</div>`;
+    return;
+  }
+
+  root.innerHTML = rows
+    .map((row) => {
+      const snapshot = row.upstream_rate_limit || {};
+      const headers = snapshot.headers || {};
+      const rtk = row.rtk || {};
+      const usage = row.usage || {};
+      const title = `${row.provider}/${row.name || row.id}`;
+      const emailSuffix = row.email
+        ? `<span class="provider-email">${escapeHtml(row.email)}</span>`
+        : "";
+      return `
+    <div class="row limit-row">
+      <div>
+        <strong title="${escapeHtml(title)}">${escapeHtml(title)}</strong>
+        ${emailSuffix}
+        <div class="row-meta">
+              <span>${escapeHtml(row.status || "unknown")}</span>
+              <span>${row.is_active ? "active" : "disabled"}</span>
+              <span>${escapeHtml(row.model || "no model")}</span>
+              <span>seen ${escapeHtml(formatUnixSeconds(snapshot.observedAt))}</span>
+            </div>
+          </div>
+          <div class="limit-grid">
+            ${limitCell("Upstream RPM", headers["x-ratelimit-remaining-requests"], headers["x-ratelimit-limit-requests"])}
+            ${limitCell("Upstream TPM", headers["x-ratelimit-remaining-tokens"], headers["x-ratelimit-limit-tokens"])}
+            ${limitCell("Req Reset", headers["x-ratelimit-reset-requests"], null)}
+            ${limitCell("Tok Reset", headers["x-ratelimit-reset-tokens"], null)}
+            ${limitCell("RTK Req", rtk.requests_remaining, null)}
+            ${limitCell("RTK Tok", rtk.tokens_remaining, null)}
+            ${limitCell("Requests", usage.requests, null)}
+            ${limitCell("Cost", formatUsd(usage.cost), null)}
+          </div>
+        </div>
+      `;
+    })
+    .join("");
+}
+
+function limitCell(label, value, limit) {
+  const displayValue =
+    value === undefined || value === null || value === "" ? "-" : String(value);
+  const displayLimit =
+    limit === undefined || limit === null || limit === "" ? "" : ` / ${limit}`;
+  return `
+    <div class="limit-cell">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(displayValue)}${escapeHtml(displayLimit)}</strong>
+    </div>
+  `;
 }
 
 function renderProviderCatalog(catalog) {
@@ -304,10 +435,14 @@ function renderProviders(providers) {
     .map((provider) => {
       const title = `${provider.provider}/${provider.name || provider.id}`;
       const status = provider.is_active ? "Active" : "Disabled";
+      const emailSuffix = provider.email
+        ? `<span class="provider-email">${escapeHtml(provider.email)}</span>`
+        : "";
       return `
         <div class="row provider-row" data-provider-id="${escapeHtml(provider.id)}">
           <div>
             <strong title="${escapeHtml(title)}">${escapeHtml(title)}</strong>
+            ${emailSuffix}
             <div class="row-meta">
               <span>${escapeHtml(provider.auth_type)}</span>
               <span>${escapeHtml(provider.data?.format || "")}</span>
@@ -334,12 +469,24 @@ function renderComboModelOptions(providers) {
   if (!select) return;
 
   const options = [];
+  const sameProviderCount = {};
+  // Count how many connections share the same provider type
+  providers.forEach((provider) => {
+    sameProviderCount[provider.provider] =
+      (sameProviderCount[provider.provider] || 0) + 1;
+  });
+
   providers.forEach((provider) => {
     providerModelIds(provider).forEach((model) => {
-      options.push({
-        value: `${provider.provider}/${model}`,
-        label: `${provider.provider}/${model}`,
-      });
+      const value = `${provider.provider}/${model}`;
+      // Include name/email to disambiguate when same provider type has multiple connections
+      let label = `${provider.provider}/${model}`;
+      const needsSuffix = (sameProviderCount[provider.provider] || 1) > 1;
+      if (needsSuffix) {
+        const suffix = provider.email || provider.name || "";
+        if (suffix) label += ` (${suffix})`;
+      }
+      options.push({ value, label });
     });
   });
 
@@ -360,7 +507,11 @@ function providerModelIds(provider) {
     const providerId = String(provider?.provider || "").toLowerCase();
     const alias = String(provider?.data?.alias || "").toLowerCase();
     const format = String(provider?.data?.format || "").toLowerCase();
-    if (providerId === "antigravity" || alias === "ag" || format === "antigravity") {
+    if (
+      providerId === "antigravity" ||
+      alias === "ag" ||
+      format === "antigravity"
+    ) {
       return [...ANTIGRAVITY_MODELS];
     }
     return [];
@@ -501,6 +652,7 @@ $("providerForm").addEventListener("submit", async (event) => {
     provider: $("providerInput").value,
     auth_type: $("authTypeInput").value,
     name: $("providerNameInput").value,
+    email: $("providerEmailInput").value || null,
     priority: numberOrNull($("providerPriorityInput").value),
     is_active: $("providerActiveInput").checked,
     data,
@@ -688,6 +840,7 @@ function editProvider(id) {
   $("providerBaseUrlInput").value = provider.data?.baseUrl || "";
   $("providerFormatInput").value = provider.data?.format || "";
   $("providerNameInput").value = provider.name || "";
+  $("providerEmailInput").value = provider.email || "";
   $("providerPriorityInput").value = provider.priority ?? "";
   $("providerApiKeyInput").value = "";
   $("providerBasicUserInput").value = provider.data?.username || "";
@@ -709,6 +862,7 @@ function resetProviderForm() {
   $("providerBaseUrlInput").value = "";
   $("providerFormatInput").value = "";
   $("providerNameInput").value = "";
+  $("providerEmailInput").value = "";
   $("providerPriorityInput").value = "";
   $("providerApiKeyInput").value = "";
   $("providerBasicUserInput").value = "";
@@ -812,17 +966,19 @@ async function startOAuth(providerId) {
       // Poll for token
       pollOAuthToken(providerId, result.state, 5000);
     } else {
-      // Authorization code flow: open browser
-      notice.textContent =
-        "Opening browser for " + result.provider + " login...";
-      window.open(result.url, "_blank", "width=600,height=700");
+      sessionStorage.setItem(
+        "blackrouter.oauth.pending",
+        JSON.stringify({
+          providerId,
+          state: result.state,
+          startedAt: Date.now(),
+        }),
+      );
       notice.innerHTML =
         "<strong>Login with " +
         result.provider +
-        "</strong><p>Complete authorization in the opened window.</p><p>Waiting for token...</p>";
-
-      // Poll for token
-      pollOAuthToken(providerId, result.state, 2000);
+        "</strong><p>Redirecting to browser authorization...</p>";
+      window.location.href = result.url;
     }
   } catch (error) {
     notice.textContent = "❌ OAuth failed: " + error.message;
@@ -841,21 +997,41 @@ async function pollOAuthToken(providerId, state, interval) {
 
       if (data.status === "done" && data.access_token) {
         $("providerApiKeyInput").value = data.access_token;
-        // Store project_id in provider data for Antigravity
-        if (data.project_id) {
+        // Store email if returned from OAuth
+        if (data.email) {
+          $("providerEmailInput").value = data.email;
+          $("providerNameInput").value =
+            $("providerNameInput").value || data.email.split("@")[0];
+        }
+        // Store long-lived OAuth metadata in provider data when available.
+        if (
+          data.project_id ||
+          data.refresh_token ||
+          data.token_expires_at ||
+          providerId === "antigravity"
+        ) {
           try {
             const existing = JSON.parse($("providerDataInput").value || "{}");
-            existing.projectId = data.project_id;
+            if (data.project_id) existing.projectId = data.project_id;
+            if (data.refresh_token) existing.refreshToken = data.refresh_token;
+            if (data.token_expires_at)
+              existing.tokenExpiresAt = data.token_expires_at;
             $("providerDataInput").value = JSON.stringify(existing, null, 2);
           } catch (e) {}
         }
-        const extra = data.project_id ? ` (Project: ${data.project_id})` : "";
+        const extra = data.email
+          ? ` (${data.email})`
+          : data.project_id
+            ? ` (Project: ${data.project_id})`
+            : "";
+        sessionStorage.removeItem("blackrouter.oauth.pending");
         $("oauthNotice").innerHTML =
           `<strong>✅ Token received!</strong>${extra} Fill remaining fields and save.`;
         $("oauthNotice").classList.remove("error");
         return;
       }
       if (data.status === "error") {
+        sessionStorage.removeItem("blackrouter.oauth.pending");
         $("oauthNotice").textContent =
           "❌ OAuth error: " + (data.error || "Unknown");
         $("oauthNotice").classList.add("error");
@@ -865,6 +1041,7 @@ async function pollOAuthToken(providerId, state, interval) {
       // Continue polling
     }
   }
+  sessionStorage.removeItem("blackrouter.oauth.pending");
   $("oauthNotice").innerHTML =
     "<strong>⏰ Login timed out.</strong> Please try again.";
   $("oauthNotice").classList.add("error");
@@ -932,9 +1109,14 @@ function showProviderModels(id) {
   const notice = $("providerTestNotice");
   notice.classList.remove("hidden");
   notice.classList.toggle("error", models.length === 0);
+  const label = provider.email
+    ? `${provider.provider} (${provider.email})`
+    : provider.name
+      ? `${provider.provider}/${provider.name}`
+      : provider.provider;
   notice.textContent = models.length
-    ? `${provider.provider} models (${models.length}): ${models.join(", ")}`
-    : `${provider.provider} has no saved models. Use Fetch or add data.models manually.`;
+    ? `${label} models (${models.length}): ${models.join(", ")}`
+    : `${label} has no saved models. Use Fetch or add data.models manually.`;
 }
 
 function addComboModel(model) {
@@ -979,10 +1161,41 @@ function showNewApiKey(key) {
   notice.classList.remove("hidden");
 }
 
-refresh().catch((error) => {
-  setBadge("healthBadge", "Offline", "error");
-  console.error(error);
-});
+async function resumePendingOAuth() {
+  const raw = sessionStorage.getItem("blackrouter.oauth.pending");
+  if (!raw) return;
+
+  let pending;
+  try {
+    pending = JSON.parse(raw);
+  } catch (error) {
+    sessionStorage.removeItem("blackrouter.oauth.pending");
+    return;
+  }
+
+  const providerId = pending?.providerId;
+  const oauthState = pending?.state;
+  const startedAt = Number(pending?.startedAt || 0);
+  if (!providerId || !oauthState || Date.now() - startedAt > 10 * 60 * 1000) {
+    sessionStorage.removeItem("blackrouter.oauth.pending");
+    return;
+  }
+
+  const notice = $("oauthNotice");
+  if (notice) {
+    notice.innerHTML = `<strong>Waiting for ${escapeHtml(providerId)} authorization...</strong><p>Completing login and loading token.</p>`;
+    notice.classList.remove("hidden");
+    notice.classList.remove("error");
+  }
+  pollOAuthToken(providerId, oauthState, 1000);
+}
+
+refresh()
+  .then(resumePendingOAuth)
+  .catch((error) => {
+    setBadge("healthBadge", "Offline", "error");
+    console.error(error);
+  });
 
 // Handle OAuth callback: if URL has ?token=..., fill it in
 (function () {

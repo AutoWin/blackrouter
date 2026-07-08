@@ -39,6 +39,17 @@ Current state of the project - what's completed, in progress, and planned.
 
 ---
 
+### [Zed IDE Integration](./ZED_INTEGRATION.md)
+Huong dan cau hinh Zed IDE dung BlackRouter nhu mot OpenAI-compatible provider.
+
+**Key sections:**
+- Tao provider va combo trong BlackRouter
+- Them OpenAI-compatible provider trong Zed
+- Mau `settings.json` cho `black-mimo`
+- Troubleshooting
+
+---
+
 ### [Development Plan](./DEVELOPMENT_PLAN.md)
 Comprehensive roadmap for future development.
 

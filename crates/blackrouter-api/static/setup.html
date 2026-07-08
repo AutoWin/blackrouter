@@ -36,6 +36,9 @@
                     <button class="tab" data-panel="providers" type="button">
                         Providers
                     </button>
+                    <button class="tab" data-panel="limits" type="button">
+                        Limits
+                    </button>
                     <button class="tab" data-panel="combos" type="button">
                         Combos
                     </button>
@@ -289,6 +292,7 @@
                                     placeholder="OpenAI primary"
                                 />
                             </label>
+                            <input id="providerEmailInput" type="hidden" />
                             <label class="field">
                                 <span>Priority</span>
                                 <input
@@ -415,6 +419,22 @@
                     <div
                         id="modelsList"
                         class="model-list"
+                        aria-live="polite"
+                    ></div>
+                </section>
+
+                <section id="limits" class="panel">
+                    <div class="section-head">
+                        <h2>Limits</h2>
+                        <span id="limitsBadge" class="badge muted"
+                            >No upstream data</span
+                        >
+                    </div>
+                    <div id="limitsSummary" class="limit-summary"></div>
+                    <div id="costGuardSummary" class="limit-summary"></div>
+                    <div
+                        id="limitsList"
+                        class="table-list limit-list"
                         aria-live="polite"
                     ></div>
                 </section>
