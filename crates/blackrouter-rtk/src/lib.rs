@@ -760,7 +760,6 @@ impl Default for RtkBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::time::sleep;
 
     #[tokio::test]
     async fn test_rate_limiting() {

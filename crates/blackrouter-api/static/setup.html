@@ -458,35 +458,56 @@
                                 />
                             </label>
                             <label class="field">
-                                <span>Kind</span>
-                                <input
-                                    id="comboKindInput"
-                                    placeholder="llm"
-                                    value="llm"
-                                />
+                                <span>Provider</span>
+                                <select id="comboProviderInput">
+                                    <option value="">All providers</option>
+                                </select>
                             </label>
-                            <label class="field wide">
-                                <span>Fetched Provider Model</span>
-                                <select id="comboModelSelect"></select>
-                            </label>
-                            <label class="field wide">
-                                <span>Models in Combo</span>
-                                <textarea
-                                    id="comboModelsInput"
-                                    rows="6"
-                                    spellcheck="false"
-                                    placeholder="cline/claude-sonnet-4&#10;commandcode/claude-opus"
-                                ></textarea>
-                            </label>
+                            <input id="comboKindInput" type="hidden" value="llm" />
                         </div>
-                        <div class="form-actions">
+
+                        <div class="field wide">
+                            <span>
+                                Models in Combo
+                                <small>(fallback order, top = highest priority)</small>
+                            </span>
+                            <div
+                                id="comboModelsInput"
+                                class="model-editor"
+                                aria-live="polite"
+                            ></div>
+                            <p
+                                id="comboEmptyHint"
+                                class="empty-hint"
+                            >
+                                No models added yet. Pick from the list below or
+                                type a provider/model above.
+                            </p>
+                        </div>
+
+                        <div class="combo-add-row">
+                            <input
+                                id="comboModelManualInput"
+                                class="combo-add-input"
+                                placeholder="provider/model (e.g. cline/claude-sonnet-4)"
+                                spellcheck="false"
+                            />
                             <button
-                                id="comboAddModelButton"
+                                id="comboAddManualButton"
                                 class="secondary-button"
                                 type="button"
                             >
                                 Add Model
                             </button>
+                        </div>
+
+                        <div
+                            id="comboNotice"
+                            class="notice hidden"
+                            aria-live="polite"
+                        ></div>
+
+                        <div class="form-actions">
                             <button
                                 id="comboCancelEditButton"
                                 class="secondary-button hidden"
@@ -503,14 +524,15 @@
                             </button>
                         </div>
                     </form>
-                    <div
-                        id="combosList"
-                        class="table-list"
-                        aria-live="polite"
-                    ></div>
+                    <h3 class="subhead">Available Models</h3>
                     <div
                         id="comboModelsList"
                         class="model-list"
+                        aria-live="polite"
+                    ></div>
+                    <div
+                        id="combosList"
+                        class="table-list"
                         aria-live="polite"
                     ></div>
                 </section>

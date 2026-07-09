@@ -1,4 +1,5 @@
 use anyhow::Context;
+use blackrouter_api::auth;
 use blackrouter_api::{build_router, AppState};
 use blackrouter_config::AppConfig;
 use blackrouter_storage::Storage;
@@ -10,6 +11,9 @@ use tracing_subscriber::EnvFilter;
 async fn main() -> anyhow::Result<()> {
     let config = AppConfig::load().context("failed to load BlackRouter config")?;
     init_tracing(&config.log_level)?;
+
+    // Validate control-plane configuration at startup.
+    auth::validate_control_config(&config).map_err(|s| anyhow::anyhow!("{s}"))?;
 
     let storage = Storage::new(config.database_path.clone());
     let storage_status = storage

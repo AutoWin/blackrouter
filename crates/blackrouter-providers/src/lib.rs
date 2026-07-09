@@ -106,28 +106,55 @@ const CLINE_MODELS: &[&str] = &[
 ];
 
 const COMMANDCODE_MODELS: &[&str] = &[
+    // Anthropic
+    "claude-sonnet-5",
     "claude-sonnet-4-6",
     "claude-fable-5",
     "claude-opus-4-8",
     "claude-opus-4-7",
-    "claude-haiku-4-5-20251001",
+    "claude-haiku-4-5",
+    // OpenAI
     "gpt-5.5",
     "gpt-5.4",
     "gpt-5.3-codex",
     "gpt-5.4-mini",
+    // Moonshot
+    "moonshotai/Kimi-K2.7-Code",
+    "moonshotai/Kimi-K2.7-Code-Highspeed",
     "moonshotai/Kimi-K2.6",
     "moonshotai/Kimi-K2.5",
+    // Zhipu
     "zai-org/GLM-5.2",
+    "zai-org/GLM-5.2-Fast",
     "zai-org/GLM-5.1",
     "zai-org/GLM-5",
+    // MiniMax
     "MiniMaxAI/MiniMax-M3",
     "MiniMaxAI/MiniMax-M2.7",
     "MiniMaxAI/MiniMax-M2.5",
+    // Xiaomi
+    "xiaomi/mimo-v2.5-pro",
+    "xiaomi/mimo-v2.5",
+    // DeepSeek
     "deepseek/deepseek-v4-pro",
     "deepseek/deepseek-v4-flash",
+    // Alibaba
+    "Qwen/Qwen3.7-Max",
+    "Qwen/Qwen3.7-Plus",
     "Qwen/Qwen3.6-Max-Preview",
     "Qwen/Qwen3.6-Plus",
-    "Qwen/Qwen3.7-Max",
+    // StepFun
+    "stepfun/Step-3.7-Flash",
+    "stepfun/Step-3.5-Flash",
+    // Tencent
+    "tencent/Hy3",
+    // NVIDIA
+    "nvidia/nemotron-3-ultra-550b-a55b",
+    // Google
+    "google/gemini-3.5-flash",
+    "google/gemini-3.1-flash-lite",
+    // Sakana
+    "sakana/fugu-ultra",
 ];
 
 const CODEX_MODELS: &[&str] = &[
@@ -149,6 +176,533 @@ const CODEX_MODELS: &[&str] = &[
     "gpt-5-codex-mini",
 ];
 
+// ── Model Context Window Catalog ──────────────────────────────────────
+
+/// Token limit metadata for a single model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModelInfo {
+    /// Maximum total tokens (input + output) the model supports.
+    pub context_window: u32,
+    /// Maximum output tokens the model can generate in one response.
+    pub max_output_tokens: u32,
+}
+
+/// Static catalog mapping lowercase model names to their token limits.
+/// Both hyphenated and dotted version separators are listed where the
+/// model appears in multiple formats across the codebase.
+const MODEL_CATALOG: &[(&str, ModelInfo)] = &[
+    // ── Anthropic Claude ──────────────────────────────────────────────
+    (
+        "claude-sonnet-5",
+        ModelInfo {
+            context_window: 200_000,
+            max_output_tokens: 16_384,
+        },
+    ),
+    (
+        "claude-sonnet-4-6",
+        ModelInfo {
+            context_window: 200_000,
+            max_output_tokens: 8_192,
+        },
+    ),
+    (
+        "claude-sonnet-4.6",
+        ModelInfo {
+            context_window: 200_000,
+            max_output_tokens: 8_192,
+        },
+    ),
+    (
+        "claude-opus-4-8",
+        ModelInfo {
+            context_window: 200_000,
+            max_output_tokens: 32_768,
+        },
+    ),
+    (
+        "claude-opus-4.8",
+        ModelInfo {
+            context_window: 200_000,
+            max_output_tokens: 32_768,
+        },
+    ),
+    (
+        "claude-opus-4-7",
+        ModelInfo {
+            context_window: 200_000,
+            max_output_tokens: 32_768,
+        },
+    ),
+    (
+        "claude-opus-4.7",
+        ModelInfo {
+            context_window: 200_000,
+            max_output_tokens: 32_768,
+        },
+    ),
+    (
+        "claude-opus-4-6-thinking",
+        ModelInfo {
+            context_window: 200_000,
+            max_output_tokens: 64_000,
+        },
+    ),
+    (
+        "claude-fable-5",
+        ModelInfo {
+            context_window: 200_000,
+            max_output_tokens: 16_384,
+        },
+    ),
+    (
+        "claude-haiku-4-5",
+        ModelInfo {
+            context_window: 200_000,
+            max_output_tokens: 8_192,
+        },
+    ),
+    (
+        "claude-haiku-4.5",
+        ModelInfo {
+            context_window: 200_000,
+            max_output_tokens: 8_192,
+        },
+    ),
+    // ── OpenAI GPT ────────────────────────────────────────────────────
+    (
+        "gpt-5.5",
+        ModelInfo {
+            context_window: 1_048_576,
+            max_output_tokens: 32_768,
+        },
+    ),
+    (
+        "gpt-5.4",
+        ModelInfo {
+            context_window: 1_048_576,
+            max_output_tokens: 32_768,
+        },
+    ),
+    (
+        "gpt-5.4-mini",
+        ModelInfo {
+            context_window: 1_048_576,
+            max_output_tokens: 16_384,
+        },
+    ),
+    // ── OpenAI Codex ──────────────────────────────────────────────────
+    (
+        "gpt-5.3-codex",
+        ModelInfo {
+            context_window: 1_048_576,
+            max_output_tokens: 65_536,
+        },
+    ),
+    (
+        "gpt-5.3-codex-review",
+        ModelInfo {
+            context_window: 1_048_576,
+            max_output_tokens: 32_768,
+        },
+    ),
+    (
+        "gpt-5.3-codex-xhigh",
+        ModelInfo {
+            context_window: 1_048_576,
+            max_output_tokens: 65_536,
+        },
+    ),
+    (
+        "gpt-5.3-codex-high",
+        ModelInfo {
+            context_window: 1_048_576,
+            max_output_tokens: 65_536,
+        },
+    ),
+    (
+        "gpt-5.3-codex-low",
+        ModelInfo {
+            context_window: 524_288,
+            max_output_tokens: 32_768,
+        },
+    ),
+    (
+        "gpt-5.3-codex-none",
+        ModelInfo {
+            context_window: 262_144,
+            max_output_tokens: 16_384,
+        },
+    ),
+    (
+        "gpt-5.3-codex-spark",
+        ModelInfo {
+            context_window: 131_072,
+            max_output_tokens: 8_192,
+        },
+    ),
+    (
+        "gpt-5.2-codex",
+        ModelInfo {
+            context_window: 1_048_576,
+            max_output_tokens: 65_536,
+        },
+    ),
+    (
+        "gpt-5.2-codex-review",
+        ModelInfo {
+            context_window: 1_048_576,
+            max_output_tokens: 32_768,
+        },
+    ),
+    (
+        "gpt-5.1-codex-max",
+        ModelInfo {
+            context_window: 524_288,
+            max_output_tokens: 32_768,
+        },
+    ),
+    (
+        "gpt-5.1-codex",
+        ModelInfo {
+            context_window: 524_288,
+            max_output_tokens: 32_768,
+        },
+    ),
+    (
+        "gpt-5.1-codex-mini",
+        ModelInfo {
+            context_window: 262_144,
+            max_output_tokens: 16_384,
+        },
+    ),
+    (
+        "gpt-5-codex",
+        ModelInfo {
+            context_window: 262_144,
+            max_output_tokens: 32_768,
+        },
+    ),
+    (
+        "gpt-5-codex-mini",
+        ModelInfo {
+            context_window: 131_072,
+            max_output_tokens: 16_384,
+        },
+    ),
+    (
+        "gpt-oss-120b-medium",
+        ModelInfo {
+            context_window: 131_072,
+            max_output_tokens: 16_384,
+        },
+    ),
+    // ── Google Gemini ─────────────────────────────────────────────────
+    (
+        "gemini-1.5-flash",
+        ModelInfo {
+            context_window: 1_048_576,
+            max_output_tokens: 8_192,
+        },
+    ),
+    (
+        "gemini-1.5-pro",
+        ModelInfo {
+            context_window: 2_097_152,
+            max_output_tokens: 8_192,
+        },
+    ),
+    (
+        "gemini-2.0-flash",
+        ModelInfo {
+            context_window: 1_048_576,
+            max_output_tokens: 8_192,
+        },
+    ),
+    (
+        "gemini-2.0-flash-lite",
+        ModelInfo {
+            context_window: 1_048_576,
+            max_output_tokens: 8_192,
+        },
+    ),
+    (
+        "gemini-2.5-flash",
+        ModelInfo {
+            context_window: 1_048_576,
+            max_output_tokens: 65_536,
+        },
+    ),
+    (
+        "gemini-2.5-pro",
+        ModelInfo {
+            context_window: 1_048_576,
+            max_output_tokens: 65_536,
+        },
+    ),
+    (
+        "gemini-3-flash",
+        ModelInfo {
+            context_window: 2_097_152,
+            max_output_tokens: 65_536,
+        },
+    ),
+    (
+        "gemini-3-flash-preview",
+        ModelInfo {
+            context_window: 2_097_152,
+            max_output_tokens: 65_536,
+        },
+    ),
+    (
+        "gemini-3-flash-agent",
+        ModelInfo {
+            context_window: 2_097_152,
+            max_output_tokens: 65_536,
+        },
+    ),
+    (
+        "gemini-3-pro-preview",
+        ModelInfo {
+            context_window: 2_097_152,
+            max_output_tokens: 65_536,
+        },
+    ),
+    (
+        "gemini-3.5-flash",
+        ModelInfo {
+            context_window: 2_097_152,
+            max_output_tokens: 65_536,
+        },
+    ),
+    (
+        "gemini-3.5-flash-low",
+        ModelInfo {
+            context_window: 2_097_152,
+            max_output_tokens: 32_768,
+        },
+    ),
+    (
+        "gemini-3.5-flash-extra-low",
+        ModelInfo {
+            context_window: 2_097_152,
+            max_output_tokens: 16_384,
+        },
+    ),
+    (
+        "gemini-3.1-pro-low",
+        ModelInfo {
+            context_window: 2_097_152,
+            max_output_tokens: 32_768,
+        },
+    ),
+    (
+        "gemini-3.1-flash-lite",
+        ModelInfo {
+            context_window: 2_097_152,
+            max_output_tokens: 16_384,
+        },
+    ),
+    (
+        "gemini-pro-agent",
+        ModelInfo {
+            context_window: 2_097_152,
+            max_output_tokens: 65_536,
+        },
+    ),
+    // ── DeepSeek ──────────────────────────────────────────────────────
+    (
+        "deepseek-v4-pro",
+        ModelInfo {
+            context_window: 131_072,
+            max_output_tokens: 16_384,
+        },
+    ),
+    (
+        "deepseek-v4-flash",
+        ModelInfo {
+            context_window: 131_072,
+            max_output_tokens: 8_192,
+        },
+    ),
+    // ── Alibaba Qwen ─────────────────────────────────────────────────
+    (
+        "qwen3.7-max",
+        ModelInfo {
+            context_window: 131_072,
+            max_output_tokens: 16_384,
+        },
+    ),
+    (
+        "qwen3.7-plus",
+        ModelInfo {
+            context_window: 131_072,
+            max_output_tokens: 8_192,
+        },
+    ),
+    (
+        "qwen3.6-max-preview",
+        ModelInfo {
+            context_window: 131_072,
+            max_output_tokens: 16_384,
+        },
+    ),
+    (
+        "qwen3.6-plus",
+        ModelInfo {
+            context_window: 131_072,
+            max_output_tokens: 8_192,
+        },
+    ),
+    // ── Moonshot Kimi ─────────────────────────────────────────────────
+    (
+        "kimi-k2.7-code",
+        ModelInfo {
+            context_window: 262_144,
+            max_output_tokens: 16_384,
+        },
+    ),
+    (
+        "kimi-k2.7-code-highspeed",
+        ModelInfo {
+            context_window: 262_144,
+            max_output_tokens: 16_384,
+        },
+    ),
+    (
+        "kimi-k2.6",
+        ModelInfo {
+            context_window: 262_144,
+            max_output_tokens: 16_384,
+        },
+    ),
+    (
+        "kimi-k2.5",
+        ModelInfo {
+            context_window: 262_144,
+            max_output_tokens: 16_384,
+        },
+    ),
+    // ── Zhipu GLM ─────────────────────────────────────────────────────
+    (
+        "glm-5.2",
+        ModelInfo {
+            context_window: 131_072,
+            max_output_tokens: 8_192,
+        },
+    ),
+    (
+        "glm-5.2-fast",
+        ModelInfo {
+            context_window: 131_072,
+            max_output_tokens: 8_192,
+        },
+    ),
+    (
+        "glm-5.1",
+        ModelInfo {
+            context_window: 131_072,
+            max_output_tokens: 8_192,
+        },
+    ),
+    (
+        "glm-5",
+        ModelInfo {
+            context_window: 131_072,
+            max_output_tokens: 8_192,
+        },
+    ),
+    // ── MiniMax ───────────────────────────────────────────────────────
+    (
+        "minimax-m3",
+        ModelInfo {
+            context_window: 131_072,
+            max_output_tokens: 16_384,
+        },
+    ),
+    (
+        "minimax-m2.7",
+        ModelInfo {
+            context_window: 131_072,
+            max_output_tokens: 8_192,
+        },
+    ),
+    (
+        "minimax-m2.5",
+        ModelInfo {
+            context_window: 131_072,
+            max_output_tokens: 8_192,
+        },
+    ),
+    // ── Xiaomi mimo ───────────────────────────────────────────────────
+    (
+        "mimo-v2.5-pro",
+        ModelInfo {
+            context_window: 131_072,
+            max_output_tokens: 8_192,
+        },
+    ),
+    (
+        "mimo-v2.5",
+        ModelInfo {
+            context_window: 131_072,
+            max_output_tokens: 8_192,
+        },
+    ),
+    // ── StepFun ───────────────────────────────────────────────────────
+    (
+        "step-3.7-flash",
+        ModelInfo {
+            context_window: 131_072,
+            max_output_tokens: 8_192,
+        },
+    ),
+    (
+        "step-3.5-flash",
+        ModelInfo {
+            context_window: 131_072,
+            max_output_tokens: 8_192,
+        },
+    ),
+    // ── Tencent ───────────────────────────────────────────────────────
+    (
+        "hy3",
+        ModelInfo {
+            context_window: 131_072,
+            max_output_tokens: 8_192,
+        },
+    ),
+    // ── NVIDIA ────────────────────────────────────────────────────────
+    (
+        "nemotron-3-ultra-550b-a55b",
+        ModelInfo {
+            context_window: 131_072,
+            max_output_tokens: 16_384,
+        },
+    ),
+    // ── Sakana ────────────────────────────────────────────────────────
+    (
+        "fugu-ultra",
+        ModelInfo {
+            context_window: 131_072,
+            max_output_tokens: 8_192,
+        },
+    ),
+];
+
+/// Look up model info by model name. Handles `provider/model` format by
+/// stripping the prefix. Comparison is case-insensitive.
+pub fn lookup_model_info(model: &str) -> Option<&'static ModelInfo> {
+    let name = match model.rsplit_once('/') {
+        Some((_, m)) => m,
+        None => model,
+    };
+    MODEL_CATALOG
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, info)| info)
+}
+
 pub const PROVIDER_PROFILES: &[ProviderProfile] = &[
     ProviderProfile {
         id: "commandcode",
@@ -166,6 +720,23 @@ pub const PROVIDER_PROFILES: &[ProviderProfile] = &[
             ("x-cli-environment", "cli"),
         ],
         fallback_models: COMMANDCODE_MODELS,
+    },
+    ProviderProfile {
+        id: "tencent",
+        alias: "tencent",
+        name: "Tencent",
+        category: "coding",
+        auth_type: "api-key",
+        format: "commandcode",
+        base_url: "https://api.commandcode.ai/alpha/generate",
+        api_key_hint: "user_... from ~/.commandcode/auth.json or commandcode.ai/studio",
+        website: "https://commandcode.ai",
+        models_url: "",
+        default_headers: &[
+            ("x-command-code-version", "0.25.7"),
+            ("x-cli-environment", "cli"),
+        ],
+        fallback_models: &["tencent/Hy3"],
     },
     ProviderProfile {
         id: "cline",

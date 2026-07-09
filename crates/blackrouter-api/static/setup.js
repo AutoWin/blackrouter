@@ -31,6 +31,12 @@ const ANTIGRAVITY_MODELS = [
   "gemini-3-pro-preview",
 ];
 
+// Ordered, de-duplicated list of models currently being composed in the combo form.
+let comboModelDraft = [];
+
+// When set, the available-models picker is filtered to this provider type.
+let comboProviderFilter = "";
+
 const $ = (id) => document.getElementById(id);
 
 function setValue(id, value) {
@@ -265,16 +271,9 @@ function render() {
     })),
     "No models",
   );
-  renderComboModelOptions(providers);
+  renderComboProviderOptions(providers);
+  renderComboPicker(providers);
   renderCombos(combos);
-  renderRows(
-    "comboModelsList",
-    models.map((model) => ({
-      name: model.id,
-      value: model.owned_by || "blackrouter",
-    })),
-    "No models",
-  );
 }
 
 function renderLimits(payload) {
@@ -464,22 +463,19 @@ function renderProviders(providers) {
     .join("");
 }
 
-function renderComboModelOptions(providers) {
-  const select = $("comboModelSelect");
-  if (!select) return;
-
-  const options = [];
+function comboPickerOptions(providers) {
+  const list = Array.isArray(providers) ? providers : [];
   const sameProviderCount = {};
-  // Count how many connections share the same provider type
-  providers.forEach((provider) => {
+  list.forEach((provider) => {
     sameProviderCount[provider.provider] =
       (sameProviderCount[provider.provider] || 0) + 1;
   });
 
-  providers.forEach((provider) => {
+  const options = [];
+  list.forEach((provider) => {
+    if (comboProviderFilter && provider.provider !== comboProviderFilter) return;
     providerModelIds(provider).forEach((model) => {
       const value = `${provider.provider}/${model}`;
-      // Include name/email to disambiguate when same provider type has multiple connections
       let label = `${provider.provider}/${model}`;
       const needsSuffix = (sameProviderCount[provider.provider] || 1) > 1;
       if (needsSuffix) {
@@ -490,15 +486,150 @@ function renderComboModelOptions(providers) {
     });
   });
 
+  return options.sort((a, b) => a.label.localeCompare(b.label));
+}
+
+// Populates the Provider <select> from the available provider connections and
+// restores the active filter so a background refresh doesn't lose the selection.
+function renderComboProviderOptions(providers) {
+  const select = $("comboProviderInput");
+  if (!select) return;
+
+  const list = Array.isArray(providers) ? providers : [];
+  const providerTypes = [
+    ...new Set(list.map((provider) => provider.provider).filter(Boolean)),
+  ].sort((a, b) => a.localeCompare(b));
+
   select.innerHTML = [
-    `<option value="">Select fetched provider model</option>`,
-    ...options
-      .sort((a, b) => a.label.localeCompare(b.label))
-      .map(
-        (option) =>
-          `<option value="${escapeHtml(option.value)}">${escapeHtml(option.label)}</option>`,
-      ),
+    `<option value="">All providers</option>`,
+    ...providerTypes.map(
+      (type) => `<option value="${escapeHtml(type)}">${escapeHtml(type)}</option>`,
+    ),
   ].join("");
+  select.value = comboProviderFilter;
+}
+
+// Renders the reference list of available provider models with an "Add" button
+// per row. Buttons for models already in the draft are disabled and labelled
+// "Added" so the user gets immediate feedback.
+function renderComboPicker(providersSource) {
+  const providers = Array.isArray(providersSource)
+    ? providersSource
+    : Array.isArray(providersSource?.data)
+      ? providersSource.data
+      : [];
+  const root = $("comboModelsList");
+  if (!root) return;
+
+  const options = comboPickerOptions(providers);
+  if (!options.length) {
+    root.innerHTML = `<div class="empty">No provider models available</div>`;
+    return;
+  }
+
+  root.innerHTML = options
+    .map((option) => {
+      const added = comboModelDraft.includes(option.value);
+      return `
+        <div class="row model-pick-row">
+          <div>
+            <strong title="${escapeHtml(option.label)}">${escapeHtml(option.label)}</strong>
+            <span>${escapeHtml(option.value)}</span>
+          </div>
+          <div class="row-actions">
+            <button
+              class="row-button"
+              type="button"
+              data-action="add-model"
+              data-model="${escapeHtml(option.value)}"
+              ${added ? "disabled" : ""}
+            >${added ? "Added" : "Add"}</button>
+          </div>
+        </div>
+      `;
+    })
+    .join("");
+}
+
+// Renders the ordered list of models in the combo draft with move/remove controls.
+function renderComboModelDraft() {
+  const root = $("comboModelsInput");
+  if (!root) return;
+
+  const hint = $("comboEmptyHint");
+  if (!comboModelDraft.length) {
+    root.innerHTML = "";
+    if (hint) hint.classList.remove("hidden");
+    return;
+  }
+  if (hint) hint.classList.add("hidden");
+
+  root.innerHTML = comboModelDraft
+    .map((model, index) => {
+      const canUp = index > 0;
+      const canDown = index < comboModelDraft.length - 1;
+      return `
+        <div class="model-edit-row" data-index="${index}">
+          <span class="model-edit-index">${index + 1}</span>
+          <span class="model-edit-name" title="${escapeHtml(model)}">${escapeHtml(model)}</span>
+          <div class="row-actions">
+            <button
+              class="row-button icon-move"
+              type="button"
+              data-action="move-up"
+              data-index="${index}"
+              ${canUp ? "" : "disabled"}
+              aria-label="Move up"
+            >▲</button>
+            <button
+              class="row-button icon-move"
+              type="button"
+              data-action="move-down"
+              data-index="${index}"
+              ${canDown ? "" : "disabled"}
+              aria-label="Move down"
+            >▼</button>
+            <button
+              class="danger-button row-button"
+              type="button"
+              data-action="remove-model"
+              data-index="${index}"
+              aria-label="Remove"
+            >✕</button>
+          </div>
+        </div>
+      `;
+    })
+    .join("");
+}
+
+function getComboModels() {
+  return comboModelDraft.slice();
+}
+
+function showComboNotice(message, isError) {
+  const node = $("comboNotice");
+  if (!node) return;
+  node.textContent = message;
+  node.classList.toggle("error", Boolean(isError));
+  node.classList.remove("hidden");
+}
+
+function hideComboNotice() {
+  const node = $("comboNotice");
+  if (!node) return;
+  node.classList.add("hidden");
+  node.textContent = "";
+}
+
+function markFieldError(id) {
+  const node = $(id);
+  if (node) node.classList.add("field-error");
+}
+
+function clearFieldError(id) {
+  const node = $(id);
+  if (node) node.classList.remove("field-error");
 }
 
 function providerModelIds(provider) {
@@ -670,31 +801,44 @@ $("providerInput").addEventListener("input", () => {
 
 $("comboForm").addEventListener("submit", async (event) => {
   event.preventDefault();
-  let models = $("comboModelsInput")
-    .value.split(/\r?\n/)
-    .map((item) => item.trim())
-    .filter(Boolean);
-  const selectedModel = $("comboModelSelect").value;
-  if (!models.length && selectedModel) models = [selectedModel];
-  if (!models.length) {
-    $("comboModelSelect").focus();
-    alert("Select a fetched provider model or enter at least one model.");
+  hideComboNotice();
+
+  const name = $("comboNameInput").value.trim();
+  if (!name) {
+    showComboNotice("Combo name is required.", "error");
+    markFieldError("comboNameInput");
+    $("comboNameInput").focus();
     return;
   }
+
+  const models = getComboModels();
+  if (!models.length) {
+    showComboNotice(
+      "Add at least one model to the combo (pick from the list or type one above).",
+      "error",
+    );
+    markFieldError("comboModelsInput");
+    return;
+  }
+
   const editId = $("comboEditIdInput").value;
   const method = editId ? "PUT" : "POST";
   const path = editId
     ? `/api/setup/combos/${encodeURIComponent(editId)}`
     : "/api/setup/combos";
 
-  await sendJson(path, method, {
-    name: $("comboNameInput").value,
-    kind: $("comboKindInput").value || "llm",
-    models,
-  });
-
-  resetComboForm();
-  await refresh();
+  try {
+    await sendJson(path, method, {
+      name,
+      kind: $("comboKindInput").value.trim() || "llm",
+      models,
+    });
+    showComboNotice(editId ? "Combo updated." : "Combo created.", false);
+    resetComboForm();
+    await refresh();
+  } catch (error) {
+    showComboNotice(`Failed: ${error.message}`, "error");
+  }
 });
 
 $("comboCancelEditButton").addEventListener("click", resetComboForm);
@@ -744,11 +888,59 @@ $("providersList").addEventListener("click", async (event) => {
   }
 });
 
-$("comboAddModelButton").addEventListener("click", () => {
-  const selected = $("comboModelSelect").value;
-  if (!selected) return;
-  addComboModel(selected);
+$("comboAddManualButton").addEventListener("click", () => {
+  const input = $("comboModelManualInput");
+  addComboModel(input.value, $("comboProviderInput").value);
 });
+
+$("comboModelManualInput").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    addComboModel(event.target.value, $("comboProviderInput").value);
+  }
+});
+
+$("comboProviderInput").addEventListener("change", () => {
+  comboProviderFilter = $("comboProviderInput").value;
+  renderComboPicker(state.providers);
+});
+
+// Delegated handler for the available-models picker (Add buttons).
+$("comboModelsList").addEventListener("click", (event) => {
+  const button = event.target.closest('button[data-action="add-model"]');
+  if (!button || button.disabled) return;
+  addComboModel(button.dataset.model);
+});
+
+// Delegated handler for the ordered combo draft (move up/down, remove).
+$("comboModelsInput").addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-action]");
+  if (!button) return;
+
+  const index = Number(button.dataset.index);
+  const action = button.dataset.action;
+  if (action === "move-up" && index > 0) {
+    [comboModelDraft[index - 1], comboModelDraft[index]] = [
+      comboModelDraft[index],
+      comboModelDraft[index - 1],
+    ];
+  } else if (action === "move-down" && index < comboModelDraft.length - 1) {
+    [comboModelDraft[index + 1], comboModelDraft[index]] = [
+      comboModelDraft[index],
+      comboModelDraft[index + 1],
+    ];
+  } else if (action === "remove-model") {
+    comboModelDraft.splice(index, 1);
+  } else {
+    return;
+  }
+  renderComboModelDraft();
+  renderComboPicker(state.providers);
+});
+
+$("comboNameInput").addEventListener("input", () =>
+  clearFieldError("comboNameInput"),
+);
 
 $("combosList").addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-action]");
@@ -901,10 +1093,15 @@ function editCombo(id) {
 
   $("comboEditIdInput").value = combo.id;
   $("comboNameInput").value = combo.name || "";
-  $("comboKindInput").value = combo.kind || "llm";
-  $("comboModelsInput").value = Array.isArray(combo.models)
-    ? combo.models.join("\n")
-    : "";
+  setValue("comboKindInput", combo.kind || "llm");
+  comboModelDraft = Array.isArray(combo.models) ? combo.models.slice() : [];
+  comboProviderFilter = "";
+  renderComboModelDraft();
+  renderComboPicker(state.providers);
+  const providerSelect = $("comboProviderInput");
+  if (providerSelect) providerSelect.value = "";
+  clearFieldError("comboNameInput");
+  clearFieldError("comboModelsInput");
   $("comboSubmitButton").textContent = "Save Combo";
   $("comboCancelEditButton").classList.remove("hidden");
   setBadge("combosBadge", "Editing combo", "warn");
@@ -913,10 +1110,19 @@ function editCombo(id) {
 function resetComboForm() {
   $("comboEditIdInput").value = "";
   $("comboNameInput").value = "";
-  $("comboKindInput").value = "llm";
-  $("comboModelsInput").value = "";
+  setValue("comboKindInput", "llm");
+  comboModelDraft = [];
+  comboProviderFilter = "";
+  renderComboModelDraft();
+  renderComboPicker(state.providers);
+  const providerSelect = $("comboProviderInput");
+  if (providerSelect) providerSelect.value = "";
+  $("comboModelManualInput").value = "";
   $("comboSubmitButton").textContent = "Add Combo";
   $("comboCancelEditButton").classList.add("hidden");
+  hideComboNotice();
+  clearFieldError("comboNameInput");
+  clearFieldError("comboModelsInput");
 }
 
 async function checkProvider(id) {
@@ -1085,7 +1291,7 @@ async function fetchProviderModels(id) {
   notice.classList.remove("error");
   try {
     const result = await sendJson(
-      `/api/setup/providers/${encodeURIComponent(id)}/models`,
+      `/api/setup/providers/${encodeURIComponent(id)}/models?refresh=1`,
       "POST",
       {},
     );
@@ -1119,13 +1325,20 @@ function showProviderModels(id) {
     : `${label} has no saved models. Use Fetch or add data.models manually.`;
 }
 
-function addComboModel(model) {
-  const current = $("comboModelsInput")
-    .value.split(/\r?\n/)
-    .map((item) => item.trim())
-    .filter(Boolean);
-  if (!current.includes(model)) current.push(model);
-  $("comboModelsInput").value = current.join("\n");
+function addComboModel(model, provider) {
+  let value = String(model || "").trim();
+  if (!value) return;
+  // When a provider is selected and the entry has no provider prefix yet,
+  // auto-qualify it as provider/model.
+  if (!value.includes("/") && provider) value = `${provider}/${value}`;
+  if (!comboModelDraft.includes(value)) {
+    comboModelDraft.push(value);
+    renderComboModelDraft();
+    renderComboPicker(state.providers);
+    clearFieldError("comboModelsInput");
+  }
+  const input = $("comboModelManualInput");
+  if (input) input.value = "";
 }
 
 async function saveConfig() {

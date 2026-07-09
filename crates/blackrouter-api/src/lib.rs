@@ -12,7 +12,7 @@ use blackrouter_providers::{
     builtin_provider_models as registry_builtin_provider_models, provider_profiles,
     BuiltinProviderModels, ProviderProfile,
 };
-use blackrouter_rtk::{LoadBalanceStrategy, RateLimitConfig, RequestKey, ResponseCache, Rtk};
+use blackrouter_rtk::{LoadBalanceStrategy, RequestKey, Rtk};
 use blackrouter_storage::{
     ApiKeyRecord, CachedProviderModels, ComboRecord, CreatedApiKey, DailyUsage, ModelAliasRecord,
     ModelListItem, NewApiKey, NewCombo, NewModelAlias, NewProviderConnection,
@@ -29,19 +29,24 @@ use blackrouter_translator::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::Arc;
+
+use std::sync::OnceLock;
 use std::time::Duration;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
-use prometheus::{
-    register_histogram_vec, register_int_counter_vec, register_int_gauge, Encoder, HistogramVec,
-    IntCounterVec, IntGauge, Registry, TextEncoder,
-};
-
+pub mod auth;
+pub mod metrics;
 mod oauth;
+pub mod state;
+
+// Re-export key types so `blackrouter_bin` (and existing handler code) can
+// reference them without qualifying through sub-modules.
+pub use auth::{authorize_v1, extract_api_key, storage_error_to_api, ApiErrorResponse};
+pub use metrics::Metrics;
+pub use state::AppState;
 
 const MAX_REQUEST_BYTES: usize = 50 * 1024 * 1024;
 const COMMANDCODE_VERSION: &str = "0.25.7";
@@ -49,239 +54,133 @@ const CODEX_MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models?cli
 const CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const CODEX_USER_AGENT: &str = "codex_cli_rs/0.136.0";
 
-#[derive(Clone)]
-pub struct Metrics {
-    pub registry: Arc<Registry>,
-    pub requests_total: IntCounterVec,
-    pub request_duration: HistogramVec,
-    pub stream_ttfb: HistogramVec,
-    pub tokens_total: IntCounterVec,
-    pub open_connections: IntGauge,
-}
+// Metrics is re-exported from `metrics` module (see top of file).
 
-impl Metrics {
-    pub fn new() -> Self {
-        let registry = Arc::new(Registry::new());
-
-        let requests_total = register_int_counter_vec!(
-            "blackrouter_requests_total",
-            "Total number of requests",
-            &["provider", "model", "status"]
-        )
-        .unwrap();
-
-        let request_duration = register_histogram_vec!(
-            "blackrouter_request_duration_seconds",
-            "Request duration in seconds",
-            &["provider", "model"],
-            vec![0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0]
-        )
-        .unwrap();
-
-        let stream_ttfb = register_histogram_vec!(
-            "blackrouter_stream_ttfb_seconds",
-            "Time to first byte for streaming requests",
-            &["provider", "model"],
-            vec![0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0]
-        )
-        .unwrap();
-
-        let tokens_total = register_int_counter_vec!(
-            "blackrouter_tokens_total",
-            "Total tokens processed",
-            &["provider", "model", "type"]
-        )
-        .unwrap();
-
-        let open_connections =
-            register_int_gauge!("blackrouter_open_connections", "Current open connections")
-                .unwrap();
-
-        // Register process metrics
-        let process_collector = prometheus::process_collector::ProcessCollector::for_self();
-        let _ = prometheus::register(Box::new(process_collector));
-
-        registry.register(Box::new(requests_total.clone())).ok();
-        registry.register(Box::new(request_duration.clone())).ok();
-        registry.register(Box::new(stream_ttfb.clone())).ok();
-        registry.register(Box::new(tokens_total.clone())).ok();
-        registry.register(Box::new(open_connections.clone())).ok();
-
-        Self {
-            registry,
-            requests_total,
-            request_duration,
-            stream_ttfb,
-            tokens_total,
-            open_connections,
-        }
-    }
-
-    pub fn encode(&self) -> String {
-        let mut buffer = vec![];
-        let encoder = TextEncoder::new();
-        let metric_families = self.registry.gather();
-        encoder.encode(&metric_families, &mut buffer).ok();
-        String::from_utf8(buffer).unwrap_or_default()
-    }
-}
-
-#[derive(Clone)]
-pub struct AppState {
-    pub config: AppConfig,
-    pub storage: Storage,
-    pub started_at_unix: u64,
-    pub rtk: Rtk,
-    pub http_client: reqwest::Client,
-    pub usage_tx: tokio::sync::mpsc::UnboundedSender<UsageEntry>,
-    pub metrics: Metrics,
-    pub response_cache: ResponseCache,
-}
-
-impl AppState {
-    pub fn new(config: AppConfig, storage: Storage) -> Self {
-        let rtk_config = RateLimitConfig {
-            requests_per_minute: 60,
-            tokens_per_minute: 100_000,
-            max_concurrent: 10,
-            enabled: true,
-        };
-
-        // Shared HTTP client with connection pooling (Phase 1.2)
-        let http_client = reqwest::Client::builder()
-            .pool_max_idle_per_host(100)
-            .pool_idle_timeout(Duration::from_secs(90))
-            .tcp_keepalive(Duration::from_secs(60))
-            .tcp_nodelay(true)
-            .timeout(Duration::from_secs(600))
-            .redirect(reqwest::redirect::Policy::limited(3))
-            .build()
-            .expect("Failed to build shared HTTP client");
-
-        // Batch usage writer (Phase 1.4): buffer entries, flush every 5s or at 100 entries
-        let (usage_tx, mut usage_rx) = tokio::sync::mpsc::unbounded_channel::<UsageEntry>();
-        let batch_storage = storage.clone();
-        tokio::spawn(async move {
-            let mut buffer: Vec<UsageEntry> = Vec::with_capacity(128);
-            let mut interval = tokio::time::interval(Duration::from_secs(5));
-            loop {
-                tokio::select! {
-                    Some(entry) = usage_rx.recv() => {
-                        buffer.push(entry);
-                        if buffer.len() >= 100 {
-                            let batch = std::mem::take(&mut buffer);
-                            if let Err(e) = batch_storage.record_usages_batch(&batch) {
-                                tracing::warn!("batch usage write failed: {e}");
-                            }
-                        }
-                    }
-                    _ = interval.tick() => {
-                        if !buffer.is_empty() {
-                            let batch = std::mem::take(&mut buffer);
-                            if let Err(e) = batch_storage.record_usages_batch(&batch) {
-                                tracing::warn!("batch usage flush failed: {e}");
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        Self {
-            config,
-            storage,
-            started_at_unix: unix_timestamp(),
-            rtk: Rtk::new(rtk_config),
-            http_client,
-            usage_tx,
-            metrics: Metrics::new(),
-            response_cache: ResponseCache::new(Duration::from_secs(300), 1000),
-        }
-    }
-}
+// AppState is re-exported from `state` module (see top of file).
 
 pub fn build_router(state: AppState) -> Router {
-    Router::new()
+    // ── Public routes (no control-token required) ──────────────────────────
+    let public_routes = Router::new()
         .route("/", get(setup_redirect))
         .route("/setup", get(setup_page))
         .route("/setup.css", get(setup_css))
         .route("/setup.js", get(setup_js))
         .route("/health", get(health))
         .route("/version", get(version))
-        .route("/api/runtime/status", get(runtime_status))
-        .route(
-            "/api/setup/config",
-            get(setup_config).put(save_setup_config),
-        )
-        .route(
-            "/api/setup/api-keys",
-            get(list_api_keys).post(create_api_key),
-        )
-        .route("/api/setup/api-keys/{id}/rotate", post(rotate_api_key))
-        .route(
-            "/api/setup/providers",
-            get(list_providers).post(create_provider),
-        )
-        .route(
-            "/api/setup/providers/{id}",
-            get(get_provider)
-                .put(update_provider)
-                .delete(delete_provider),
-        )
-        .route("/api/setup/providers/{id}/toggle", post(toggle_provider))
-        .route("/api/setup/providers/{id}/test", post(test_provider))
-        .route(
-            "/api/setup/providers/{id}/models",
-            post(fetch_provider_models),
-        )
-        .route("/api/setup/provider-catalog", get(provider_catalog))
-        .route("/api/doctor", get(doctor))
-        .route("/api/setup/combos", get(list_combos).post(create_combo))
-        .route(
-            "/api/setup/combos/{id}",
-            get(get_combo).put(update_combo).delete(delete_combo),
-        )
-        .route(
-            "/api/setup/aliases",
-            get(list_model_aliases).post(create_model_alias),
-        )
-        .route(
-            "/api/setup/aliases/{id}",
-            put(update_model_alias).delete(delete_model_alias),
-        )
-        .route(
-            "/api/setup/lb-strategy",
-            get(get_lb_strategy).put(set_lb_strategy),
-        )
-        .route("/api/provider-limits", get(provider_limits))
         .route("/v1/models", get(v1_models))
         .route("/v1beta/models", get(v1_models))
         .route("/v1/chat/completions", post(chat_completions_shell))
         .route("/v1/responses", post(responses_proxy))
         .route("/v1/messages", post(messages_proxy))
-        .route("/api/rtk/metrics", get(rtk_metrics))
-        .route("/api/rtk/status/{provider}/{model}", get(rtk_status))
-        .route("/metrics", get(metrics))
-        .route("/api/usage", get(usage_stats))
-        .route("/api/usage/daily", get(list_daily_usage))
-        .route("/api/usage/daily/{date}", get(get_daily_usage))
-        .route("/api/usage/aggregate", post(aggregate_daily))
-        .route("/telegram/webhook", post(telegram_webhook))
-        .route("/api/oauth/{provider}/start", post(oauth::oauth_start))
-        .route("/api/oauth/{provider}/callback", get(oauth::oauth_callback))
+        .route("/metrics", get(prometheus_metrics))
+        .route("/telegram/webhook", post(telegram_webhook));
+
+    // ── Control-plane routes (gated by control-token middleware) ───────────
+    let control_routes = Router::new()
+        .route("/runtime/status", get(runtime_status))
+        .route("/setup/config", get(setup_config).put(save_setup_config))
+        .route("/setup/api-keys", get(list_api_keys).post(create_api_key))
+        .route("/setup/api-keys/{id}/rotate", post(rotate_api_key))
         .route(
-            "/api/oauth/{provider}/exchange",
-            post(oauth::oauth_exchange),
+            "/setup/providers",
+            get(list_providers).post(create_provider),
         )
-        .route("/api/oauth/{provider}/status", get(oauth::oauth_status))
+        .route(
+            "/setup/providers/{id}",
+            get(get_provider)
+                .put(update_provider)
+                .delete(delete_provider),
+        )
+        .route("/setup/providers/{id}/toggle", post(toggle_provider))
+        .route("/setup/providers/{id}/test", post(test_provider))
+        .route("/setup/providers/{id}/models", post(fetch_provider_models))
+        .route("/setup/provider-catalog", get(provider_catalog))
+        .route("/doctor", get(doctor))
+        .route("/setup/combos", get(list_combos).post(create_combo))
+        .route(
+            "/setup/combos/{id}",
+            get(get_combo).put(update_combo).delete(delete_combo),
+        )
+        .route(
+            "/setup/aliases",
+            get(list_model_aliases).post(create_model_alias),
+        )
+        .route(
+            "/setup/aliases/{id}",
+            put(update_model_alias).delete(delete_model_alias),
+        )
+        .route(
+            "/setup/lb-strategy",
+            get(get_lb_strategy).put(set_lb_strategy),
+        )
+        .route("/provider-limits", get(provider_limits))
+        .route("/rtk/metrics", get(rtk_metrics))
+        .route("/rtk/status/{provider}/{model}", get(rtk_status))
+        .route("/usage", get(usage_stats))
+        .route("/usage/daily", get(list_daily_usage))
+        .route("/usage/daily/{date}", get(get_daily_usage))
+        .route("/usage/aggregate", post(aggregate_daily))
+        .route("/oauth/{provider}/start", post(oauth::oauth_start))
+        .route("/oauth/{provider}/callback", get(oauth::oauth_callback))
+        .route("/oauth/{provider}/exchange", post(oauth::oauth_exchange))
+        .route("/oauth/{provider}/status", get(oauth::oauth_status))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::enforce_control_token,
+        ));
+
+    // ── Assemble router ───────────────────────────────────────────────────
+    let mut app = Router::new()
+        .merge(public_routes)
+        .nest("/api", control_routes)
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(600),
         ))
-        .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive())
+        .layer(TraceLayer::new_for_http());
+
+    // Scoped CORS — only applied when BLACKROUTER_CORS_ALLOW_ORIGINS is set.
+    // Same-origin requests (setup UI) work without a CORS layer.
+    if let Some(cors) = build_cors_layer() {
+        app = app.layer(cors);
+    }
+
+    app
+}
+
+/// Build a scoped CORS layer from the `BLACKROUTER_CORS_ALLOW_ORIGINS` env var.
+/// Returns `None` when the variable is unset (secure default — no cross-origin).
+fn build_cors_layer() -> Option<CorsLayer> {
+    let origins_str = std::env::var("BLACKROUTER_CORS_ALLOW_ORIGINS").ok()?;
+    let origins: Vec<axum::http::HeaderValue> = origins_str
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse().ok())
+        .collect();
+
+    if origins.is_empty() {
+        return None;
+    }
+
+    Some(
+        CorsLayer::new()
+            .allow_origin(tower_http::cors::AllowOrigin::list(origins))
+            .allow_methods([
+                axum::http::Method::GET,
+                axum::http::Method::POST,
+                axum::http::Method::PUT,
+                axum::http::Method::DELETE,
+            ])
+            .allow_headers([
+                axum::http::header::AUTHORIZATION,
+                axum::http::header::CONTENT_TYPE,
+                axum::http::header::ACCEPT,
+            ])
+            .allow_credentials(true),
+    )
 }
 
 async fn setup_redirect() -> Redirect {
@@ -345,7 +244,7 @@ async fn version() -> Json<BuildInfo> {
     Json(BuildInfo::default())
 }
 
-async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoResponse {
     let body = state.metrics.encode();
     ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body)
 }
@@ -1966,6 +1865,60 @@ fn normalized_route_model(route: &RouteKind) -> String {
     }
 }
 
+fn commandcode_upstream_model(model: &ModelRef) -> String {
+    model.model.clone()
+}
+
+fn commandcode_stream_error(bytes: &[u8]) -> Option<(StatusCode, String)> {
+    let text = String::from_utf8_lossy(bytes);
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let json = trimmed
+            .strip_prefix("data:")
+            .map(str::trim)
+            .unwrap_or(trimmed);
+        let Ok(event) = serde_json::from_str::<Value>(json) else {
+            continue;
+        };
+
+        if event.get("type").and_then(Value::as_str) != Some("error") {
+            continue;
+        }
+
+        let error = event.get("error").or_else(|| event.get("message"));
+        let message = error
+            .and_then(|value| {
+                value.as_str().map(ToOwned::to_owned).or_else(|| {
+                    value
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
+            })
+            .unwrap_or_else(|| {
+                error
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "CommandCode stream error".to_string())
+            });
+
+        let status = error
+            .and_then(|value| value.get("statusCode"))
+            .or_else(|| event.get("statusCode"))
+            .and_then(Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok())
+            .and_then(|value| StatusCode::from_u16(value).ok())
+            .unwrap_or(StatusCode::BAD_GATEWAY);
+
+        return Some((status, message));
+    }
+
+    None
+}
+
 /// Generate rate limit headers compatible with OpenAI format
 async fn rate_limit_headers(rtk: &Rtk, provider: &str, model: &str) -> Vec<(&'static str, String)> {
     let key = RequestKey {
@@ -2633,6 +2586,128 @@ fn build_upstream_request(
     request
 }
 
+// ── Context Window Management ──────────────────────────────────────────
+
+static BPE: OnceLock<tiktoken_rs::CoreBPE> = OnceLock::new();
+
+fn get_bpe() -> &'static tiktoken_rs::CoreBPE {
+    BPE.get_or_init(|| tiktoken_rs::cl100k_base().expect("failed to load cl100k_base"))
+}
+
+/// Count tokens in an OpenAI-format messages array using cl100k_base encoding.
+/// Follows OpenAI's token counting methodology for chat completions.
+fn count_chat_tokens(messages: &[Value]) -> u32 {
+    let bpe = get_bpe();
+    let mut total: u32 = 3; // priming: <|start|>assistant<|message|>
+    for msg in messages {
+        total += 4; // per-message formatting overhead
+        if let Some(role) = msg.get("role").and_then(Value::as_str) {
+            total += bpe.encode_with_special_tokens(role).len() as u32;
+        }
+        if let Some(content) = msg.get("content") {
+            match content {
+                Value::String(s) => {
+                    total += bpe.encode_with_special_tokens(s).len() as u32;
+                }
+                Value::Array(parts) => {
+                    for part in parts {
+                        if let Some(text) = part.get("text").and_then(Value::as_str) {
+                            total += bpe.encode_with_special_tokens(text).len() as u32;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(tool_calls) = msg.get("tool_calls").and_then(Value::as_array) {
+            for tc in tool_calls {
+                total += 7; // tool call formatting overhead
+                if let Some(func) = tc.get("function") {
+                    if let Some(name) = func.get("name").and_then(Value::as_str) {
+                        total += bpe.encode_with_special_tokens(name).len() as u32;
+                    }
+                    if let Some(args) = func.get("arguments").and_then(Value::as_str) {
+                        total += bpe.encode_with_special_tokens(args).len() as u32;
+                    }
+                }
+            }
+        }
+        if let Some(name) = msg.get("name").and_then(Value::as_str) {
+            total += bpe.encode_with_special_tokens(name).len() as u32;
+            total = total.saturating_sub(1); // name adjusts overhead
+        }
+    }
+    total
+}
+
+/// Trim conversation messages to fit within the model's context window.
+/// Strategy: remove oldest non-system messages first, then cap max_tokens.
+/// Returns true if any modification was made.
+fn trim_context_to_fit(body: &mut Value, context_window: u32, max_output_tokens: u32) -> bool {
+    // Determine effective max_tokens
+    let requested = body
+        .get("max_tokens")
+        .or_else(|| body.get("max_completion_tokens"))
+        .and_then(Value::as_u64)
+        .map(|v| v as u32);
+    let effective_max = requested
+        .unwrap_or(max_output_tokens)
+        .min(max_output_tokens);
+
+    // Cap max_tokens in body if it exceeds model limit
+    if requested.is_some_and(|r| r > max_output_tokens) {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                "max_tokens".to_string(),
+                Value::Number(max_output_tokens.into()),
+            );
+        }
+    }
+
+    let budget = context_window.saturating_sub(effective_max);
+
+    // Get messages array
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    if messages.is_empty() {
+        return false;
+    }
+
+    let mut current = count_chat_tokens(messages);
+    if current <= budget {
+        return false;
+    }
+
+    // Count leading system messages to preserve
+    let system_count = messages
+        .iter()
+        .take_while(|m| m.get("role").and_then(Value::as_str) == Some("system"))
+        .count();
+
+    // Remove oldest non-system messages until we fit
+    let mut modified = false;
+    while current > budget && messages.len() > system_count + 1 {
+        let removed = messages.remove(system_count);
+        let removed_tokens = count_chat_tokens(std::slice::from_ref(&removed));
+        current = current.saturating_sub(removed_tokens);
+        modified = true;
+    }
+
+    // If still over budget after removing all non-system messages, reduce max_tokens
+    if current > budget {
+        let remaining = context_window.saturating_sub(current);
+        if remaining > 0 {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("max_tokens".to_string(), Value::Number(remaining.into()));
+                modified = true;
+            }
+        }
+    }
+
+    modified
+}
+
 async fn proxy_chat_completions(
     state: &AppState,
     body: Value,
@@ -2914,24 +2989,46 @@ async fn proxy_with_specific_provider(
         }
     };
 
+    // Context window management — trim messages if they exceed model limits
+    let mut working_body = body.clone();
+    if let Some(info) = blackrouter_providers::lookup_model_info(&model.model) {
+        if trim_context_to_fit(
+            &mut working_body,
+            info.context_window,
+            info.max_output_tokens,
+        ) {
+            tracing::debug!(
+                "trimmed context for {}/{} (context_window={})",
+                model.provider,
+                model.model,
+                info.context_window
+            );
+        }
+    }
+
     // Translate request from OpenAI format to target format
     let translated_body = if target_format != WireFormat::OpenAiChat {
-        translate_request(body, WireFormat::OpenAiChat, target_format).map_err(|error| {
-            ApiErrorResponse::new(
-                StatusCode::BAD_REQUEST,
-                format!("request translation failed: {error}"),
-                "translation_error",
-            )
-        })?
+        translate_request(&working_body, WireFormat::OpenAiChat, target_format).map_err(
+            |error| {
+                ApiErrorResponse::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("request translation failed: {error}"),
+                    "translation_error",
+                )
+            },
+        )?
     } else {
-        body.clone()
+        working_body
     };
 
     let mut upstream_body = translated_body;
     if let Some(object) = upstream_body.as_object_mut() {
         if target_format == WireFormat::CommandCode {
             if let Some(params) = object.get_mut("params").and_then(Value::as_object_mut) {
-                params.insert("model".to_string(), Value::String(model.model.clone()));
+                params.insert(
+                    "model".to_string(),
+                    Value::String(commandcode_upstream_model(model)),
+                );
                 params.insert("stream".to_string(), Value::Bool(true));
             }
         } else {
@@ -3187,6 +3284,30 @@ async fn proxy_with_specific_provider(
             ));
         }
     };
+
+    if target_format == WireFormat::CommandCode {
+        if let Some((status, message)) = commandcode_stream_error(&bytes) {
+            state
+                .rtk
+                .record_request_end(&request_key, false, start_time.elapsed(), 0, 0, 0.0)
+                .await;
+            state
+                .metrics
+                .requests_total
+                .with_label_values(&[&model.provider, &model.model, &status.as_u16().to_string()])
+                .inc();
+            state
+                .metrics
+                .request_duration
+                .with_label_values(&[&model.provider, &model.model])
+                .observe(start_time.elapsed().as_secs_f64());
+            return Err(ApiErrorResponse::new(
+                status,
+                format!("{} error: {message}", model.provider),
+                "provider_error",
+            ));
+        }
+    }
 
     let codex_chat_response = if uses_codex_backend && target_format == WireFormat::OpenAiResponses
     {
@@ -3807,120 +3928,18 @@ async fn messages_proxy(
         })
 }
 
-fn authorize_v1(state: &AppState, headers: &HeaderMap) -> Result<(), ApiErrorResponse> {
-    if !state.config.require_api_key {
-        return Ok(());
-    }
-
-    let api_key = extract_api_key(headers).ok_or_else(|| {
-        ApiErrorResponse::new(
-            StatusCode::UNAUTHORIZED,
-            "Missing API key",
-            "authentication_error",
-        )
-    })?;
-
-    let valid = state.storage.is_valid_api_key(&api_key).map_err(|error| {
-        ApiErrorResponse::internal(format!("API key validation failed: {error}"))
-    })?;
-
-    if valid {
-        Ok(())
-    } else {
-        Err(ApiErrorResponse::new(
-            StatusCode::UNAUTHORIZED,
-            "Invalid API key",
-            "authentication_error",
-        ))
-    }
-}
-
-fn extract_api_key(headers: &HeaderMap) -> Option<String> {
-    if let Some(value) = headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-    {
-        let value = value.trim();
-        if value
-            .get(..7)
-            .map(|prefix| prefix.eq_ignore_ascii_case("bearer "))
-            .unwrap_or(false)
-        {
-            return Some(value[7..].trim().to_string());
-        }
-    }
-
-    headers
-        .get("x-api-key")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-#[derive(Debug)]
-pub struct ApiErrorResponse {
-    status: StatusCode,
-    message: String,
-    error_type: &'static str,
-}
-
-impl ApiErrorResponse {
-    pub fn new(status: StatusCode, message: impl Into<String>, error_type: &'static str) -> Self {
-        Self {
-            status,
-            message: message.into(),
-            error_type,
-        }
-    }
-
-    pub fn internal(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::INTERNAL_SERVER_ERROR, message, "server_error")
-    }
-
-    pub fn bad_request(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::BAD_REQUEST, message, "invalid_request_error")
-    }
-
-    pub fn not_found(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::NOT_FOUND, message, "not_found")
-    }
-}
-
-fn storage_error_to_api(error: StorageError, context: &'static str) -> ApiErrorResponse {
-    match error {
-        StorageError::Validation(message) if message.contains("not found") => {
-            ApiErrorResponse::not_found(message)
-        }
-        StorageError::Validation(message) => ApiErrorResponse::bad_request(message),
-        other => ApiErrorResponse::internal(format!("{context}: {other}")),
-    }
-}
-
-impl IntoResponse for ApiErrorResponse {
-    fn into_response(self) -> Response {
-        let body = Json(json!({
-            "error": {
-                "message": self.message,
-                "type": self.error_type,
-                "param": null,
-                "code": null
-            }
-        }));
-        (self.status, body).into_response()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         builtin_provider_models, classify_provider_post_response, codex_stream_to_chat_response,
-        derive_models_url, extract_api_key, extract_codex_model_ids, extract_model_ids,
-        provider_check_post_body, provider_check_uses_post, provider_uses_codex_model_catalog,
-        sanitize_codex_responses_body, should_cooldown_provider,
+        commandcode_stream_error, commandcode_upstream_model, derive_models_url, extract_api_key,
+        extract_codex_model_ids, extract_model_ids, provider_check_post_body,
+        provider_check_uses_post, provider_uses_codex_model_catalog, sanitize_codex_responses_body,
+        should_cooldown_provider,
     };
     use axum::http::{HeaderMap, StatusCode};
     use base64::Engine;
+    use blackrouter_core::ModelRef;
     use blackrouter_storage::RawProviderConnection;
     use serde_json::json;
 
@@ -4006,6 +4025,27 @@ mod tests {
         );
         assert!(!not_found.ok);
         assert!(not_found.message.contains("not found"));
+    }
+
+    #[test]
+    fn commandcode_upstream_model_uses_provider_native_id() {
+        let model = ModelRef {
+            provider: "commandcode".to_string(),
+            model: "tencent/Hy3".to_string(),
+        };
+
+        assert_eq!(commandcode_upstream_model(&model), "tencent/Hy3");
+    }
+
+    #[test]
+    fn commandcode_stream_error_extracts_status_and_message() {
+        let raw = r#"{"type":"start"}
+{"type":"error","error":{"isRetryable":false,"message":"model: tencent/HY3","statusCode":404,"type":"server_error"}}"#;
+
+        let (status, message) = commandcode_stream_error(raw.as_bytes()).unwrap();
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(message, "model: tencent/HY3");
     }
 
     #[test]

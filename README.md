@@ -46,7 +46,7 @@ Install Rust, then:
 cargo run -p blackrouter-bin
 ```
 
-The local `.env` currently uses port `20130` and stores data under `/Users/ccm/Documents/blackrouter/data`.
+The local `.env` currently uses port `20129` and stores data under `/Users/ccm/Documents/blackrouter/data`.
 
 To point at an existing 9Router data directory:
 
@@ -72,23 +72,23 @@ BLACKROUTER_DATABASE_URL=sqlite:///data/blackrouter.db
 With the current `.env`, open:
 
 ```bash
-curl http://localhost:20130/health
+curl http://localhost:20129/health
 ```
 
 For Zed/OpenAI-compatible clients, use:
 
 ```json
-"api_url": "http://localhost:20130/v1"
+"api_url": "http://localhost:20129/v1"
 ```
 
 ## Verify
 
 ```bash
-curl http://localhost:20130/health
-curl http://localhost:20130/setup
-curl http://localhost:20130/version
-curl http://localhost:20130/api/runtime/status
-curl http://localhost:20130/v1/models
+curl http://localhost:20129/health
+curl http://localhost:20129/setup
+curl http://localhost:20129/version
+curl http://localhost:20129/api/runtime/status
+curl http://localhost:20129/v1/models
 ```
 
 ## Notes
