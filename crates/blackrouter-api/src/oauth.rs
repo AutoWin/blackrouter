@@ -74,7 +74,7 @@ struct OAuthSession {
 // ── Request/Response types ─────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
-pub(crate) struct OAuthStartResponse {
+pub struct OAuthStartResponse {
     url: String,
     state: String,
     provider: String,
@@ -86,19 +86,19 @@ pub(crate) struct OAuthStartResponse {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct OAuthCallbackQuery {
+pub struct OAuthCallbackQuery {
     code: Option<String>,
     state: Option<String>,
     error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct OAuthStatusQuery {
+pub struct OAuthStatusQuery {
     state: String,
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct OAuthPollResponse {
+pub struct OAuthPollResponse {
     status: String,
     access_token: Option<String>,
     refresh_token: Option<String>,
@@ -109,7 +109,7 @@ pub(crate) struct OAuthPollResponse {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct OAuthExchangeBody {
+pub struct OAuthExchangeBody {
     code: String,
     state: String,
 }

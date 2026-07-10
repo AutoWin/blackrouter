@@ -1,0 +1,86 @@
+{
+  "title": "BlackRouter",
+  "uid": "blackrouter",
+  "schemaVersion": 39,
+  "version": 1,
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "templating": {
+    "list": [
+      {
+        "name": "provider",
+        "type": "query",
+        "label": "Provider",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(blackrouter_requests_total, provider)",
+        "refresh": 1,
+        "includeAll": true,
+        "multi": true
+      },
+      {
+        "name": "model",
+        "type": "query",
+        "label": "Model",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(blackrouter_requests_total, model)",
+        "refresh": 1,
+        "includeAll": true,
+        "multi": true
+      }
+    ]
+  },
+  "panels": [
+    {
+      "title": "Request Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(blackrouter_requests_total{provider=~\"$provider\", model=~\"$model\"}[$__rate_interval])) by (status)",
+          "legendFormat": "{{status}}"
+        }
+      ]
+    },
+    {
+      "title": "Request Duration p95 (s)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(blackrouter_request_duration_seconds_bucket{provider=~\"$provider\", model=~\"$model\"}[$__rate_interval])) by (le))",
+          "legendFormat": "p95"
+        }
+      ]
+    },
+    {
+      "title": "Tokens / sec",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(rate(blackrouter_tokens_total{provider=~\"$provider\", model=~\"$model\", type=\"prompt\"}[$__rate_interval]))",
+          "legendFormat": "prompt"
+        },
+        {
+          "expr": "sum(rate(blackrouter_tokens_total{provider=~\"$provider\", model=~\"$model\", type=\"completion\"}[$__rate_interval]))",
+          "legendFormat": "completion"
+        }
+      ]
+    },
+    {
+      "title": "Stream TTFB p95 (s)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(blackrouter_stream_ttfb_seconds_bucket{provider=~\"$provider\", model=~\"$model\"}[$__rate_interval])) by (le))",
+          "legendFormat": "p95"
+        }
+      ]
+    }
+  ]
+}

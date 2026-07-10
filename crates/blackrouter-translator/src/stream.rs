@@ -882,6 +882,21 @@ fn extract_sse_data(raw: &str) -> Option<String> {
     None
 }
 
+/// Maximum idle time (no data from upstream) before terminating the translated
+/// stream. Prevents infinite hangs when upstream keeps the connection open
+/// without sending data.
+const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Check whether a raw SSE event or CommandCode line is the `[DONE]` sentinel.
+fn is_done_sentinel(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    let data = trimmed
+        .strip_prefix("data:")
+        .map(str::trim)
+        .unwrap_or(trimmed);
+    data == "[DONE]"
+}
+
 fn extract_commandcode_line(raw: &str) -> Option<String> {
     let line = raw.trim();
     if line.is_empty() {
@@ -943,10 +958,29 @@ where
                     if let Some(pos) = st.buffer.find('\n') {
                         let raw_line = st.buffer[..pos].to_string();
                         st.buffer = st.buffer[pos + 1..].to_string();
+
+                        // Check for [DONE] sentinel from upstream
+                        if is_done_sentinel(&raw_line) {
+                            st.emitted_done = true;
+                            return Some((Ok(Bytes::from("data: [DONE]\n\n")), st));
+                        }
+
                         if let Some(data) = extract_commandcode_line(&raw_line) {
                             let chunks = st.translate.translate_event(&data);
                             if !chunks.is_empty() {
-                                return Some((Ok(Bytes::from(chunks.concat())), st));
+                                let combined = chunks.concat();
+                                // If this event set stopped, append [DONE] and terminate
+                                if st.translate.stopped {
+                                    st.emitted_done = true;
+                                    let done = format!("{}data: [DONE]\n\n", combined);
+                                    return Some((Ok(Bytes::from(done)), st));
+                                }
+                                return Some((Ok(Bytes::from(combined)), st));
+                            }
+                            // If stopped was set but no chunks emitted, still terminate
+                            if st.translate.stopped {
+                                st.emitted_done = true;
+                                return Some((Ok(Bytes::from("data: [DONE]\n\n")), st));
                             }
                         }
                         continue;
@@ -959,18 +993,42 @@ where
                     let raw_event = st.buffer[..pos].to_string();
                     st.buffer = st.buffer[pos + 2..].to_string();
 
+                    // Check for [DONE] sentinel from upstream
+                    if is_done_sentinel(&raw_event) {
+                        st.emitted_done = true;
+                        return Some((Ok(Bytes::from("data: [DONE]\n\n")), st));
+                    }
+
                     // Extract data: line from the event
                     if let Some(data) = extract_sse_data(&raw_event) {
                         let chunks = st.translate.translate_event(&data);
                         if !chunks.is_empty() {
                             // Concatenate all translated chunks into one Bytes
                             let combined = chunks.concat();
+                            // If this event set stopped, append [DONE] and terminate
+                            if st.translate.stopped {
+                                st.emitted_done = true;
+                                let done = format!("{}data: [DONE]\n\n", combined);
+                                return Some((Ok(Bytes::from(done)), st));
+                            }
                             return Some((Ok(Bytes::from(combined)), st));
+                        }
+                        // If stopped was set but no chunks emitted, still terminate
+                        if st.translate.stopped {
+                            st.emitted_done = true;
+                            return Some((Ok(Bytes::from("data: [DONE]\n\n")), st));
                         }
                         // Skip non-translatable events, continue loop
                     }
                     // Skip events without data: line
                     continue;
+                }
+
+                // If the translator has signaled stop (finish_reason emitted),
+                // terminate immediately without waiting for upstream to close.
+                if st.translate.stopped {
+                    st.emitted_done = true;
+                    return Some((Ok(Bytes::from("data: [DONE]\n\n")), st));
                 }
 
                 // Need more data from upstream
@@ -1000,16 +1058,26 @@ where
                     return Some((Ok(Bytes::from("data: [DONE]\n\n")), st));
                 }
 
-                // Fetch next chunk from upstream
-                match st.upstream.next().await {
-                    Some(Ok(bytes)) => {
+                // Fetch next chunk from upstream (with idle timeout to prevent
+                // infinite hangs when upstream holds the connection open)
+                match tokio::time::timeout(STREAM_IDLE_TIMEOUT, st.upstream.next()).await {
+                    Ok(Some(Ok(bytes))) => {
                         st.buffer.push_str(&String::from_utf8_lossy(&bytes));
                     }
-                    Some(Err(e)) => {
+                    Ok(Some(Err(e))) => {
                         return Some((Err(SseTranslateError::Upstream(e.to_string())), st));
                     }
-                    None => {
+                    Ok(None) => {
                         st.upstream_done = true;
+                    }
+                    Err(_) => {
+                        // Idle timeout — terminate stream to prevent client hang
+                        tracing::warn!(
+                            "upstream stream idle for {:?}, terminating translated stream",
+                            STREAM_IDLE_TIMEOUT
+                        );
+                        st.emitted_done = true;
+                        return Some((Ok(Bytes::from("data: [DONE]\n\n")), st));
                     }
                 }
             }

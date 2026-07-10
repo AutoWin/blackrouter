@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -116,10 +116,53 @@ impl RateLimitState {
     }
 }
 
+// ── Durable state snapshot (Phase 5.3) ─────────────────────────────
+// These are JSON-serializable projections of the in-memory RTK state.
+// `Instant` is not serializable, so we store logical counts and reconstruct
+// the sliding window conservatively on restore (treating the snapshot as
+// having just happened — which never over-reports remaining capacity).
+
+/// One rate-limit window entry (per RequestKey).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RtkRateEntry {
+    pub key: RequestKey,
+    /// Number of requests recorded in the current window.
+    pub requests: u32,
+    /// Sum of tokens recorded in the current window.
+    pub tokens: u64,
+    /// In-flight concurrent requests.
+    pub concurrent: u32,
+}
+
+/// One circuit-breaker entry (per provider connection id).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RtkCircuitEntry {
+    pub connection_id: String,
+    pub state: CircuitState,
+    pub consecutive_failures: u32,
+    pub last_failure_unix: Option<u64>,
+    pub opened_at_unix: Option<u64>,
+}
+
+/// Full durable snapshot of RTK runtime state.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RtkSnapshot {
+    pub rate_limits: Vec<RtkRateEntry>,
+    pub circuit_breakers: Vec<RtkCircuitEntry>,
+    pub captured_at_unix: u64,
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 // ── Circuit Breaker (Phase 4.1) ────────────────────────────────────────
 
 /// Circuit breaker state
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CircuitState {
     /// Normal operation — requests pass through
     Closed,
@@ -186,6 +229,7 @@ pub enum LoadBalanceStrategy {
     ResponseTime,
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for LoadBalanceStrategy {
     fn default() -> Self {
         Self::RoundRobin
@@ -193,8 +237,6 @@ impl Default for LoadBalanceStrategy {
 }
 
 // ── Response Cache (Phase 4.2) ─────────────────────────────────────────
-
-/// A cached response entry
 struct CacheEntry {
     body: Vec<u8>,
     content_type: Option<String>,
@@ -261,6 +303,11 @@ impl ResponseCache {
     /// Get current cache size
     pub async fn len(&self) -> usize {
         self.entries.read().await.len()
+    }
+
+    /// Whether the cache is empty
+    pub async fn is_empty(&self) -> bool {
+        self.entries.read().await.is_empty()
     }
 }
 
@@ -516,6 +563,199 @@ impl Rtk {
         samples.clear();
     }
 
+    /// Capture a JSON-serializable snapshot of the durable RTK state
+    /// (rate-limit windows + circuit breakers). Safe to call periodically;
+    /// does not block the hot path for long.
+    pub async fn snapshot(&self) -> RtkSnapshot {
+        self.snapshot_inner().await
+    }
+
+    /// Blocking variant for process startup before the async runtime runs.
+    pub fn snapshot_blocking(&self) -> RtkSnapshot {
+        self.snapshot_inner_blocking()
+    }
+
+    async fn snapshot_inner(&self) -> RtkSnapshot {
+        let now = unix_now();
+        let mut rate_limits = Vec::new();
+        {
+            let map = self.inner.rate_limits.read().await;
+            for (key, state) in map.iter() {
+                // Count only requests/tokens still inside the 60s window so a
+                // restored window does not carry ancient traffic.
+                let cutoff = Instant::now() - Duration::from_secs(60);
+                let requests = state.requests.iter().filter(|t| **t > cutoff).count() as u32;
+                let tokens: u64 = state
+                    .tokens
+                    .iter()
+                    .filter(|(t, _)| *t > cutoff)
+                    .map(|(_, tk)| *tk)
+                    .sum();
+                rate_limits.push(RtkRateEntry {
+                    key: key.clone(),
+                    requests,
+                    tokens,
+                    concurrent: state.concurrent,
+                });
+            }
+        }
+
+        let mut circuit_breakers = Vec::new();
+        {
+            let map = self.inner.circuit_breakers.read().await;
+            for (connection_id, entry) in map.iter() {
+                circuit_breakers.push(RtkCircuitEntry {
+                    connection_id: connection_id.clone(),
+                    state: entry.state.clone(),
+                    consecutive_failures: entry.consecutive_failures,
+                    last_failure_unix: entry.last_failure_time.map(|t| now - t.elapsed().as_secs()),
+                    opened_at_unix: entry.opened_at.map(|t| now - t.elapsed().as_secs()),
+                });
+            }
+        }
+
+        RtkSnapshot {
+            rate_limits,
+            circuit_breakers,
+            captured_at_unix: now,
+        }
+    }
+
+    fn snapshot_inner_blocking(&self) -> RtkSnapshot {
+        let now = unix_now();
+        let mut rate_limits = Vec::new();
+        {
+            let map = self.inner.rate_limits.blocking_read();
+            for (key, state) in map.iter() {
+                let cutoff = Instant::now() - Duration::from_secs(60);
+                let requests = state.requests.iter().filter(|t| **t > cutoff).count() as u32;
+                let tokens: u64 = state
+                    .tokens
+                    .iter()
+                    .filter(|(t, _)| *t > cutoff)
+                    .map(|(_, tk)| *tk)
+                    .sum();
+                rate_limits.push(RtkRateEntry {
+                    key: key.clone(),
+                    requests,
+                    tokens,
+                    concurrent: state.concurrent,
+                });
+            }
+        }
+
+        let mut circuit_breakers = Vec::new();
+        {
+            let map = self.inner.circuit_breakers.blocking_read();
+            for (connection_id, entry) in map.iter() {
+                circuit_breakers.push(RtkCircuitEntry {
+                    connection_id: connection_id.clone(),
+                    state: entry.state.clone(),
+                    consecutive_failures: entry.consecutive_failures,
+                    last_failure_unix: entry.last_failure_time.map(|t| now - t.elapsed().as_secs()),
+                    opened_at_unix: entry.opened_at.map(|t| now - t.elapsed().as_secs()),
+                });
+            }
+        }
+
+        RtkSnapshot {
+            rate_limits,
+            circuit_breakers,
+            captured_at_unix: now,
+        }
+    }
+
+    /// Restore a previously captured snapshot. Conservative by design: the
+    /// sliding window is reconstructed as if it just started (events treated as
+    /// happening now), so we never over-report remaining capacity after a
+    /// restart. Circuit breakers keep their open/half-open state so an
+    /// unhealthy provider is not immediately flooded.
+    ///
+    /// Async variant — safe to call from within a Tokio runtime.
+    pub async fn restore(&self, snapshot: &RtkSnapshot) {
+        self.restore_inner(snapshot).await;
+    }
+
+    /// Blocking variant — only for process startup before the async runtime
+    /// is running (e.g. `AppState::new`).
+    pub fn restore_blocking(&self, snapshot: &RtkSnapshot) {
+        self.restore_inner_blocking(snapshot);
+    }
+
+    async fn restore_inner(&self, snapshot: &RtkSnapshot) {
+        {
+            let mut map = self.inner.rate_limits.write().await;
+            for entry in &snapshot.rate_limits {
+                let mut state = RateLimitState::new();
+                for _ in 0..entry.requests {
+                    state.requests.push(Instant::now());
+                }
+                if entry.tokens > 0 {
+                    state.tokens.push((Instant::now(), entry.tokens));
+                }
+                state.concurrent = entry.concurrent;
+                map.insert(entry.key.clone(), state);
+            }
+        }
+        {
+            let mut map = self.inner.circuit_breakers.write().await;
+            for entry in &snapshot.circuit_breakers {
+                let last_failure_time = entry
+                    .last_failure_unix
+                    .map(|u| Instant::now() - Duration::from_secs(unix_now() - u));
+                let opened_at = entry
+                    .opened_at_unix
+                    .map(|u| Instant::now() - Duration::from_secs(unix_now() - u));
+                map.insert(
+                    entry.connection_id.clone(),
+                    CircuitBreakerEntry {
+                        state: entry.state.clone(),
+                        consecutive_failures: entry.consecutive_failures,
+                        last_failure_time,
+                        opened_at,
+                    },
+                );
+            }
+        }
+    }
+
+    fn restore_inner_blocking(&self, snapshot: &RtkSnapshot) {
+        {
+            let mut map = self.inner.rate_limits.blocking_write();
+            for entry in &snapshot.rate_limits {
+                let mut state = RateLimitState::new();
+                for _ in 0..entry.requests {
+                    state.requests.push(Instant::now());
+                }
+                if entry.tokens > 0 {
+                    state.tokens.push((Instant::now(), entry.tokens));
+                }
+                state.concurrent = entry.concurrent;
+                map.insert(entry.key.clone(), state);
+            }
+        }
+        {
+            let mut map = self.inner.circuit_breakers.blocking_write();
+            for entry in &snapshot.circuit_breakers {
+                let last_failure_time = entry
+                    .last_failure_unix
+                    .map(|u| Instant::now() - Duration::from_secs(unix_now() - u));
+                let opened_at = entry
+                    .opened_at_unix
+                    .map(|u| Instant::now() - Duration::from_secs(unix_now() - u));
+                map.insert(
+                    entry.connection_id.clone(),
+                    CircuitBreakerEntry {
+                        state: entry.state.clone(),
+                        consecutive_failures: entry.consecutive_failures,
+                        last_failure_time,
+                        opened_at,
+                    },
+                );
+            }
+        }
+    }
+
     // ── Circuit Breaker methods (Phase 4.1) ───────────────────────────
 
     /// Check if the circuit breaker is open for a provider connection
@@ -657,6 +897,61 @@ impl Rtk {
         let current = times.entry(connection_id.to_string()).or_insert(0.0);
         // Exponential moving average
         *current = *current * 0.8 + duration.as_secs_f64() * 1000.0 * 0.2;
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use tokio::test as async_test;
+
+    #[async_test]
+    async fn snapshot_restore_preserves_concurrent() {
+        let rtk = Rtk::new(RateLimitConfig::default());
+        let key = RequestKey {
+            provider: "openai".to_string(),
+            model: "gpt-4o".to_string(),
+            api_key: None,
+        };
+        rtk.record_request_start(&key).await;
+        rtk.record_request_start(&key).await;
+
+        let snapshot = rtk.snapshot().await;
+        assert_eq!(snapshot.rate_limits.len(), 1);
+        assert_eq!(snapshot.rate_limits[0].concurrent, 2);
+
+        // Restore into a fresh tracker and confirm the window is reconstructed.
+        let restored = Rtk::new(RateLimitConfig::default());
+        restored.restore(&snapshot).await;
+        let status = restored.rate_limit_status(&key).await;
+        assert_eq!(
+            status.concurrent_remaining,
+            RateLimitConfig::default().max_concurrent - 2,
+            "restored tracker should reflect in-flight concurrency"
+        );
+    }
+
+    #[async_test]
+    async fn snapshot_restore_preserves_open_circuit() {
+        let rtk = Rtk::new(RateLimitConfig::default());
+        // Force the circuit open by recording enough failures.
+        for _ in 0..10 {
+            rtk.record_circuit_failure("conn-1").await;
+        }
+        assert!(rtk.is_circuit_open("conn-1").await);
+
+        let snapshot = rtk.snapshot().await;
+        assert!(snapshot
+            .circuit_breakers
+            .iter()
+            .any(|e| e.connection_id == "conn-1" && e.state == CircuitState::Open));
+
+        let restored = Rtk::new(RateLimitConfig::default());
+        restored.restore(&snapshot).await;
+        assert!(
+            restored.is_circuit_open("conn-1").await,
+            "open circuit must survive restart to avoid flooding an unhealthy provider"
+        );
     }
 }
 

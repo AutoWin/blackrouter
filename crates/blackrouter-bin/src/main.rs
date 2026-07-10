@@ -5,6 +5,8 @@ use blackrouter_config::AppConfig;
 use blackrouter_storage::Storage;
 use blackrouter_telegram::{TelegramBot, TelegramBotConfig, TelegramRuntime};
 use tokio::net::TcpListener;
+use tracing_subscriber::fmt;
+use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -30,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let bind_addr = config.bind_addr().context("failed to build bind address")?;
-    let app_state = AppState::new(config.clone(), storage.clone());
+    let app_state = AppState::new(config.clone(), storage.clone()).await;
     let app = build_router(app_state.clone());
     let listener = TcpListener::bind(bind_addr)
         .await
@@ -38,9 +40,10 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(%bind_addr, "BlackRouter listening");
 
-    // OpenTelemetry: log configuration status (full OTLP export requires subscriber integration)
+    // OpenTelemetry traces are wired into the tracing subscriber when
+    // OTEL_EXPORTER_OTLP_ENDPOINT is set (see blackrouter_api::telemetry).
     if std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok() {
-        tracing::info!("OpenTelemetry endpoint configured, ready for export");
+        tracing::info!("OpenTelemetry tracing enabled (OTLP export)");
     }
 
     // Start Telegram bot if configured
@@ -114,7 +117,16 @@ fn init_tracing(default_directive: &str) -> anyhow::Result<()> {
         .or_else(|_| EnvFilter::try_new(default_directive))
         .context("invalid tracing filter")?;
 
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    // When OTEL_EXPORTER_OTLP_ENDPOINT is set, `init_layer()` returns an
+    // OpenTelemetry layer; otherwise `None`. `Option<L>: Layer` (blanket
+    // impl) keeps the subscriber type stable either way.
+    let otel_layer = blackrouter_api::telemetry::init_layer();
+
+    tracing_subscriber::registry()
+        .with(otel_layer)
+        .with(filter)
+        .with(fmt::layer())
+        .init();
     Ok(())
 }
 

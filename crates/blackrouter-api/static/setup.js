@@ -278,111 +278,183 @@ function render() {
 
 function renderLimits(payload) {
   const rows = Array.isArray(payload?.data) ? payload.data : [];
-  const rowsWithUpstream = rows.filter((row) => row.upstream_rate_limit).length;
-  setBadge(
-    "limitsBadge",
-    rowsWithUpstream
-      ? `${rowsWithUpstream} upstream snapshots`
-      : "No upstream data",
-    rowsWithUpstream ? "ok" : "muted",
+  const snapshots = rows.filter((row) => row.upstream_rate_limit);
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const freshSnapshots = snapshots.filter(
+    (row) => snapshotFreshness(row.upstream_rate_limit, nowSeconds) === "fresh",
   );
+  const staleSnapshots = snapshots.filter((row) => {
+    const f = snapshotFreshness(row.upstream_rate_limit, nowSeconds);
+    return f === "stale" || f === "expired";
+  });
+
+  if (snapshots.length) {
+    setBadge(
+      "limitsBadge",
+      freshSnapshots.length + " fresh / " + staleSnapshots.length + " stale",
+      staleSnapshots.length && !freshSnapshots.length ? "warn" : "ok",
+    );
+  } else {
+    setBadge("limitsBadge", "No upstream data", "muted");
+  }
 
   const metrics = payload?.metrics || {};
-  $("limitsSummary").innerHTML = `
-    <div class="metric-tile">
-      <span>Total Requests</span>
-      <strong>${formatNumber(metrics.total_requests)}</strong>
-    </div>
-    <div class="metric-tile">
-      <span>Prompt Tokens</span>
-      <strong>${formatNumber(metrics.total_prompt_tokens)}</strong>
-    </div>
-    <div class="metric-tile">
-      <span>Completion Tokens</span>
-      <strong>${formatNumber(metrics.total_completion_tokens)}</strong>
-    </div>
-    <div class="metric-tile">
-      <span>Tracked Cost</span>
-      <strong>${formatUsd(metrics.total_cost)}</strong>
-    </div>
-  `;
+  $("limitsSummary").innerHTML =
+    '<div class="metric-tile"><span>Total Requests</span><strong>' + formatNumber(metrics.total_requests) + '</strong></div>' +
+    '<div class="metric-tile"><span>Prompt Tokens</span><strong>' + formatNumber(metrics.total_prompt_tokens) + '</strong></div>' +
+    '<div class="metric-tile"><span>Completion Tokens</span><strong>' + formatNumber(metrics.total_completion_tokens) + '</strong></div>' +
+    '<div class="metric-tile"><span>Tracked Cost</span><strong>' + formatUsd(metrics.total_cost) + '</strong></div>';
 
   const guard = payload?.cost_guard || {};
-  $("costGuardSummary").innerHTML = `
-    <div class="metric-tile">
-      <span>Cost Guard</span>
-      <strong>${guard.enabled ? "Enabled" : "Disabled"}</strong>
-    </div>
-    <div class="metric-tile">
-      <span>Today</span>
-      <strong>${formatUsd(guard.daily_spend_usd)}</strong>
-    </div>
-    <div class="metric-tile">
-      <span>This Month</span>
-      <strong>${formatUsd(guard.monthly_spend_usd)}</strong>
-    </div>
-    <div class="metric-tile ${guard.daily_exceeded || guard.monthly_exceeded ? "danger" : ""}">
-      <span>Budget</span>
-      <strong>${guard.daily_exceeded || guard.monthly_exceeded ? "Exceeded" : "OK"}</strong>
-    </div>
-  `;
+  $("costGuardSummary").innerHTML =
+    '<div class="metric-tile"><span>Cost Guard</span><strong>' + (guard.enabled ? "Enabled" : "Disabled") + '</strong></div>' +
+    budgetTile("Daily", guard.daily_spend_usd, guard.daily_budget_usd, guard.daily_exceeded) +
+    budgetTile("Monthly", guard.monthly_spend_usd, guard.monthly_budget_usd, guard.monthly_exceeded);
 
   const root = $("limitsList");
   if (!root) return;
   if (!rows.length) {
-    root.innerHTML = `<div class="empty">No providers</div>`;
+    root.innerHTML =
+      '<div class="empty">No provider connections yet.</div>' +
+      '<p class="empty-hint">Add a provider connection, then send a request through it to collect upstream rate-limit snapshots.</p>';
     return;
   }
 
   root.innerHTML = rows
-    .map((row) => {
-      const snapshot = row.upstream_rate_limit || {};
-      const headers = snapshot.headers || {};
-      const rtk = row.rtk || {};
-      const usage = row.usage || {};
-      const title = `${row.provider}/${row.name || row.id}`;
-      const emailSuffix = row.email
-        ? `<span class="provider-email">${escapeHtml(row.email)}</span>`
-        : "";
-      return `
-    <div class="row limit-row">
-      <div>
-        <strong title="${escapeHtml(title)}">${escapeHtml(title)}</strong>
-        ${emailSuffix}
-        <div class="row-meta">
-              <span>${escapeHtml(row.status || "unknown")}</span>
-              <span>${row.is_active ? "active" : "disabled"}</span>
-              <span>${escapeHtml(row.model || "no model")}</span>
-              <span>seen ${escapeHtml(formatUnixSeconds(snapshot.observedAt))}</span>
-            </div>
-          </div>
-          <div class="limit-grid">
-            ${limitCell("Upstream RPM", headers["x-ratelimit-remaining-requests"], headers["x-ratelimit-limit-requests"])}
-            ${limitCell("Upstream TPM", headers["x-ratelimit-remaining-tokens"], headers["x-ratelimit-limit-tokens"])}
-            ${limitCell("Req Reset", headers["x-ratelimit-reset-requests"], null)}
-            ${limitCell("Tok Reset", headers["x-ratelimit-reset-tokens"], null)}
-            ${limitCell("RTK Req", rtk.requests_remaining, null)}
-            ${limitCell("RTK Tok", rtk.tokens_remaining, null)}
-            ${limitCell("Requests", usage.requests, null)}
-            ${limitCell("Cost", formatUsd(usage.cost), null)}
-          </div>
-        </div>
-      `;
-    })
+    .map((row) => renderLimitRow(row, nowSeconds))
     .join("");
+}
+
+function snapshotFreshness(snapshot, nowSeconds) {
+  const observed = snapshot?.observedAt;
+  const seconds = Number(observed);
+  if (!observed || !Number.isFinite(seconds)) return "unknown";
+  const ageSeconds = nowSeconds - seconds;
+  if (ageSeconds < 0) return "fresh";
+  if (ageSeconds <= 5 * 60) return "fresh";
+  if (ageSeconds <= 30 * 60) return "stale";
+  return "expired";
+}
+
+const FRESHNESS_LABEL = {
+  fresh: "Fresh",
+  stale: "Stale",
+  expired: "Expired",
+  unknown: "Unknown age",
+};
+
+function budgetTile(label, spent, budget, exceeded) {
+  const hasBudget = typeof budget === "number" && budget > 0;
+  const pct = hasBudget && spent > 0 ? Math.min(100, (spent / budget) * 100) : 0;
+  const tone = exceeded ? "danger" : hasBudget && pct >= 80 ? "warn" : "";
+  let body;
+  if (hasBudget) {
+    body =
+      '<div class="progress"><div class="progress-bar ' + tone + '" style="width:' + pct.toFixed(0) + '%"></div></div>' +
+      '<span class="progress-note">' + pct.toFixed(0) + '% used' + (exceeded ? ' — exceeded' : '') + '</span>';
+  } else {
+    body = '<span class="progress-note">no budget set</span>';
+  }
+  return (
+    '<div class="metric-tile ' + tone + '">' +
+    '<span>' + escapeHtml(label) + ' Spend</span>' +
+    '<strong>' + formatUsd(spent) + (hasBudget ? ' / ' + formatUsd(budget) : '') + '</strong>' +
+    body +
+    '</div>'
+  );
+}
+
+function renderLimitRow(row, nowSeconds) {
+  const snapshot = row.upstream_rate_limit || {};
+  const headers = snapshot.headers || {};
+  const rtk = row.rtk || {};
+  const usage = row.usage || {};
+  const title = row.provider + "/" + (row.name || row.id);
+  const emailSuffix = row.email
+    ? '<span class="provider-email">' + escapeHtml(row.email) + '</span>'
+    : "";
+
+  const freshness = snapshotFreshness(snapshot, nowSeconds);
+  const freshBadge =
+    snapshot && freshness !== "unknown"
+      ? '<span class="badge ' + (freshness === "fresh" ? "ok" : freshness === "expired" ? "error" : "warn") + ' limit-fresh">' + FRESHNESS_LABEL[freshness] + '</span>'
+      : "";
+
+  const statusTone =
+    row.status === "healthy"
+      ? "ok"
+      : row.status === "cooldown" || row.status === "error"
+        ? "error"
+        : "muted";
+
+  const limitGroup =
+    '<div class="limit-group"><span class="limit-group-title">Upstream</span><div class="limit-grid">' +
+    limitCell("RPM Remaining", headers["x-ratelimit-remaining-requests"], headers["x-ratelimit-limit-requests"]) +
+    limitCell("TPM Remaining", headers["x-ratelimit-remaining-tokens"], headers["x-ratelimit-limit-tokens"]) +
+    limitCell("Request Reset", formatReset(headers["x-ratelimit-reset-requests"])) +
+    limitCell("Token Reset", formatReset(headers["x-ratelimit-reset-tokens"])) +
+    '</div></div>';
+
+  const rtkGroup = rtk && rtk.requests_remaining !== undefined
+    ? '<div class="limit-group"><span class="limit-group-title">BlackRouter RTK (provider-wide)</span><div class="limit-grid">' +
+      limitCell("Requests Remaining", rtk.requests_remaining) +
+      limitCell("Tokens Remaining", rtk.tokens_remaining) +
+      limitCell("Concurrent Remaining", rtk.concurrent_remaining) +
+      limitCell("Retry After", rtk.retry_after_seconds != null ? rtk.retry_after_seconds + "s" : null) +
+      (rtk.limited ? limitCell("State", "Limited") : "") +
+      '</div></div>'
+    : "";
+
+  const usageGroup =
+    '<div class="limit-group"><span class="limit-group-title">Usage</span><div class="limit-grid">' +
+    limitCell("Requests", usage.requests) +
+    limitCell("Prompt Tokens", usage.prompt_tokens) +
+    limitCell("Completion Tokens", usage.completion_tokens) +
+    limitCell("Cost", formatUsd(usage.cost)) +
+    '</div></div>';
+
+  const seen = snapshot
+    ? '<span>seen ' + escapeHtml(formatUnixSeconds(snapshot.observedAt)) + '</span>'
+    : '<span>no upstream snapshot</span>';
+
+  return (
+    '<div class="row limit-row">' +
+    '<div class="limit-row-head"><div>' +
+    '<strong title="' + escapeHtml(title) + '">' + escapeHtml(title) + '</strong>' +
+    emailSuffix +
+    '<div class="row-meta">' +
+    '<span class="badge ' + statusTone + '">' + escapeHtml(row.status || "unknown") + '</span>' +
+    '<span>' + (row.is_active ? "active" : "disabled") + '</span>' +
+    '<span>' + escapeHtml(row.model || "no model") + '</span>' +
+    freshBadge + seen +
+    '</div></div></div>' +
+    limitGroup + rtkGroup + usageGroup +
+    '</div>'
+  );
+}
+
+function formatReset(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds)) return String(value);
+  if (seconds <= 0) return "now";
+  if (seconds < 60) return seconds + "s";
+  const minutes = Math.floor(seconds / 60);
+  const rem = seconds % 60;
+  return rem ? minutes + "m " + rem + "s" : minutes + "m";
 }
 
 function limitCell(label, value, limit) {
   const displayValue =
     value === undefined || value === null || value === "" ? "-" : String(value);
   const displayLimit =
-    limit === undefined || limit === null || limit === "" ? "" : ` / ${limit}`;
-  return `
-    <div class="limit-cell">
-      <span>${escapeHtml(label)}</span>
-      <strong>${escapeHtml(displayValue)}${escapeHtml(displayLimit)}</strong>
-    </div>
-  `;
+    limit === undefined || limit === null || limit === "" ? "" : " / " + limit;
+  return (
+    '<div class="limit-cell">' +
+    '<span>' + escapeHtml(label) + '</span>' +
+    '<strong>' + escapeHtml(displayValue) + escapeHtml(displayLimit) + '</strong>' +
+    '</div>'
+  );
 }
 
 function renderProviderCatalog(catalog) {
@@ -1403,12 +1475,48 @@ async function resumePendingOAuth() {
   pollOAuthToken(providerId, oauthState, 1000);
 }
 
+let limitsLoading = false;
+
+async function refreshLimits() {
+  if (limitsLoading) return;
+  limitsLoading = true;
+  const button = $("refreshLimitsButton");
+  const notice = $("limitsNotice");
+  if (button) button.disabled = true;
+  if (notice) {
+    notice.textContent = "Refreshing limits...";
+    notice.classList.remove("hidden", "error");
+  }
+  try {
+    const payload = await getJson("/api/provider-limits");
+    state.providerLimits = payload;
+    renderLimits(payload);
+    const updated = $("limitsUpdated");
+    if (updated) {
+      updated.textContent = "Updated " + new Date().toLocaleTimeString();
+    }
+  } catch (error) {
+    if (notice) {
+      notice.textContent = "Failed to load limits: " + error.message;
+      notice.classList.add("error");
+    }
+  } finally {
+    if (notice && notice.classList.contains("error") === false) {
+      notice.classList.add("hidden");
+    }
+    if (button) button.disabled = false;
+    limitsLoading = false;
+  }
+}
+
 refresh()
   .then(resumePendingOAuth)
   .catch((error) => {
     setBadge("healthBadge", "Offline", "error");
     console.error(error);
   });
+
+$("refreshLimitsButton")?.addEventListener("click", refreshLimits);
 
 // Handle OAuth callback: if URL has ?token=..., fill it in
 (function () {

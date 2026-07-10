@@ -1,6 +1,8 @@
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::extract::Request;
+use axum::extract::{Extension, Path, Query, State};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
@@ -27,10 +29,13 @@ use blackrouter_translator::{
     responses_request_to_chat, stream::translate_sse_stream, translate_request, translate_response,
     WireFormat,
 };
+use bytes::Bytes;
+use futures_util::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -39,8 +44,44 @@ use tower_http::trace::TraceLayer;
 
 pub mod auth;
 pub mod metrics;
-mod oauth;
+pub mod oauth;
 pub mod state;
+pub mod telemetry;
+
+/// Per-request identifier, attached by `request_id_middleware` and stored in
+/// request extensions so handlers can correlate logs, traces, and the
+/// persisted `requestDetails` row.
+#[derive(Clone)]
+pub struct RequestId(pub String);
+
+/// Middleware: ensure every request has a stable `x-request-id`
+/// (preferring an inbound one), record it on the current tracing span
+/// for structured logs/traces, and echo it back on the response.
+async fn request_id_middleware(request: Request, next: Next) -> Response {
+    let request_id = request
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    let span = tracing::info_span!("request", request_id = %request_id);
+    let _enter = span.enter();
+
+    let mut request = request;
+    request
+        .extensions_mut()
+        .insert(RequestId(request_id.clone()));
+
+    let mut response = next.run(request).await;
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static("x-request-id"), value);
+    }
+    response
+}
 
 // Re-export key types so `blackrouter_bin` (and existing handler code) can
 // reference them without qualifying through sub-modules.
@@ -66,6 +107,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/setup.css", get(setup_css))
         .route("/setup.js", get(setup_js))
         .route("/health", get(health))
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/version", get(version))
         .route("/v1/models", get(v1_models))
         .route("/v1beta/models", get(v1_models))
@@ -120,6 +163,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/usage/daily", get(list_daily_usage))
         .route("/usage/daily/{date}", get(get_daily_usage))
         .route("/usage/aggregate", post(aggregate_daily))
+        .route("/conversations", get(list_conversations))
+        .route(
+            "/conversations/{session_id}",
+            get(get_conversation).delete(delete_conversation),
+        )
         .route("/oauth/{provider}/start", post(oauth::oauth_start))
         .route("/oauth/{provider}/callback", get(oauth::oauth_callback))
         .route("/oauth/{provider}/exchange", post(oauth::oauth_exchange))
@@ -147,7 +195,9 @@ pub fn build_router(state: AppState) -> Router {
         app = app.layer(cors);
     }
 
-    app
+    // Apply this after all routes and other layers have been added. Axum's
+    // `Router::layer` only wraps routes that already exist at the call site.
+    app.layer(middleware::from_fn(request_id_middleware))
 }
 
 /// Build a scoped CORS layer from the `BLACKROUTER_CORS_ALLOW_ORIGINS` env var.
@@ -222,6 +272,21 @@ struct HealthDatabase {
     schema_compatible: bool,
 }
 
+#[derive(Serialize)]
+struct ReadinessCheck {
+    name: String,
+    ok: bool,
+    detail: String,
+}
+
+#[derive(Serialize)]
+struct ReadinessResponse {
+    ready: bool,
+    service: &'static str,
+    timestamp: u64,
+    checks: Vec<ReadinessCheck>,
+}
+
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     let storage_status = state.storage.status().ok();
     let schema_compatible = storage_status
@@ -238,6 +303,84 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
             schema_compatible,
         },
     })
+}
+
+// Liveness probe: the process is up and responding.
+async fn healthz(State(state): State<AppState>) -> Json<HealthResponse> {
+    health(State(state)).await
+}
+
+// Readiness probe: the service can actually serve traffic.
+// Checks SQLite is reachable, at least one provider is active, and the RTK
+// runtime is initialized. Returns 503 when not ready so orchestrators keep
+// the instance out of rotation.
+async fn readyz(
+    State(state): State<AppState>,
+) -> Result<Json<ReadinessResponse>, (StatusCode, Json<ReadinessResponse>)> {
+    let mut checks = Vec::new();
+    let mut ready = true;
+
+    // 1. Storage reachable + schema compatible.
+    match state.storage.status() {
+        Ok(status) => {
+            checks.push(ReadinessCheck {
+                name: "storage".to_string(),
+                ok: status.schema_compatible,
+                detail: status.database_path.display().to_string(),
+            });
+            if !status.schema_compatible {
+                ready = false;
+            }
+        }
+        Err(error) => {
+            checks.push(ReadinessCheck {
+                name: "storage".to_string(),
+                ok: false,
+                detail: error.to_string(),
+            });
+            ready = false;
+        }
+    };
+
+    // 2. At least one active provider connection.
+    let providers = state.storage.list_provider_connections();
+    let active_providers = providers
+        .as_ref()
+        .map(|list| list.iter().filter(|p| p.is_active).count())
+        .unwrap_or(0);
+    let provider_ok = active_providers > 0;
+    if !provider_ok {
+        ready = false;
+    }
+    checks.push(ReadinessCheck {
+        name: "providers".to_string(),
+        ok: provider_ok,
+        detail: format!("{active_providers} active"),
+    });
+
+    // 3. RTK runtime initialized (uptime > 0 means the tracker is alive).
+    let rtk_ok = state.rtk.uptime().as_secs() > 0;
+    if !rtk_ok {
+        ready = false;
+    }
+    checks.push(ReadinessCheck {
+        name: "rtk".to_string(),
+        ok: rtk_ok,
+        detail: format!("uptime {}s", state.rtk.uptime().as_secs()),
+    });
+
+    let response = ReadinessResponse {
+        ready,
+        service: "blackrouter",
+        timestamp: unix_timestamp(),
+        checks,
+    };
+
+    if ready {
+        Ok(Json(response))
+    } else {
+        Err((StatusCode::SERVICE_UNAVAILABLE, Json(response)))
+    }
 }
 
 async fn version() -> Json<BuildInfo> {
@@ -518,10 +661,7 @@ async fn fetch_provider_models(
         }
     }
 
-    let models_url = match provider_models_url(&provider.data) {
-        Ok(url) => Some(url),
-        Err(_) => None,
-    };
+    let models_url = provider_models_url(&provider.data).ok();
     let (models, resolved_url, message) = if let Some(ref url) = models_url {
         match fetch_provider_model_ids(&provider, url).await {
             Ok(models) => {
@@ -955,7 +1095,19 @@ async fn provider_limits(
         };
 
         let mut provider_usage = ProviderLimitUsage::default();
+        let provider_id = provider.id.as_str();
         for row in usage.iter().filter(|row| row.provider == provider.provider) {
+            // Rows recorded before connection_id was tracked have a null
+            // connection_id; treat them as provider-wide and share across all
+            // connections of this provider. Rows with a connection_id only
+            // count toward the matching connection.
+            let matches = match row.connection_id.as_deref() {
+                Some(id) => id == provider_id,
+                None => true,
+            };
+            if !matches {
+                continue;
+            }
             provider_usage.requests += row.count;
             provider_usage.prompt_tokens += row.prompt_tokens;
             provider_usage.completion_tokens += row.completion_tokens;
@@ -1819,16 +1971,391 @@ async fn v1_models(
     }))
 }
 
+/// Scope used for the conversation-memory `kv` store (Phase 8).
+const CONVERSATION_SCOPE: &str = "conversation";
+
+/// A persisted conversation: the full running message history plus bookkeeping.
+/// Serialized as JSON into the `kv` table under `scope = "conversation"`.
+#[derive(Clone, Serialize, Deserialize)]
+struct Conversation {
+    messages: Vec<Value>,
+    #[serde(default)]
+    created_at: u64,
+    #[serde(default)]
+    updated_at: u64,
+    #[serde(default)]
+    model: String,
+}
+
+/// Extract an optional `x-session-id` header used to enable server-side
+/// conversation memory (Phase 8). When present, BlackRouter maintains the
+/// message history across requests for that session id.
+fn extract_session_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-session-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn is_system_message(message: &Value) -> bool {
+    message.get("role").and_then(Value::as_str) == Some("system")
+}
+
+/// Merge stored session history with the messages from the current request.
+///
+/// Contract:
+/// * Incoming `system` messages replace the stored system block (so the system
+///   prompt can be (re)defined per request without resending history).
+/// * All other incoming messages are appended after the stored history.
+/// * When the session is empty (first request) this simply returns `incoming`.
+/// * When `incoming` is empty the stored history is replayed as-is.
+fn merge_session_messages(stored: &[Value], incoming: &[Value]) -> Vec<Value> {
+    let incoming_system: Vec<Value> = incoming
+        .iter()
+        .filter(|m| is_system_message(m))
+        .cloned()
+        .collect();
+    let stored_non_system: Vec<Value> = stored
+        .iter()
+        .filter(|m| !is_system_message(m))
+        .cloned()
+        .collect();
+    let incoming_non_system: Vec<Value> = incoming
+        .iter()
+        .filter(|m| !is_system_message(m))
+        .cloned()
+        .collect();
+    let mut out = incoming_system;
+    out.extend(stored_non_system);
+    out.extend(incoming_non_system);
+    out
+}
+
+/// Resolve the (minimum) context window for a route, used to trim session
+/// history before dispatch (Phase 8.2). Uses the model catalog when present,
+/// otherwise the built-in provider model table, otherwise a safe default.
+fn route_context_window(storage: &Storage, route: &RouteKind) -> u32 {
+    let models: Vec<ModelRef> = match route {
+        RouteKind::Single(model) => vec![model.clone()],
+        RouteKind::Combo { models, .. } => models.clone(),
+    };
+    let mut windows: Vec<u32> = Vec::new();
+    for model in &models {
+        if let Some(entry) = storage
+            .get_model_catalog(&model.provider, &model.model)
+            .ok()
+            .flatten()
+        {
+            if let Some(context_window) = entry.context_window {
+                windows.push(context_window as u32);
+                continue;
+            }
+        }
+        if let Some(info) = blackrouter_providers::lookup_model_info(&model.model) {
+            windows.push(info.context_window);
+        }
+    }
+    if windows.is_empty() {
+        128_000
+    } else {
+        windows.into_iter().min().unwrap_or(128_000)
+    }
+}
+
+/// Resolve the (minimum) max-output-token budget for a route, reserving room
+/// in the context window for the model's reply (Phase 8.2).
+fn route_max_output_tokens(route: &RouteKind) -> u32 {
+    let models: Vec<ModelRef> = match route {
+        RouteKind::Single(model) => vec![model.clone()],
+        RouteKind::Combo { models, .. } => models.clone(),
+    };
+    let mut outs: Vec<u32> = Vec::new();
+    for model in &models {
+        if let Some(info) = blackrouter_providers::lookup_model_info(&model.model) {
+            outs.push(info.max_output_tokens);
+        }
+    }
+    if outs.is_empty() {
+        16_384
+    } else {
+        outs.into_iter().min().unwrap_or(16_384)
+    }
+}
+
+/// Assemble the effective request body for a session: load stored history,
+/// merge with the incoming messages, and trim to the route's context window.
+/// Returns the modified body and the trimmed history (used later to persist
+/// the assistant turn).
+fn assemble_session_body(
+    storage: &Storage,
+    session_id: &str,
+    mut body: Value,
+    route: &RouteKind,
+) -> (Value, Vec<Value>) {
+    let incoming = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let stored = storage
+        .get_kv(CONVERSATION_SCOPE, session_id)
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<Conversation>(&raw).ok())
+        .map(|conversation| conversation.messages)
+        .unwrap_or_default();
+
+    let merged = merge_session_messages(&stored, &incoming);
+    if let Some(object) = body.as_object_mut() {
+        object.insert("messages".to_string(), Value::Array(merged));
+    }
+
+    // Trim the merged history (which now includes prior turns) to the route's
+    // context window. `proxy_with_specific_provider` re-trim per-provider as a
+    // backstop, but trimming the session history here keeps stored state bounded.
+    let context_window = route_context_window(storage, route);
+    let max_output = route_max_output_tokens(route);
+    trim_context_to_fit(&mut body, context_window, max_output);
+
+    let trimmed = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    (body, trimmed)
+}
+
+/// Extract the assistant message produced by a provider response so it can be
+/// appended to the session history. Handles both JSON (non-streaming) and SSE
+/// (streaming) OpenAI-format responses, reconstructing `tool_calls` if present.
+fn extract_assistant_message(bytes: &[u8], is_stream: bool) -> Option<Value> {
+    if !is_stream {
+        let value: Value = serde_json::from_slice(bytes).ok()?;
+        return value
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("message"))
+            .cloned();
+    }
+
+    let text = String::from_utf8_lossy(bytes);
+    let mut content = String::new();
+    let mut tool_calls: Vec<Value> = Vec::new();
+    let mut finish_reason: Option<String> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if !line.starts_with("data:") {
+            continue;
+        }
+        let data = line[5..].trim();
+        if data == "[DONE]" {
+            break;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        let Some(choices) = event.get("choices").and_then(Value::as_array) else {
+            continue;
+        };
+        let Some(choice) = choices.first() else {
+            continue;
+        };
+        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+            finish_reason = Some(reason.to_string());
+        }
+        let Some(delta) = choice.get("delta") else {
+            continue;
+        };
+        if let Some(text) = delta.get("content").and_then(Value::as_str) {
+            content.push_str(text);
+        }
+        if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+            for call in calls {
+                let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                if index >= tool_calls.len() {
+                    tool_calls.resize_with(index + 1, || json!({}));
+                }
+                let entry = &mut tool_calls[index];
+                if let Some(id) = call.get("id").and_then(Value::as_str) {
+                    if entry.get("id").is_none() {
+                        entry["id"] = json!(id);
+                    }
+                }
+                if let Some(kind) = call.get("type").and_then(Value::as_str) {
+                    if entry.get("type").is_none() {
+                        entry["type"] = json!(kind);
+                    }
+                }
+                if let Some(function) = call.get("function") {
+                    if entry.get("function").is_none() {
+                        entry["function"] = json!({});
+                    }
+                    if let Some(name) = function.get("name").and_then(Value::as_str) {
+                        let existing = entry["function"]
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        entry["function"]["name"] = json!(existing + name);
+                    }
+                    if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                        let existing = entry["function"]
+                            .get("arguments")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        entry["function"]["arguments"] = json!(existing + arguments);
+                    }
+                }
+            }
+        }
+    }
+
+    if content.is_empty() && tool_calls.is_empty() {
+        return None;
+    }
+    let mut message = json!({ "role": "assistant", "content": content });
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = Value::Array(tool_calls);
+    }
+    if let Some(reason) = finish_reason {
+        message["finish_reason"] = json!(reason);
+    }
+    Some(message)
+}
+
+/// Persist the assistant turn for a session after a successful response.
+/// `base_history` is the trimmed request history we actually sent upstream, so
+/// the stored conversation stays consistent with what the model saw.
+fn persist_assistant_message(
+    storage: &Storage,
+    session_id: &str,
+    base_history: &[Value],
+    response_bytes: &[u8],
+    is_stream: bool,
+) {
+    let assistant = match extract_assistant_message(response_bytes, is_stream) {
+        Some(message) => message,
+        None => return,
+    };
+
+    let created_at = storage
+        .get_kv(CONVERSATION_SCOPE, session_id)
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<Conversation>(&raw).ok())
+        .map(|conversation| conversation.created_at)
+        .unwrap_or_else(unix_timestamp);
+
+    let mut messages = base_history.to_vec();
+    messages.push(assistant);
+    let conversation = Conversation {
+        messages,
+        created_at,
+        updated_at: unix_timestamp(),
+        model: String::new(),
+    };
+
+    if let Ok(serialized) = serde_json::to_string(&conversation) {
+        if let Err(error) = storage.set_kv(CONVERSATION_SCOPE, session_id, &serialized) {
+            tracing::warn!("failed to persist conversation {session_id}: {error}");
+        }
+    }
+}
+
+/// Wrap a successful response so the assistant turn is persisted to the
+/// session once the body has been streamed to the client. The body is teed
+/// (forwarded as-is while accumulated) so streaming latency is preserved and
+/// the assistant message is captured afterwards for both stream and non-stream
+/// responses.
+fn wrap_session_response(
+    response: Response,
+    storage: Storage,
+    session_id: String,
+    base_history: Vec<Value>,
+    is_stream: bool,
+) -> Response {
+    let status = response.status();
+    let (mut parts, body) = response.into_parts();
+    if let Ok(value) = HeaderValue::from_str(&session_id) {
+        parts.headers.insert("x-session-id", value);
+    }
+
+    if !status.is_success() {
+        return Response::from_parts(parts, body);
+    }
+
+    let collected: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let collected_for_stream = collected.clone();
+    let data_stream = body.into_data_stream();
+    let tee = data_stream.map(move |result| {
+        if let Ok(bytes) = &result {
+            collected_for_stream
+                .lock()
+                .unwrap()
+                .extend_from_slice(bytes);
+        }
+        result
+    });
+
+    let finalize = stream::once({
+        let collected = collected.clone();
+        let storage = storage.clone();
+        let session_id = session_id.clone();
+        let base_history = base_history.clone();
+        async move {
+            let bytes = std::mem::take(&mut *collected.lock().unwrap());
+            persist_assistant_message(&storage, &session_id, &base_history, &bytes, is_stream);
+            Ok::<Bytes, axum::Error>(Bytes::new())
+        }
+    });
+
+    let combined = tee.chain(finalize);
+    Response::from_parts(parts, Body::from_stream(combined))
+}
+
 async fn chat_completions_shell(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(req_id): Extension<RequestId>,
     Json(mut body): Json<Value>,
 ) -> Result<Response, ApiErrorResponse> {
     authorize_v1(&state, &headers)?;
     let api_key = extract_api_key(&headers);
     let route = normalize_model_request_body(&state.storage, &mut body)?;
 
-    proxy_chat_completions(&state, body, route, api_key).await
+    // ── Phase 8: conversation memory ──
+    // When `x-session-id` is supplied, assemble the full history from stored
+    // session state + this request, and persist the assistant turn afterwards.
+    let session_id = extract_session_id(&headers);
+    let (effective_body, base_history) = match &session_id {
+        Some(session_id) => assemble_session_body(&state.storage, session_id, body, &route),
+        None => (body, Vec::new()),
+    };
+    let is_stream = effective_body
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let response =
+        proxy_chat_completions(&state, effective_body, route, api_key, &req_id.0).await?;
+
+    if let Some(session_id) = session_id {
+        Ok(wrap_session_response(
+            response,
+            state.storage.clone(),
+            session_id,
+            base_history,
+            is_stream,
+        ))
+    } else {
+        Ok(response)
+    }
 }
 
 fn format_model_ref(model: &ModelRef) -> String {
@@ -2275,8 +2802,10 @@ fn cost_guard_config(storage: &Storage) -> Result<CostGuardConfig, StorageError>
 }
 
 /// Record usage to storage asynchronously (non-blocking, fire-and-forget)
+#[allow(clippy::too_many_arguments)]
 fn record_usage_async(
     usage_tx: &tokio::sync::mpsc::UnboundedSender<UsageEntry>,
+    connection_id: Option<&str>,
     provider: &str,
     model: &str,
     endpoint: &str,
@@ -2290,7 +2819,7 @@ fn record_usage_async(
         timestamp: blackrouter_common::unix_timestamp().to_string(),
         provider: provider.to_string(),
         model: model.to_string(),
-        connection_id: None,
+        connection_id: connection_id.map(str::to_string),
         api_key: None,
         endpoint: endpoint.to_string(),
         prompt_tokens,
@@ -2304,8 +2833,10 @@ fn record_usage_async(
 }
 
 /// Record request details asynchronously
+#[allow(clippy::too_many_arguments)]
 fn record_request_details_async(
     storage: &Storage,
+    connection_id: Option<&str>,
     provider: &str,
     model: &str,
     status: &str,
@@ -2316,7 +2847,7 @@ fn record_request_details_async(
         timestamp: blackrouter_common::unix_timestamp().to_string(),
         provider: provider.to_string(),
         model: model.to_string(),
-        connection_id: None,
+        connection_id: connection_id.map(str::to_string),
         status: status.to_string(),
         data: serde_json::to_string(&data).unwrap_or_default(),
     };
@@ -2713,6 +3244,7 @@ async fn proxy_chat_completions(
     body: Value,
     route: RouteKind,
     api_key: Option<String>,
+    request_id: &str,
 ) -> Result<Response, ApiErrorResponse> {
     let is_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
 
@@ -2723,11 +3255,23 @@ async fn proxy_chat_completions(
 
     let mut last_error = None;
     for model in models {
-        match proxy_single_chat_completion(state, &body, &model, is_stream, api_key.as_deref())
-            .await
+        match proxy_single_chat_completion(
+            state,
+            &body,
+            &model,
+            is_stream,
+            api_key.as_deref(),
+            request_id,
+        )
+        .await
         {
             Ok(response) => return Ok(response),
             Err(error) => {
+                // Client errors (4xx except 429) are not worth retrying on
+                // another model — stop immediately (Phase 7.3).
+                if !is_retryable_error(error.status) {
+                    return Err(error);
+                }
                 last_error = Some(format!(
                     "{} failed: {}",
                     format_model_ref(&model),
@@ -2800,6 +3344,100 @@ fn should_cooldown_provider(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
+/// Whether an upstream error is worth retrying on another provider/model.
+/// 429 (rate limited) and 5xx (server errors) are transient → retry.
+/// Other 4xx (400/401/403/404/422, content-policy, auth) are client errors
+/// that will fail identically elsewhere → stop (Phase 7.3).
+fn is_retryable_error(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+/// Estimated per-request cost (USD) for a provider/model, used to prefer
+/// cheaper healthy providers when several serve the same model (Phase 7.2).
+/// Uses the catalog price when present, otherwise the built-in price table.
+fn provider_estimated_cost(
+    storage: &Storage,
+    provider: &RawProviderConnection,
+    model: &ModelRef,
+) -> f64 {
+    if let Ok(Some(entry)) = storage.get_model_catalog(&provider.provider, &model.model) {
+        if let (Some(pin), Some(pout)) = (entry.price_in_per_million, entry.price_out_per_million) {
+            // Rough midpoint estimate (1M in / 1M out) for ranking only.
+            return (pin + pout) / 2.0;
+        }
+    }
+    let (pin, pout) = price_per_million(&provider.provider, &model.model);
+    (pin + pout) / 2.0
+}
+
+/// Extract the capabilities a request requires, used for capability-based
+/// routing (Phase 7.4). Returns modality strings from the request shape.
+fn request_modalities(body: &Value) -> Vec<&'static str> {
+    let mut needs = Vec::new();
+    if body.get("tools").is_some() || body.get("tool_choice").is_some() {
+        needs.push("tools");
+    }
+    // Vision: any message content item with an image.
+    let has_image = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|msgs| {
+            msgs.iter().any(|m| {
+                m.get("content")
+                    .and_then(Value::as_array)
+                    .map(|parts| {
+                        parts.iter().any(|p| {
+                            p.get("type")
+                                .and_then(Value::as_str)
+                                .map(|t| t == "image_url")
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+    if has_image {
+        needs.push("vision");
+    }
+    needs
+}
+
+/// Filter providers by requested capabilities using the model catalog.
+/// Providers without a catalog entry are kept (unknown capability → assume
+/// compatible). If every candidate is excluded, the original list is returned
+/// so a request is never hard-dropped for missing metadata (Phase 7.4).
+fn filter_by_capability<'a>(
+    storage: &Storage,
+    available: &[&'a RawProviderConnection],
+    model: &ModelRef,
+    needed: &[&str],
+) -> Vec<&'a RawProviderConnection> {
+    if needed.is_empty() {
+        return available.to_vec();
+    }
+    let matched: Vec<&RawProviderConnection> = available
+        .iter()
+        .copied()
+        .filter(|p| {
+            match storage.get_model_catalog(&p.provider, &model.model) {
+                Ok(Some(entry)) => match entry.modalities {
+                    Some(json) => needed.iter().all(|n| json.contains(n)),
+                    // No modality metadata → treat as capable.
+                    None => true,
+                },
+                // No catalog entry → assume capable.
+                _ => true,
+            }
+        })
+        .collect();
+    if matched.is_empty() {
+        available.to_vec()
+    } else {
+        matched
+    }
+}
+
 /// Proxy a single model with load balancing, circuit breaker, and caching (Phase 4)
 async fn proxy_single_chat_completion(
     state: &AppState,
@@ -2807,6 +3445,7 @@ async fn proxy_single_chat_completion(
     model: &ModelRef,
     is_stream: bool,
     api_key: Option<&str>,
+    request_id: &str,
 ) -> Result<Response, ApiErrorResponse> {
     // ── Response Cache check (Phase 4.2) ──────────────────────────────
     if !is_stream {
@@ -2883,19 +3522,80 @@ async fn proxy_single_chat_completion(
         available.push(&providers[0]);
     }
 
-    // Select starting index via load balancing strategy
-    let start_idx = state
-        .rtk
-        .select_provider_index(&model.provider, available.len())
-        .await;
+    // ── Capability-based routing (Phase 7.4) ────────────────────────────
+    // Prefer providers whose catalog advertises the requested modalities
+    // (vision/tools). Providers without catalog metadata are kept.
+    let needed = request_modalities(body);
+    let capability_matched = filter_by_capability(&state.storage, &available, model, &needed);
+    if capability_matched.len() != available.len() {
+        tracing::debug!(
+            "capability routing: {}/{} providers match {:?} for {}",
+            capability_matched.len(),
+            available.len(),
+            needed,
+            format_model_ref(model)
+        );
+    }
 
-    // Try providers starting from selected index
+    // ── Cost-aware ordering (Phase 7.2) ────────────────────────────────
+    // Sort by estimated per-request cost (cheapest first) so an identical
+    // model served by several providers is served by the least expensive
+    // healthy one. Stable sort preserves the load-balancer's relative order
+    // for equal-cost providers.
+    let mut ordered: Vec<&RawProviderConnection> = capability_matched;
+    ordered.sort_by(|a, b| {
+        provider_estimated_cost(&state.storage, a, model)
+            .partial_cmp(&provider_estimated_cost(&state.storage, b, model))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // ── Provider hedge (Phase 7.3, non-streaming) ──────────────────────//
+    // Fire the two cheapest providers concurrently and return the first
+    // valid response. Streaming keeps sequential fallback (SSE is not
+    // race-friendly). If both fail we fall through to the full sequential
+    // loop below (which will retry them + any remaining providers).
+    if !is_stream && ordered.len() >= 2 {
+        let (r1, r2) = tokio::join!(
+            proxy_with_specific_provider(
+                state, body, model, is_stream, api_key, ordered[0], request_id
+            ),
+            proxy_with_specific_provider(
+                state, body, model, is_stream, api_key, ordered[1], request_id
+            ),
+        );
+        if let Ok(response) = r1 {
+            let p = ordered[0];
+            let _ = state.storage.set_provider_runtime_status(
+                &p.id,
+                "healthy",
+                None,
+                p.expires_at.clone(),
+            );
+            state.rtk.record_circuit_success(&p.id).await;
+            return Ok(response);
+        }
+        if let Ok(response) = r2 {
+            let p = ordered[1];
+            let _ = state.storage.set_provider_runtime_status(
+                &p.id,
+                "healthy",
+                None,
+                p.expires_at.clone(),
+            );
+            state.rtk.record_circuit_success(&p.id).await;
+            return Ok(response);
+        }
+        tracing::debug!("hedge: both providers failed, falling back to sequential");
+    }
+
+    // ── Sequential provider loop with fallback-by-error (Phase 7.3) ─────
     let mut last_error = None;
-    for i in 0..available.len() {
-        let idx = (start_idx + i) % available.len();
-        let provider = available[idx];
-
-        match proxy_with_specific_provider(state, body, model, is_stream, api_key, provider).await {
+    for provider in ordered {
+        match proxy_with_specific_provider(
+            state, body, model, is_stream, api_key, provider, request_id,
+        )
+        .await
+        {
             Ok(response) => {
                 let _ = state.storage.set_provider_runtime_status(
                     &provider.id,
@@ -2909,7 +3609,7 @@ async fn proxy_single_chat_completion(
             Err(error) => {
                 tracing::warn!(
                     "provider {} ({}) failed: {}, trying next",
-                    idx,
+                    provider.provider,
                     provider.id,
                     error.message
                 );
@@ -2922,6 +3622,11 @@ async fn proxy_single_chat_completion(
                         provider.expires_at.clone(),
                     );
                     state.rtk.record_circuit_failure(&provider.id).await;
+                }
+                // Client errors (4xx except 429) are not worth retrying on
+                // another provider — stop immediately (Phase 7.3).
+                if !is_retryable_error(error.status) {
+                    return Err(error);
                 }
                 last_error = Some(error);
             }
@@ -2945,6 +3650,7 @@ async fn proxy_with_specific_provider(
     is_stream: bool,
     api_key: Option<&str>,
     provider: &RawProviderConnection,
+    request_id: &str,
 ) -> Result<Response, ApiErrorResponse> {
     let mut auth_data = provider.data.clone();
     let mut format = provider
@@ -3371,6 +4077,7 @@ async fn proxy_with_specific_provider(
     // Record to usage storage (async, non-blocking, batched)
     record_usage_async(
         &state.usage_tx,
+        Some(&provider.id),
         &model.provider,
         &model.model,
         "/v1/chat/completions",
@@ -3382,11 +4089,13 @@ async fn proxy_with_specific_provider(
     // Record request details (async, non-blocking)
     record_request_details_async(
         &state.storage,
+        Some(&provider.id),
         &model.provider,
         &model.model,
         "success",
         serde_json::json!({
             "endpoint": "/v1/chat/completions",
+            "request_id": request_id,
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "cost": cost,
@@ -3634,9 +4343,63 @@ fn days_to_date(days: i64) -> (i64, u32, u32) {
     (year, m, d)
 }
 
+/// List all stored conversations (Phase 8 — conversation management).
+/// Returns lightweight metadata per session; use `GET /conversations/{id}` for
+/// the full message history.
+async fn list_conversations(State(state): State<AppState>) -> Json<Value> {
+    let rows = state
+        .storage
+        .list_kv(CONVERSATION_SCOPE)
+        .unwrap_or_default();
+    let mut items = Vec::new();
+    for (key, value) in rows {
+        let conversation = serde_json::from_str::<Conversation>(&value).unwrap_or(Conversation {
+            messages: Vec::new(),
+            created_at: 0,
+            updated_at: 0,
+            model: String::new(),
+        });
+        items.push(json!({
+            "session_id": key,
+            "message_count": conversation.messages.len(),
+            "created_at": conversation.created_at,
+            "updated_at": conversation.updated_at,
+        }));
+    }
+    Json(json!({ "data": items }))
+}
+
+/// Fetch a single conversation's full message history (Phase 8).
+async fn get_conversation(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Result<Json<Value>, ApiErrorResponse> {
+    let raw = state
+        .storage
+        .get_kv(CONVERSATION_SCOPE, &session_id)
+        .map_err(|error| ApiErrorResponse::internal(format!("storage error: {error}")))?
+        .ok_or_else(|| ApiErrorResponse::not_found("conversation not found"))?;
+    let conversation = serde_json::from_str::<Conversation>(&raw).map_err(|error| {
+        ApiErrorResponse::internal(format!("failed to parse conversation: {error}"))
+    })?;
+    Ok(Json(
+        serde_json::to_value(&conversation).unwrap_or(Value::Null),
+    ))
+}
+
+/// Delete a stored conversation (Phase 8). Idempotent.
+async fn delete_conversation(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Json<Value> {
+    let _ = state.storage.delete_kv(CONVERSATION_SCOPE, &session_id);
+    Json(json!({ "ok": true }))
+}
+
 async fn responses_proxy(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(req_id): Extension<RequestId>,
     Json(body): Json<Value>,
 ) -> Result<Response, ApiErrorResponse> {
     authorize_v1(&state, &headers)?;
@@ -3659,8 +4422,14 @@ async fn responses_proxy(
         .to_string();
 
     // Proxy through chat completions (reuse all streaming/translation/pooling logic)
-    let response =
-        proxy_chat_completions(&state, chat_body, route, extract_api_key(&headers)).await?;
+    let response = proxy_chat_completions(
+        &state,
+        chat_body,
+        route,
+        extract_api_key(&headers),
+        &req_id.0,
+    )
+    .await?;
 
     // For non-streaming responses, convert chat completion → Responses API format
     let is_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
@@ -3701,6 +4470,7 @@ async fn responses_proxy(
 async fn messages_proxy(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Extension(req_id): Extension<RequestId>,
     Json(mut body): Json<Value>,
 ) -> Result<Response, ApiErrorResponse> {
     authorize_v1(&state, &headers)?;
@@ -3863,6 +4633,7 @@ async fn messages_proxy(
         // Record to usage storage (async, non-blocking, batched)
         record_usage_async(
             &state.usage_tx,
+            Some(&provider.id),
             &first_model.provider,
             &first_model.model,
             "/v1/messages",
@@ -3891,7 +4662,8 @@ async fn messages_proxy(
             ApiErrorResponse::bad_request(format!("claude→openai translation failed: {error}"))
         })?;
 
-    let chat_response = proxy_chat_completions(&state, chat_body, route, api_key.clone()).await?;
+    let chat_response =
+        proxy_chat_completions(&state, chat_body, route, api_key.clone(), &req_id.0).await?;
 
     // For non-streaming, convert OpenAI response → Claude Messages format
     if is_stream {
@@ -3933,11 +4705,12 @@ mod tests {
     use super::{
         builtin_provider_models, classify_provider_post_response, codex_stream_to_chat_response,
         commandcode_stream_error, commandcode_upstream_model, derive_models_url, extract_api_key,
-        extract_codex_model_ids, extract_model_ids, provider_check_post_body,
-        provider_check_uses_post, provider_uses_codex_model_catalog, sanitize_codex_responses_body,
+        extract_codex_model_ids, extract_model_ids, extract_session_id, is_retryable_error,
+        merge_session_messages, provider_check_post_body, provider_check_uses_post,
+        provider_uses_codex_model_catalog, request_modalities, sanitize_codex_responses_body,
         should_cooldown_provider,
     };
-    use axum::http::{HeaderMap, StatusCode};
+    use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
     use base64::Engine;
     use blackrouter_core::ModelRef;
     use blackrouter_storage::RawProviderConnection;
@@ -4197,5 +4970,189 @@ mod tests {
             .unwrap()
             .models
             .contains(&"gemini-2.0-flash-lite"));
+    }
+
+    #[test]
+    fn retryable_errors_are_transient_only() {
+        // Retryable: rate limits and server errors.
+        assert!(is_retryable_error(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable_error(StatusCode::BAD_GATEWAY));
+        assert!(is_retryable_error(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(is_retryable_error(StatusCode::INTERNAL_SERVER_ERROR));
+        // Not retryable: client errors (auth / content-policy / bad request).
+        assert!(!is_retryable_error(StatusCode::BAD_REQUEST));
+        assert!(!is_retryable_error(StatusCode::UNAUTHORIZED));
+        assert!(!is_retryable_error(StatusCode::FORBIDDEN));
+        assert!(!is_retryable_error(StatusCode::NOT_FOUND));
+        assert!(!is_retryable_error(StatusCode::UNPROCESSABLE_ENTITY));
+    }
+
+    #[test]
+    fn request_modalities_detects_vision_and_tools() {
+        // Plain text request → no special modalities.
+        let plain = json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        assert!(request_modalities(&plain).is_empty());
+
+        // Vision request → "vision".
+        let vision = json!({
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is this?"},
+                    {"type": "image_url", "image_url": {"url": "http://x/y.png"}}
+                ]
+            }]
+        });
+        assert_eq!(request_modalities(&vision), vec!["vision"]);
+
+        // Tools request → "tools".
+        let tools = json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "f"}}]
+        });
+        assert_eq!(request_modalities(&tools), vec!["tools"]);
+
+        // Both → both modalities.
+        let both = json!({
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "http://x/y.png"}}
+                ]
+            }],
+            "tools": [{"type": "function", "function": {"name": "f"}}]
+        });
+        assert_eq!(request_modalities(&both), vec!["tools", "vision"]);
+    }
+
+    // ── Phase 8: conversation memory ────────────────────────────────────────
+
+    #[test]
+    fn extract_session_id_reads_header() {
+        let mut headers = HeaderMap::new();
+        assert!(extract_session_id(&headers).is_none());
+
+        headers.insert(
+            HeaderName::from_static("x-session-id"),
+            HeaderValue::from_static("sess-123"),
+        );
+        assert_eq!(extract_session_id(&headers).as_deref(), Some("sess-123"));
+
+        // Empty header is treated as absent.
+        let mut empty = HeaderMap::new();
+        empty.insert(
+            HeaderName::from_static("x-session-id"),
+            HeaderValue::from_static(""),
+        );
+        assert!(extract_session_id(&empty).is_none());
+    }
+
+    #[test]
+    fn merge_session_messages_appends_new_turns() {
+        let stored = json!([
+            {"role": "system", "content": "be nice"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"}
+        ])
+        .as_array()
+        .cloned()
+        .unwrap();
+
+        // Client sends only the next user turn.
+        let incoming = json!([{"role": "user", "content": "again?"}])
+            .as_array()
+            .cloned()
+            .unwrap();
+
+        let merged = merge_session_messages(&stored, &incoming);
+        assert_eq!(merged.len(), 4);
+        assert_eq!(merged[0]["role"], json!("system"));
+        assert_eq!(merged[1]["content"], json!("hi"));
+        assert_eq!(merged[2]["content"], json!("hello"));
+        assert_eq!(merged[3]["content"], json!("again?"));
+    }
+
+    #[test]
+    fn merge_session_messages_replaces_system_prompt() {
+        let stored = json!([
+            {"role": "system", "content": "old"},
+            {"role": "user", "content": "hi"}
+        ])
+        .as_array()
+        .cloned()
+        .unwrap();
+
+        let incoming = json!([
+            {"role": "system", "content": "new"},
+            {"role": "user", "content": "yo"}
+        ])
+        .as_array()
+        .cloned()
+        .unwrap();
+
+        let merged = merge_session_messages(&stored, &incoming);
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[0]["content"], json!("new"));
+        assert_eq!(merged[1]["content"], json!("hi"));
+        assert_eq!(merged[2]["content"], json!("yo"));
+    }
+
+    #[test]
+    fn merge_session_messages_empty_incoming_replays_stored() {
+        let stored = json!([{"role": "user", "content": "hi"}])
+            .as_array()
+            .cloned()
+            .unwrap();
+        let incoming: Vec<Value> = Vec::new();
+        let merged = merge_session_messages(&stored, &incoming);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0]["content"], json!("hi"));
+    }
+
+    #[test]
+    fn extract_assistant_message_from_json() {
+        let response = json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "the answer"}
+            }]
+        });
+        let bytes = serde_json::to_vec(&response).unwrap();
+        let message = extract_assistant_message(&bytes, false).unwrap();
+        assert_eq!(message["role"], json!("assistant"));
+        assert_eq!(message["content"], json!("the answer"));
+    }
+
+    #[test]
+    fn extract_assistant_message_from_sse() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let message = extract_assistant_message(sse.as_bytes(), true).unwrap();
+        assert_eq!(message["role"], json!("assistant"));
+        assert_eq!(message["content"], json!("Hello world"));
+    }
+
+    #[test]
+    fn extract_assistant_message_from_sse_reconstructs_tool_calls() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_\",\"arguments\":\"\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"weather\",\"arguments\":\"1\"}}]}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let message = extract_assistant_message(sse.as_bytes(), true).unwrap();
+        assert_eq!(message["role"], json!("assistant"));
+        let tool_calls = message["tool_calls"].as_array().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0]["id"], json!("call_1"));
+        assert_eq!(tool_calls[0]["function"]["name"], json!("get_weather"));
+        assert_eq!(tool_calls[0]["function"]["arguments"], json!("1"));
     }
 }

@@ -191,12 +191,37 @@ pub struct UsageEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageRow {
     pub provider: String,
+    pub connection_id: Option<String>,
     pub model: String,
     pub status: String,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub cost: f64,
     pub count: u64,
+}
+
+/// A persisted RTK runtime state row (rate-limit / circuit-breaker snapshots).
+/// `data` holds a serialized JSON snapshot; `kind` discriminates the payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RtkStateRow {
+    pub key: String,
+    pub kind: String,
+    pub data: String,
+    pub updated_at: u64,
+}
+
+/// A normalized model catalog entry: capability + pricing metadata used for
+/// cost-aware and capability-based routing (Phase 7).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelCatalogEntry {
+    pub provider: String,
+    pub model: String,
+    pub context_window: Option<u64>,
+    /// JSON array of modality strings, e.g. ["text","vision","audio","tools"].
+    pub modalities: Option<String>,
+    pub price_in_per_million: Option<f64>,
+    pub price_out_per_million: Option<f64>,
+    pub latency_p50_ms: Option<u64>,
 }
 
 /// Request detail entry for storing full request/response metadata (Phase 3.1)
@@ -1311,29 +1336,214 @@ impl Storage {
         let conn = self.open()?;
         let since = since.unwrap_or("1970-01-01T00:00:00Z");
         let mut stmt = conn.prepare(
-            "SELECT provider, model, status,
+            "SELECT provider, connectionId, model, status,
                     SUM(promptTokens) as pt, SUM(completionTokens) as ct,
                     SUM(cost) as cost, COUNT(*) as cnt
              FROM usageHistory
              WHERE timestamp >= ?1
-             GROUP BY provider, model, status
+             GROUP BY provider, connectionId, model, status
              ORDER BY cnt DESC",
         )?;
         let rows = stmt.query_map(params![since], |row| {
             Ok(UsageRow {
                 provider: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                model: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                status: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                prompt_tokens: row.get::<_, i64>(3)? as u64,
-                completion_tokens: row.get::<_, i64>(4)? as u64,
-                cost: row.get::<_, f64>(5)?,
-                count: row.get::<_, i64>(6)? as u64,
+                connection_id: row.get::<_, Option<String>>(1)?,
+                model: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                status: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                prompt_tokens: row.get::<_, i64>(4)? as u64,
+                completion_tokens: row.get::<_, i64>(5)? as u64,
+                cost: row.get::<_, f64>(6)?,
+                count: row.get::<_, i64>(7)? as u64,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| StorageError::Sqlite(e))
+            .map_err(StorageError::Sqlite)
     }
 
+    /// Load all persisted RTK state rows (rate-limit + circuit-breaker snapshots).
+    pub fn load_rtk_state(&self) -> Result<Vec<RtkStateRow>> {
+        let conn = self.open()?;
+        let mut stmt = conn.prepare(
+            "SELECT key, kind, data, updated_at FROM rtk_state ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(RtkStateRow {
+                key: row.get::<_, String>(0)?,
+                kind: row.get::<_, String>(1)?,
+                data: row.get::<_, String>(2)?,
+                updated_at: row.get::<_, i64>(3)? as u64,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StorageError::Sqlite)
+    }
+
+    /// Persist a batch of RTK state rows, replacing any existing rows with the
+    /// same `key`. Uses a single transaction for atomicity.
+    pub fn save_rtk_state(&self, rows: &[RtkStateRow]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let conn = self.open()?;
+        let tx = conn.unchecked_transaction()?;
+        for row in rows {
+            tx.execute(
+                "INSERT INTO rtk_state (key, kind, data, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(key) DO UPDATE SET
+                   kind = excluded.kind,
+                   data = excluded.data,
+                   updated_at = excluded.updated_at",
+                params![row.key, row.kind, row.data, row.updated_at],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Remove RTK state rows older than `before_unix` (replacement-guard so a
+    /// stalled snapshotter cannot wipe a fresh snapshot).
+    pub fn prune_rtk_state(&self, before_unix: u64) -> Result<()> {
+        let conn = self.open()?;
+        conn.execute(
+            "DELETE FROM rtk_state WHERE updated_at < ?1",
+            params![before_unix],
+        )?;
+        Ok(())
+    }
+
+    /// Upsert a batch of model catalog entries (Phase 7.1).
+    pub fn upsert_model_catalog(&self, entries: &[ModelCatalogEntry]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let conn = self.open()?;
+        let tx = conn.unchecked_transaction()?;
+        for e in entries {
+            tx.execute(
+                "INSERT INTO model_catalog \
+                 (provider, model, context_window, modalities, price_in_per_million, price_out_per_million, latency_p50_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                 ON CONFLICT(provider, model) DO UPDATE SET \
+                   context_window = excluded.context_window,\
+                   modalities = excluded.modalities,\
+                   price_in_per_million = excluded.price_in_per_million,\
+                   price_out_per_million = excluded.price_out_per_million,\
+                   latency_p50_ms = excluded.latency_p50_ms",
+                params![
+                    e.provider,
+                    e.model,
+                    e.context_window.map(|v| v as i64),
+                    e.modalities,
+                    e.price_in_per_million,
+                    e.price_out_per_million,
+                    e.latency_p50_ms.map(|v| v as i64),
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Load all model catalog entries.
+    pub fn load_model_catalog(&self) -> Result<Vec<ModelCatalogEntry>> {
+        let conn = self.open()?;
+        let mut stmt = conn.prepare(
+            "SELECT provider, model, context_window, modalities, price_in_per_million, \
+             price_out_per_million, latency_p50_ms FROM model_catalog",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ModelCatalogEntry {
+                provider: row.get::<_, String>(0)?,
+                model: row.get::<_, String>(1)?,
+                context_window: row.get::<_, Option<i64>>(2)?.map(|v| v as u64),
+                modalities: row.get::<_, Option<String>>(3)?,
+                price_in_per_million: row.get::<_, Option<f64>>(4)?,
+                price_out_per_million: row.get::<_, Option<f64>>(5)?,
+                latency_p50_ms: row.get::<_, Option<i64>>(6)?.map(|v| v as u64),
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StorageError::Sqlite)
+    }
+
+    /// Get a single catalog entry for a provider/model pair.
+    pub fn get_model_catalog(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Result<Option<ModelCatalogEntry>> {
+        let conn = self.open()?;
+        let mut stmt = conn.prepare(
+            "SELECT provider, model, context_window, modalities, price_in_per_million, \
+             price_out_per_million, latency_p50_ms FROM model_catalog \
+             WHERE provider = ?1 AND model = ?2",
+        )?;
+        let mut rows = stmt.query_map(params![provider, model], |row| {
+            Ok(ModelCatalogEntry {
+                provider: row.get::<_, String>(0)?,
+                model: row.get::<_, String>(1)?,
+                context_window: row.get::<_, Option<i64>>(2)?.map(|v| v as u64),
+                modalities: row.get::<_, Option<String>>(3)?,
+                price_in_per_million: row.get::<_, Option<f64>>(4)?,
+                price_out_per_million: row.get::<_, Option<f64>>(5)?,
+                latency_p50_ms: row.get::<_, Option<i64>>(6)?.map(|v| v as u64),
+            })
+        })?;
+        match rows.next() {
+            Some(row) => row.map(Some).map_err(StorageError::Sqlite),
+            None => Ok(None),
+        }
+    }
+
+    // ── Generic key/value store (Phase 8: conversation memory) ────────────
+    // Backed by the pre-existing `kv (scope, key, value)` compat table.
+
+    /// Read a raw value from the `kv` store. Returns `Ok(None)` if absent.
+    pub fn get_kv(&self, scope: &str, key: &str) -> Result<Option<String>> {
+        let conn = self.open()?;
+        let mut stmt = conn.prepare("SELECT value FROM kv WHERE scope = ?1 AND key = ?2")?;
+        let mut rows = stmt.query_map(params![scope, key], |row| row.get::<_, String>(0))?;
+        match rows.next() {
+            Some(row) => row.map(Some).map_err(StorageError::Sqlite),
+            None => Ok(None),
+        }
+    }
+
+    /// Upsert a raw value into the `kv` store (insert or replace).
+    pub fn set_kv(&self, scope: &str, key: &str, value: &str) -> Result<()> {
+        let conn = self.open()?;
+        conn.execute(
+            "INSERT INTO kv (scope, key, value) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(scope, key) DO UPDATE SET value = excluded.value",
+            params![scope, key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a value from the `kv` store. Idempotent (no-op if absent).
+    pub fn delete_kv(&self, scope: &str, key: &str) -> Result<()> {
+        let conn = self.open()?;
+        conn.execute(
+            "DELETE FROM kv WHERE scope = ?1 AND key = ?2",
+            params![scope, key],
+        )?;
+        Ok(())
+    }
+
+    /// List every `(key, value)` pair in a scope, ordered by key.
+    /// Used by the conversation-management control endpoints.
+    pub fn list_kv(&self, scope: &str) -> Result<Vec<(String, String)>> {
+        let conn = self.open()?;
+        let mut stmt = conn.prepare("SELECT key, value FROM kv WHERE scope = ?1 ORDER BY key")?;
+        let rows = stmt.query_map(params![scope], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StorageError::Sqlite)
+    }
+
+    /// Total cost (USD) recorded since the given unix timestamp.
     pub fn total_cost_since(&self, since_unix: u64) -> Result<f64> {
         let conn = self.open()?;
         let total = conn.query_row(
@@ -1995,6 +2205,26 @@ CREATE TABLE IF NOT EXISTS runtimeEvents (
   meta TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_runtime_events_ts ON runtimeEvents(timestamp DESC);
+
+CREATE TABLE IF NOT EXISTS rtk_state (
+  key TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  data TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rtk_state_kind ON rtk_state(kind);
+
+CREATE TABLE IF NOT EXISTS model_catalog (
+  provider TEXT NOT NULL,
+  model TEXT NOT NULL,
+  context_window INTEGER,
+  modalities TEXT,
+  price_in_per_million REAL,
+  price_out_per_million REAL,
+  latency_p50_ms INTEGER,
+  PRIMARY KEY (provider, model)
+);
+CREATE INDEX IF NOT EXISTS idx_model_catalog_provider ON model_catalog(provider);
 "#;
 
 #[cfg(test)]

@@ -2043,7 +2043,7 @@ fn convert_openai_messages_to_gemini(messages: &[Value]) -> Result<Vec<Value>> {
                     }]
                 }));
             }
-            "user" | _ => {
+            _ => {
                 let content = msg.get("content");
                 if let Some(text) = content.and_then(Value::as_str) {
                     gemini_contents.push(serde_json::json!({

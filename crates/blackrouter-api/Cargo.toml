@@ -27,6 +27,9 @@ uuid.workspace = true
 prometheus.workspace = true
 opentelemetry.workspace = true
 tracing-opentelemetry.workspace = true
+tracing-subscriber.workspace = true
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
 rand = "0.8"
 sha2 = "0.10"
 base64 = "0.22"
