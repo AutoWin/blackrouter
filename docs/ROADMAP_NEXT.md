@@ -172,6 +172,12 @@ Test: `retryable_errors_are_transient_only`, `request_modalities_detects_vision_
 - Khi cần: rate-limit state ra Redis/shared store; SQLite thành central DB hoặc Postgres.
 - `ResponseCache` cũng cần external (Redis) nếu nhiều replica.
 
+**Đã implement (done):**
+- **9.1** — `apiKeys` được migrate additive với `tenantId` + policy JSON. Policy hỗ trợ quota request/ngày (counter SQLite atomic), token/ngày, cost/tháng, provider allowlist và model allowlist. Auth trả `key_id`/tenant context; usage và RTK chỉ lưu key ID, không ghi raw credential. Rotation giữ nguyên tenant/policy. Setup UI hỗ trợ tạo/sửa policy và rotate.
+- **9.2** — background provider prober đọc cấu hình runtime (`enabled`, interval, timeout, failure threshold), đánh dấu `degraded`/`unhealthy` theo số lỗi liên tiếp và tự phục hồi `healthy`. `/readyz` và `GET /api/provider-health` hiển thị trạng thái probe.
+- **9.3** — bảng `settingsHistory` lưu version mỗi lần save; `GET /api/setup/config/versions` + restore endpoint. `requireApiKey`, cost guard và health-probe config có hiệu lực không cần restart qua `RuntimeSettings` hot reload.
+- **9.4** — `BLACKROUTER_REDIS_URL` bật shared mode: Redis Lua atomically phối hợp RPM/token-window/concurrency giữa replica, chia sẻ RTK snapshot và deterministic response cache. Redis là optional; single-node vẫn dùng SQLite + memory. Compose có Redis `cluster` profile. Lưu ý persistence nghiệp vụ vẫn là SQLite; multi-host production cần đặt DB trên storage phù hợp hoặc thay bằng central DB.
+
 **Definition of Done (Phase 9):** nhiều tenant cách ly quota; deploy nhiều replica không mất rate-limit state.
 
 ---
@@ -190,6 +196,11 @@ Test: `retryable_errors_are_transient_only`, `request_modalities_detects_vision_
 
 ### 10.3 Docs & Runbooks
 - README có sẵn; bổ sung runbook vận hành, mẫu docker-compose với Prometheus/Grafana, troubleshooting.
+
+**Đã implement (done):**
+- **10.1** — Setup UI có API-key tenant/quota/allowlist editor + rotation, cost-guard form, proactive-probe settings và model-alias management; Limits tiếp tục hiển thị health/cost/RTK.
+- **10.2** — CLI có `doctor`, `migrate`, `config apply`, `usage export` bên cạnh provider login.
+- **10.3** — `docs/OPERATIONS.md` mô tả probes, hot reload/version restore, tenant keys, Redis multi-replica, backup/recovery và incident checks; Docker Compose có readiness healthcheck và observability stack.
 
 ---
 
@@ -234,8 +245,8 @@ Test: `retryable_errors_are_transient_only`, `request_modalities_detects_vision_
 - [x] 7.3 Combo hedge/fallback-by-error
 - [x] 7.4 Capability routing
 - [x] 8.1 Session store (nếu agentic)
-- [ ] 9.1 Multi-tenant API key scoping
-- [ ] 9.2 Proactive health probing
-- [ ] 9.3 Config hot-reload
-- [ ] 9.4 Shared RTK/Cache (nếu scale ngang)
-- [ ] 10.x UI/CLI/Docs polish
+- [x] 9.1 Multi-tenant API key scoping
+- [x] 9.2 Proactive health probing
+- [x] 9.3 Config hot-reload
+- [x] 9.4 Shared RTK/Cache (nếu scale ngang)
+- [x] 10.x UI/CLI/Docs polish

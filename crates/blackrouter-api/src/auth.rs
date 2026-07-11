@@ -3,10 +3,12 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use chrono::Datelike;
 use serde_json::json;
 
 use blackrouter_config::AppConfig;
-use blackrouter_storage::StorageError;
+use blackrouter_core::RouteKind;
+use blackrouter_storage::{ApiKeyPolicy, AuthenticatedApiKey, StorageError};
 
 use crate::state::AppState;
 
@@ -57,30 +59,140 @@ impl IntoResponse for ApiErrorResponse {
 
 // ── v1 API key auth ──────────────────────────────────────────────────────────
 
-pub fn authorize_v1(state: &AppState, headers: &HeaderMap) -> Result<(), ApiErrorResponse> {
-    if !state.config.require_api_key {
-        return Ok(());
-    }
+#[derive(Clone, Debug, Default)]
+pub struct AuthContext {
+    pub key_id: Option<String>,
+    pub tenant_id: Option<String>,
+    pub policy: ApiKeyPolicy,
+}
 
-    let api_key = extract_api_key(headers).ok_or_else(|| {
-        ApiErrorResponse::new(
-            StatusCode::UNAUTHORIZED,
-            "Missing API key",
-            "authentication_error",
-        )
-    })?;
+pub fn authorize_v1(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<AuthContext, ApiErrorResponse> {
+    let supplied = extract_api_key(headers);
+    let authenticated = supplied
+        .as_deref()
+        .map(|api_key| state.storage.authenticate_api_key(api_key))
+        .transpose()
+        .map_err(|error| ApiErrorResponse::internal(format!("API key validation failed: {error}")))?
+        .flatten();
 
-    let valid = state.storage.is_valid_api_key(&api_key).map_err(|error| {
-        ApiErrorResponse::internal(format!("API key validation failed: {error}"))
-    })?;
-
-    if valid {
-        Ok(())
-    } else {
-        Err(ApiErrorResponse::new(
+    if supplied.is_some() && authenticated.is_none() {
+        return Err(ApiErrorResponse::new(
             StatusCode::UNAUTHORIZED,
             "Invalid API key",
             "authentication_error",
+        ));
+    }
+
+    if state.runtime_settings().require_api_key && authenticated.is_none() {
+        return Err(ApiErrorResponse::new(
+            StatusCode::UNAUTHORIZED,
+            "Missing API key",
+            "authentication_error",
+        ));
+    }
+
+    let context = authenticated.map(auth_context).unwrap_or_default();
+    enforce_quota(state, &context)?;
+    Ok(context)
+}
+
+fn auth_context(key: AuthenticatedApiKey) -> AuthContext {
+    AuthContext {
+        key_id: Some(key.id),
+        tenant_id: key.tenant_id,
+        policy: key.policy,
+    }
+}
+
+fn enforce_quota(state: &AppState, auth: &AuthContext) -> Result<(), ApiErrorResponse> {
+    let Some(key_id) = auth.key_id.as_deref() else {
+        return Ok(());
+    };
+    let now = blackrouter_common::unix_timestamp();
+    let day_start = now - (now % 86_400);
+    let daily = state
+        .storage
+        .api_key_usage_since(key_id, day_start)
+        .map_err(|error| ApiErrorResponse::internal(format!("quota check failed: {error}")))?;
+    let month_start = chrono::Utc::now()
+        .date_naive()
+        .with_day(1)
+        .and_then(|date| date.and_hms_opt(0, 0, 0))
+        .map(|date| date.and_utc().timestamp() as u64)
+        .unwrap_or(day_start);
+    let monthly = state
+        .storage
+        .api_key_usage_since(key_id, month_start)
+        .map_err(|error| ApiErrorResponse::internal(format!("quota check failed: {error}")))?;
+
+    let exceeded = auth
+        .policy
+        .tokens_per_day
+        .is_some_and(|limit| daily.tokens >= limit)
+        || auth
+            .policy
+            .cost_per_month_usd
+            .is_some_and(|limit| monthly.cost >= limit);
+    if exceeded {
+        return Err(ApiErrorResponse::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "API key quota exceeded",
+            "quota_exceeded",
+        ));
+    }
+    Ok(())
+}
+
+pub fn reserve_request_quota(state: &AppState, auth: &AuthContext) -> Result<(), ApiErrorResponse> {
+    let (Some(key_id), Some(limit)) = (auth.key_id.as_deref(), auth.policy.requests_per_day) else {
+        return Ok(());
+    };
+    let now = blackrouter_common::unix_timestamp();
+    let day_start = now - (now % 86_400);
+    let reserved = state
+        .storage
+        .reserve_api_key_request(key_id, day_start, limit)
+        .map_err(|error| {
+            ApiErrorResponse::internal(format!("quota reservation failed: {error}"))
+        })?;
+    if reserved {
+        Ok(())
+    } else {
+        Err(ApiErrorResponse::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "API key request quota exceeded",
+            "quota_exceeded",
+        ))
+    }
+}
+
+pub fn enforce_route_scope(auth: &AuthContext, route: &RouteKind) -> Result<(), ApiErrorResponse> {
+    let models = match route {
+        RouteKind::Single(model) => std::slice::from_ref(model),
+        RouteKind::Combo { models, .. } => models.as_slice(),
+    };
+    let provider_allowed = auth.policy.provider_allowlist.is_empty()
+        || models
+            .iter()
+            .all(|model| auth.policy.provider_allowlist.contains(&model.provider));
+    let model_allowed = auth.policy.model_allowlist.is_empty()
+        || models.iter().all(|model| {
+            auth.policy.model_allowlist.contains(&model.model)
+                || auth
+                    .policy
+                    .model_allowlist
+                    .contains(&format!("{}/{}", model.provider, model.model))
+        });
+    if provider_allowed && model_allowed {
+        Ok(())
+    } else {
+        Err(ApiErrorResponse::new(
+            StatusCode::FORBIDDEN,
+            "API key is not allowed to use this provider or model",
+            "permission_error",
         ))
     }
 }
@@ -280,6 +392,8 @@ mod tests {
             require_api_key: false,
             control_api_enabled: true,
             control_token: None,
+            redis_url: None,
+            shared_state_prefix: "blackrouter-test".to_string(),
             log_level: "info".to_string(),
             telegram: blackrouter_config::TelegramConfig {
                 enabled: false,
@@ -305,6 +419,8 @@ mod tests {
             require_api_key: false,
             control_api_enabled: true,
             control_token: Some("s3cret".to_string()),
+            redis_url: None,
+            shared_state_prefix: "blackrouter-test".to_string(),
             log_level: "info".to_string(),
             telegram: blackrouter_config::TelegramConfig {
                 enabled: false,
@@ -330,6 +446,8 @@ mod tests {
             require_api_key: false,
             control_api_enabled: false,
             control_token: None,
+            redis_url: None,
+            shared_state_prefix: "blackrouter-test".to_string(),
             log_level: "info".to_string(),
             telegram: blackrouter_config::TelegramConfig {
                 enabled: false,

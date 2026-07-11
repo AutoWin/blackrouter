@@ -26,6 +26,9 @@ pub struct AppConfig {
     pub control_api_enabled: bool,
     #[serde(skip_serializing)]
     pub control_token: Option<String>,
+    #[serde(skip_serializing)]
+    pub redis_url: Option<String>,
+    pub shared_state_prefix: String,
     pub log_level: String,
     pub telegram: TelegramConfig,
 }
@@ -80,6 +83,9 @@ impl AppConfig {
             require_api_key,
             control_api_enabled,
             control_token: env_string("BLACKROUTER_CONTROL_TOKEN"),
+            redis_url: env_string("BLACKROUTER_REDIS_URL"),
+            shared_state_prefix: env_string("BLACKROUTER_SHARED_STATE_PREFIX")
+                .unwrap_or_else(|| "blackrouter".to_string()),
             log_level: env_string("BLACKROUTER_LOG_LEVEL").unwrap_or_else(|| "info".to_string()),
             telegram: TelegramConfig::load(),
         })

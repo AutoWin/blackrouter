@@ -42,6 +42,9 @@
                     <button class="tab" data-panel="combos" type="button">
                         Combos
                     </button>
+                    <button class="tab" data-panel="aliases" type="button">
+                        Aliases
+                    </button>
                 </nav>
             </aside>
 
@@ -103,6 +106,24 @@
                                 wiring</span
                             >
                         </label>
+                        <div class="grid two">
+                            <label class="check-field inline">
+                                <input id="healthProbeEnabledInput" type="checkbox" />
+                                <span>Proactive provider probes</span>
+                            </label>
+                            <label class="field">
+                                <span>Probe interval (seconds)</span>
+                                <input id="healthProbeIntervalInput" type="number" min="5" value="30" />
+                            </label>
+                            <label class="field">
+                                <span>Probe timeout (seconds)</span>
+                                <input id="healthProbeTimeoutInput" type="number" min="1" value="5" />
+                            </label>
+                            <label class="field">
+                                <span>Failure threshold</span>
+                                <input id="healthProbeThresholdInput" type="number" min="1" value="3" />
+                            </label>
+                        </div>
                         <div class="form-actions">
                             <button class="primary-button" type="submit">
                                 Save Config
@@ -153,6 +174,7 @@
                         </label>
                     </div>
                     <form id="apiKeyForm" class="form-block">
+                        <input id="apiKeyEditIdInput" type="hidden" />
                         <div class="grid two">
                             <label class="field">
                                 <span>Name</span>
@@ -160,6 +182,30 @@
                                     id="apiKeyNameInput"
                                     placeholder="Local CLI"
                                 />
+                            </label>
+                            <label class="field">
+                                <span>Tenant ID</span>
+                                <input id="apiKeyTenantInput" placeholder="team-acme" />
+                            </label>
+                            <label class="field">
+                                <span>Requests / day</span>
+                                <input id="apiKeyRequestsInput" type="number" min="1" placeholder="unlimited" />
+                            </label>
+                            <label class="field">
+                                <span>Tokens / day</span>
+                                <input id="apiKeyTokensInput" type="number" min="1" placeholder="unlimited" />
+                            </label>
+                            <label class="field">
+                                <span>Cost / month (USD)</span>
+                                <input id="apiKeyCostInput" type="number" min="0" step="0.01" placeholder="unlimited" />
+                            </label>
+                            <label class="field">
+                                <span>Provider allowlist</span>
+                                <input id="apiKeyProvidersInput" placeholder="openai, anthropic" />
+                            </label>
+                            <label class="field">
+                                <span>Model allowlist</span>
+                                <input id="apiKeyModelsInput" placeholder="openai/gpt-5, claude-sonnet" />
                             </label>
                             <label class="field">
                                 <span>Machine ID</span>
@@ -171,8 +217,9 @@
                         </div>
                         <div class="form-actions">
                             <button class="primary-button" type="submit">
-                                Create API Key
+                                <span id="apiKeySubmitLabel">Create API Key</span>
                             </button>
+                            <button id="apiKeyCancelEditButton" class="secondary-button hidden" type="button">Cancel</button>
                         </div>
                     </form>
                     <div id="newApiKeyNotice" class="notice hidden"></div>
@@ -447,6 +494,23 @@
                     ></div>
                     <div id="limitsSummary" class="limit-summary"></div>
                     <div id="costGuardSummary" class="limit-summary"></div>
+                    <form id="costGuardForm" class="form-block">
+                        <div class="grid two">
+                            <label class="check-field inline">
+                                <input id="costGuardEnabledInput" type="checkbox" />
+                                <span>Enable cost guard</span>
+                            </label>
+                            <label class="field">
+                                <span>Daily budget (USD)</span>
+                                <input id="costGuardDailyInput" type="number" min="0" step="0.01" placeholder="unlimited" />
+                            </label>
+                            <label class="field">
+                                <span>Monthly budget (USD)</span>
+                                <input id="costGuardMonthlyInput" type="number" min="0" step="0.01" placeholder="unlimited" />
+                            </label>
+                        </div>
+                        <div class="form-actions"><button class="primary-button" type="submit">Save Cost Guard</button></div>
+                    </form>
                     <div
                         id="limitsList"
                         class="table-list limit-list"
@@ -550,6 +614,18 @@
                         class="table-list"
                         aria-live="polite"
                     ></div>
+                </section>
+
+                <section id="aliases" class="panel">
+                    <div class="section-head"><h2>Model Aliases</h2><span id="aliasesBadge" class="badge muted">0 aliases</span></div>
+                    <form id="aliasForm" class="form-block">
+                        <div class="grid two">
+                            <label class="field"><span>Alias</span><input id="aliasNameInput" placeholder="fast" required /></label>
+                            <label class="field"><span>Target</span><input id="aliasTargetInput" placeholder="openai/gpt-5-mini" required /></label>
+                        </div>
+                        <div class="form-actions"><button class="primary-button" type="submit">Add Alias</button></div>
+                    </form>
+                    <div id="aliasesList" class="table-list" aria-live="polite"></div>
                 </section>
             </main>
         </div>

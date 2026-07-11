@@ -757,6 +757,8 @@ impl TelegramRuntime {
         match self.storage.create_api_key(NewApiKey {
             name: Some(name.to_string()),
             machine_id: Some("telegram".to_string()),
+            tenant_id: None,
+            policy: Default::default(),
         }) {
             Ok(created) => format!(
                 "<b>API Key Created</b>\n\nName: {}\nID: {}\nKey: <code>{}</code>\n\nThis is shown once.",

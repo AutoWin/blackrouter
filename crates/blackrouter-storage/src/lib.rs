@@ -48,7 +48,13 @@ const COMPAT_TABLES: &[&str] = &[
     "modelAliases",
 ];
 
-const BLACKROUTER_TABLES: &[&str] = &["adminAuditLog", "telegramLinks", "runtimeEvents"];
+const BLACKROUTER_TABLES: &[&str] = &[
+    "adminAuditLog",
+    "telegramLinks",
+    "runtimeEvents",
+    "settingsHistory",
+    "apiKeyQuotaCounters",
+];
 
 #[derive(Clone, Debug)]
 pub struct Storage {
@@ -71,12 +77,28 @@ pub struct ModelListItem {
     pub owned_by: &'static str,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ApiKeyPolicy {
+    #[serde(default)]
+    pub requests_per_day: Option<u64>,
+    #[serde(default)]
+    pub tokens_per_day: Option<u64>,
+    #[serde(default)]
+    pub cost_per_month_usd: Option<f64>,
+    #[serde(default)]
+    pub provider_allowlist: Vec<String>,
+    #[serde(default)]
+    pub model_allowlist: Vec<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ApiKeyRecord {
     pub id: String,
     pub key_masked: String,
     pub name: Option<String>,
     pub machine_id: Option<String>,
+    pub tenant_id: Option<String>,
+    pub policy: ApiKeyPolicy,
     pub is_active: bool,
     pub created_at: String,
 }
@@ -91,6 +113,31 @@ pub struct CreatedApiKey {
 pub struct NewApiKey {
     pub name: Option<String>,
     pub machine_id: Option<String>,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub policy: ApiKeyPolicy,
+}
+
+#[derive(Clone, Debug)]
+pub struct AuthenticatedApiKey {
+    pub id: String,
+    pub tenant_id: Option<String>,
+    pub policy: ApiKeyPolicy,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ApiKeyUsage {
+    pub requests: u64,
+    pub tokens: u64,
+    pub cost: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SettingsVersion {
+    pub version: u64,
+    pub data: Value,
+    pub created_at: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -311,22 +358,62 @@ impl Storage {
     pub fn save_settings_json(&self, settings: &Value) -> Result<Value> {
         let conn = self.open()?;
         let raw = serde_json::to_string_pretty(settings)?;
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
             r#"
             INSERT INTO settings (id, data)
             VALUES (1, ?1)
             ON CONFLICT(id) DO UPDATE SET data = excluded.data
             "#,
-            params![raw],
+            params![&raw],
         )?;
+        tx.execute(
+            "INSERT INTO settingsHistory (data, createdAt) VALUES (?1, ?2)",
+            params![&raw, blackrouter_common::unix_timestamp()],
+        )?;
+        tx.commit()?;
         Ok(settings.clone())
+    }
+
+    pub fn list_settings_versions(&self, limit: u64) -> Result<Vec<SettingsVersion>> {
+        let conn = self.open()?;
+        let mut stmt = conn.prepare(
+            "SELECT version, data, createdAt FROM settingsHistory ORDER BY version DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit.min(100) as i64], |row| {
+            let raw: String = row.get(1)?;
+            Ok((row.get::<_, i64>(0)?, raw, row.get::<_, i64>(2)?))
+        })?;
+        rows.map(|row| {
+            let (version, raw, created_at) = row?;
+            Ok(SettingsVersion {
+                version: version as u64,
+                data: serde_json::from_str(&raw)?,
+                created_at: created_at as u64,
+            })
+        })
+        .collect()
+    }
+
+    pub fn restore_settings_version(&self, version: u64) -> Result<Value> {
+        let conn = self.open()?;
+        let raw = conn
+            .query_row(
+                "SELECT data FROM settingsHistory WHERE version = ?1",
+                params![version as i64],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| StorageError::Validation("settings version not found".to_string()))?;
+        let settings = serde_json::from_str::<Value>(&raw)?;
+        self.save_settings_json(&settings)
     }
 
     pub fn list_api_keys(&self) -> Result<Vec<ApiKeyRecord>> {
         let conn = self.open()?;
         let mut stmt = conn.prepare(
             r#"
-            SELECT id, key, name, machineId, isActive, createdAt
+            SELECT id, key, name, machineId, tenantId, policy, isActive, createdAt
             FROM apiKeys
             ORDER BY createdAt DESC, id DESC
             "#,
@@ -339,8 +426,10 @@ impl Storage {
                 key_masked: mask_secret(&key),
                 name: row.get(2)?,
                 machine_id: row.get(3)?,
-                is_active: row.get::<_, i64>(4)? != 0,
-                created_at: row.get(5)?,
+                tenant_id: row.get(4)?,
+                policy: parse_policy(row.get::<_, Option<String>>(5)?),
+                is_active: row.get::<_, i64>(6)? != 0,
+                created_at: row.get(7)?,
             })
         })?;
 
@@ -355,13 +444,16 @@ impl Storage {
         let created_at = now_text();
         let name = normalize_opt(input.name);
         let machine_id = normalize_opt(input.machine_id);
+        let tenant_id = normalize_opt(input.tenant_id);
+        validate_api_key_policy(&input.policy)?;
+        let policy = serde_json::to_string(&input.policy)?;
 
         conn.execute(
             r#"
-            INSERT INTO apiKeys (id, key, name, machineId, isActive, createdAt)
-            VALUES (?1, ?2, ?3, ?4, 1, ?5)
+            INSERT INTO apiKeys (id, key, name, machineId, tenantId, policy, isActive, createdAt)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)
             "#,
-            params![id, key, name, machine_id, created_at],
+            params![id, key, name, machine_id, tenant_id, policy, created_at],
         )?;
 
         Ok(CreatedApiKey {
@@ -370,6 +462,8 @@ impl Storage {
                 key_masked: mask_secret(&key),
                 name,
                 machine_id,
+                tenant_id,
+                policy: input.policy,
                 is_active: true,
                 created_at,
             },
@@ -381,10 +475,15 @@ impl Storage {
     pub fn rotate_api_key(&self, key_id: &str) -> Result<CreatedApiKey> {
         let conn = self.open()?;
         // Get existing key metadata
-        let (name, machine_id): (Option<String>, Option<String>) = conn.query_row(
-            "SELECT name, machineId FROM apiKeys WHERE id = ?1",
+        let (name, machine_id, tenant_id, policy): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn.query_row(
+            "SELECT name, machineId, tenantId, policy FROM apiKeys WHERE id = ?1",
             params![key_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
 
         // Deactivate old key
@@ -400,10 +499,10 @@ impl Storage {
 
         conn.execute(
             r#"
-            INSERT INTO apiKeys (id, key, name, machineId, isActive, createdAt)
-            VALUES (?1, ?2, ?3, ?4, 1, ?5)
+            INSERT INTO apiKeys (id, key, name, machineId, tenantId, policy, isActive, createdAt)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)
             "#,
-            params![new_id, key, name, machine_id, created_at],
+            params![new_id, key, name, machine_id, tenant_id, policy, created_at],
         )?;
 
         Ok(CreatedApiKey {
@@ -412,11 +511,123 @@ impl Storage {
                 key_masked: mask_secret(&key),
                 name,
                 machine_id,
+                tenant_id,
+                policy: parse_policy(policy),
                 is_active: true,
                 created_at,
             },
             key,
         })
+    }
+
+    pub fn update_api_key_policy(
+        &self,
+        key_id: &str,
+        tenant_id: Option<String>,
+        policy: ApiKeyPolicy,
+    ) -> Result<ApiKeyRecord> {
+        validate_api_key_policy(&policy)?;
+        let conn = self.open()?;
+        let tenant_id = normalize_opt(tenant_id);
+        let policy_json = serde_json::to_string(&policy)?;
+        let changed = conn.execute(
+            "UPDATE apiKeys SET tenantId = ?2, policy = ?3 WHERE id = ?1",
+            params![key_id, tenant_id, policy_json],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::Validation("API key not found".to_string()));
+        }
+        self.get_api_key_record(key_id)?
+            .ok_or_else(|| StorageError::Validation("API key not found".to_string()))
+    }
+
+    pub fn authenticate_api_key(&self, api_key: &str) -> Result<Option<AuthenticatedApiKey>> {
+        let conn = self.open()?;
+        conn.query_row(
+            "SELECT id, tenantId, policy FROM apiKeys WHERE key = ?1 AND isActive = 1 LIMIT 1",
+            params![api_key],
+            |row| {
+                Ok(AuthenticatedApiKey {
+                    id: row.get(0)?,
+                    tenant_id: row.get(1)?,
+                    policy: parse_policy(row.get::<_, Option<String>>(2)?),
+                })
+            },
+        )
+        .optional()
+        .map_err(StorageError::from)
+    }
+
+    pub fn api_key_usage_since(&self, key_id: &str, since_unix: u64) -> Result<ApiKeyUsage> {
+        let conn = self.open()?;
+        conn.query_row(
+            r#"
+            SELECT COUNT(*),
+                   COALESCE(SUM(promptTokens + completionTokens), 0),
+                   COALESCE(SUM(CASE WHEN status = 'success' THEN cost ELSE 0 END), 0)
+            FROM usageHistory
+            WHERE apiKey = ?1 AND CAST(timestamp AS INTEGER) >= ?2
+            "#,
+            params![key_id, since_unix],
+            |row| {
+                Ok(ApiKeyUsage {
+                    requests: row.get::<_, i64>(0)? as u64,
+                    tokens: row.get::<_, i64>(1)? as u64,
+                    cost: row.get(2)?,
+                })
+            },
+        )
+        .map_err(StorageError::from)
+    }
+
+    pub fn reserve_api_key_request(
+        &self,
+        key_id: &str,
+        period_start: u64,
+        limit: u64,
+    ) -> Result<bool> {
+        if limit == 0 {
+            return Ok(false);
+        }
+        let conn = self.open()?;
+        let changed = conn.execute(
+            r#"
+            INSERT INTO apiKeyQuotaCounters (keyId, periodStart, kind, value)
+            VALUES (?1, ?2, 'requests', 1)
+            ON CONFLICT(keyId, periodStart, kind) DO UPDATE SET
+              value = apiKeyQuotaCounters.value + 1
+            WHERE apiKeyQuotaCounters.value < ?3
+            "#,
+            params![key_id, period_start, limit],
+        )?;
+        let _ = conn.execute(
+            "DELETE FROM apiKeyQuotaCounters WHERE periodStart < ?1",
+            params![period_start.saturating_sub(40 * 86_400)],
+        );
+        Ok(changed > 0)
+    }
+
+    fn get_api_key_record(&self, key_id: &str) -> Result<Option<ApiKeyRecord>> {
+        let conn = self.open()?;
+        conn.query_row(
+            "SELECT id, key, name, machineId, tenantId, policy, isActive, createdAt FROM apiKeys WHERE id = ?1",
+            params![key_id],
+            |row| {
+                let key: String = row.get(1)?;
+                Ok(ApiKeyRecord {
+                    id: row.get(0)?,
+                    key_masked: mask_secret(&key),
+                    name: row.get(2)?,
+                    machine_id: row.get(3)?,
+                    tenant_id: row.get(4)?,
+                    policy: parse_policy(row.get::<_, Option<String>>(5)?),
+                    is_active: row.get::<_, i64>(6)? != 0,
+                    created_at: row.get(7)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(StorageError::from)
     }
 
     pub fn list_provider_connections(&self) -> Result<Vec<ProviderConnectionRecord>> {
@@ -1856,6 +2067,33 @@ fn normalize_opt(value: Option<String>) -> Option<String> {
         .filter(|item| !item.is_empty())
 }
 
+fn parse_policy(raw: Option<String>) -> ApiKeyPolicy {
+    raw.and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default()
+}
+
+fn validate_api_key_policy(policy: &ApiKeyPolicy) -> Result<()> {
+    if policy.cost_per_month_usd.is_some_and(|value| value < 0.0) {
+        return Err(StorageError::Validation(
+            "cost_per_month_usd cannot be negative".to_string(),
+        ));
+    }
+    if policy
+        .provider_allowlist
+        .iter()
+        .any(|value| value.trim().is_empty())
+        || policy
+            .model_allowlist
+            .iter()
+            .any(|value| value.trim().is_empty())
+    {
+        return Err(StorageError::Validation(
+            "allowlist entries cannot be empty".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn normalize_status(value: Option<&str>) -> String {
     value
         .map(|item| item.trim().to_ascii_lowercase())
@@ -2037,6 +2275,17 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
         "cooldownUntil TEXT",
     )?;
     add_column_if_missing(conn, "providerConnections", "expiresAt", "expiresAt TEXT")?;
+    add_column_if_missing(conn, "apiKeys", "tenantId", "tenantId TEXT")?;
+    add_column_if_missing(
+        conn,
+        "apiKeys",
+        "policy",
+        "policy TEXT NOT NULL DEFAULT '{}'",
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ak_tenant ON apiKeys(tenantId)",
+        [],
+    )?;
     Ok(())
 }
 
@@ -2102,6 +2351,8 @@ CREATE TABLE IF NOT EXISTS apiKeys (
   key TEXT UNIQUE NOT NULL,
   name TEXT,
   machineId TEXT,
+  tenantId TEXT,
+  policy TEXT NOT NULL DEFAULT '{}',
   isActive INTEGER DEFAULT 1,
   createdAt TEXT NOT NULL
 );
@@ -2175,6 +2426,22 @@ CREATE INDEX IF NOT EXISTS idx_ma_alias ON modelAliases(alias);
 "#;
 
 const BLACKROUTER_SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS apiKeyQuotaCounters (
+  keyId TEXT NOT NULL,
+  periodStart INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  value INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (keyId, periodStart, kind)
+);
+CREATE INDEX IF NOT EXISTS idx_api_key_quota_period ON apiKeyQuotaCounters(periodStart);
+
+CREATE TABLE IF NOT EXISTS settingsHistory (
+  version INTEGER PRIMARY KEY AUTOINCREMENT,
+  data TEXT NOT NULL,
+  createdAt INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_settings_history_created ON settingsHistory(createdAt DESC);
+
 CREATE TABLE IF NOT EXISTS adminAuditLog (
   id TEXT PRIMARY KEY,
   timestamp TEXT NOT NULL,
@@ -2229,7 +2496,7 @@ CREATE INDEX IF NOT EXISTS idx_model_catalog_provider ON model_catalog(provider)
 
 #[cfg(test)]
 mod tests {
-    use super::{NewCombo, NewProviderConnection, Storage};
+    use super::{ApiKeyPolicy, NewApiKey, NewCombo, NewProviderConnection, Storage, UsageEntry};
     use blackrouter_core::{ModelRef, RouteKind};
     use serde_json::json;
     use std::fs;
@@ -2272,6 +2539,109 @@ mod tests {
         assert!(status.schema_compatible);
         assert!(status.table_counts.contains_key("settings"));
 
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn migrates_legacy_api_keys_before_creating_tenant_index() {
+        let path = std::env::temp_dir().join(format!(
+            "blackrouter-storage-legacy-api-keys-{}-{}.sqlite",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE apiKeys (id TEXT PRIMARY KEY, key TEXT UNIQUE NOT NULL, name TEXT, machineId TEXT, isActive INTEGER DEFAULT 1, createdAt TEXT NOT NULL);\
+             INSERT INTO apiKeys (id, key, isActive, createdAt) VALUES ('legacy', 'brk_legacy', 1, '1');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let storage = Storage::new(&path);
+        storage.initialize().expect("legacy schema migrates");
+        let authenticated = storage.authenticate_api_key("brk_legacy").unwrap().unwrap();
+        assert_eq!(authenticated.id, "legacy");
+        assert_eq!(authenticated.policy, ApiKeyPolicy::default());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn api_key_policy_round_trips_and_rotation_preserves_scope() {
+        let (storage, path) = temp_storage("api-key-policy");
+        let policy = ApiKeyPolicy {
+            requests_per_day: Some(10),
+            tokens_per_day: Some(1_000),
+            cost_per_month_usd: Some(12.5),
+            provider_allowlist: vec!["openai".to_string()],
+            model_allowlist: vec!["openai/gpt-5".to_string()],
+        };
+        let created = storage
+            .create_api_key(NewApiKey {
+                name: Some("tenant key".to_string()),
+                machine_id: None,
+                tenant_id: Some("tenant-a".to_string()),
+                policy: policy.clone(),
+            })
+            .unwrap();
+        let authenticated = storage.authenticate_api_key(&created.key).unwrap().unwrap();
+        assert_eq!(authenticated.tenant_id.as_deref(), Some("tenant-a"));
+        assert_eq!(authenticated.policy, policy);
+
+        let rotated = storage.rotate_api_key(&created.record.id).unwrap();
+        assert!(storage
+            .authenticate_api_key(&created.key)
+            .unwrap()
+            .is_none());
+        let authenticated = storage.authenticate_api_key(&rotated.key).unwrap().unwrap();
+        assert_eq!(authenticated.policy, policy);
+        assert_eq!(authenticated.tenant_id.as_deref(), Some("tenant-a"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn settings_history_and_key_usage_are_queryable() {
+        let (storage, path) = temp_storage("settings-history-usage");
+        storage
+            .save_settings_json(&json!({"requireApiKey": false}))
+            .unwrap();
+        storage
+            .save_settings_json(&json!({"requireApiKey": true}))
+            .unwrap();
+        let versions = storage.list_settings_versions(10).unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].data["requireApiKey"], true);
+
+        storage
+            .record_usage(&UsageEntry {
+                id: "ignored".to_string(),
+                timestamp: blackrouter_common::unix_timestamp().to_string(),
+                provider: "openai".to_string(),
+                model: "gpt-5".to_string(),
+                connection_id: None,
+                api_key: Some("key-id".to_string()),
+                endpoint: "/v1/chat/completions".to_string(),
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                cost: 0.25,
+                status: "success".to_string(),
+                tokens: None,
+                meta: None,
+            })
+            .unwrap();
+        let usage = storage.api_key_usage_since("key-id", 0).unwrap();
+        assert_eq!(usage.requests, 1);
+        assert_eq!(usage.tokens, 15);
+        assert_eq!(usage.cost, 0.25);
+        let period = blackrouter_common::unix_timestamp() / 86_400 * 86_400;
+        assert!(storage
+            .reserve_api_key_request("key-id", period, 2)
+            .unwrap());
+        assert!(storage
+            .reserve_api_key_request("key-id", period, 2)
+            .unwrap());
+        assert!(!storage
+            .reserve_api_key_request("key-id", period, 2)
+            .unwrap());
         let _ = fs::remove_file(path);
     }
 

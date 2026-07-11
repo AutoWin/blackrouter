@@ -55,10 +55,13 @@ impl Metrics {
             IntGauge::new("blackrouter_open_connections", "Current open connections").unwrap();
 
         // Register process collector into the custom registry (not global).
-        let process_collector = prometheus::process_collector::ProcessCollector::for_self();
-        registry
-            .register(Box::new(process_collector))
-            .expect("failed to register process collector");
+        #[cfg(target_os = "linux")]
+        {
+            let process_collector = prometheus::process_collector::ProcessCollector::for_self();
+            registry
+                .register(Box::new(process_collector))
+                .expect("failed to register process collector");
+        }
 
         // Register all metrics into the custom registry only.
         registry

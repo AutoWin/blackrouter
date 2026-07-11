@@ -10,14 +10,33 @@ services:
       - .env
     environment:
       BLACKROUTER_HOST: 0.0.0.0
-      BLACKROUTER_PORT: ${BLACKROUTER_PORT:-20129}
+      BLACKROUTER_PORT: 20129
       BLACKROUTER_DATA_DIR: /data
       BLACKROUTER_DATABASE_URL: sqlite:///data/blackrouter.db
       BLACKROUTER_COMPAT_9ROUTER_DB: "false"
     ports:
-      - "${BLACKROUTER_PORT:-20129}:${BLACKROUTER_PORT:-20129}"
+      - "${BLACKROUTER_PORT:-20129}:20129"
     volumes:
       - ./data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:20129/readyz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+  redis:
+    image: redis:7-alpine
+    container_name: blackrouter-redis
+    profiles: ["cluster"]
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
   prometheus:
     image: prom/prometheus:latest
     container_name: blackrouter-prometheus
@@ -42,3 +61,6 @@ services:
       - ./deploy/observability/grafana/provisioning:/etc/grafana/provisioning:ro
     depends_on:
       - prometheus
+
+volumes:
+  redis-data:

@@ -9,6 +9,7 @@ const state = {
   providerCatalog: null,
   providerLimits: null,
   combos: null,
+  aliases: null,
 };
 
 const ANTIGRAVITY_MODELS = [
@@ -133,6 +134,7 @@ async function refresh() {
     providerCatalog,
     providerLimits,
     combos,
+    aliases,
   ] = await Promise.all([
     getJson("/health"),
     getJson("/version"),
@@ -144,6 +146,7 @@ async function refresh() {
     getJson("/api/setup/provider-catalog"),
     getJson("/api/provider-limits"),
     getJson("/api/setup/combos"),
+    getJson("/api/setup/aliases"),
   ]);
 
   state.health = health;
@@ -156,6 +159,7 @@ async function refresh() {
   state.providerCatalog = providerCatalog;
   state.providerLimits = providerLimits;
   state.combos = combos;
+  state.aliases = aliases;
 
   render();
 }
@@ -177,6 +181,7 @@ function render() {
     : [];
   const providerLimits = state.providerLimits || {};
   const combos = Array.isArray(state.combos?.data) ? state.combos.data : [];
+  const aliases = Array.isArray(state.aliases?.data) ? state.aliases.data : [];
   const tableCounts = storage.table_counts || {};
 
   setText("versionLabel", state.version?.version || "0.1.0");
@@ -217,6 +222,15 @@ function render() {
     savedRequireApiKey ? "Required" : "Local Mode",
     savedRequireApiKey ? "ok" : "warn",
   );
+  const healthProbe = savedSettings.healthProbe || {};
+  $("healthProbeEnabledInput").checked = healthProbe.enabled ?? true;
+  setValue("healthProbeIntervalInput", healthProbe.intervalSeconds || 30);
+  setValue("healthProbeTimeoutInput", healthProbe.timeoutSeconds || 5);
+  setValue("healthProbeThresholdInput", healthProbe.failureThreshold || 3);
+  const costGuard = savedSettings.costGuard || savedSettings.cost_guard || {};
+  $("costGuardEnabledInput").checked = costGuard.enabled ?? true;
+  setValue("costGuardDailyInput", costGuard.dailyBudgetUsd ?? "");
+  setValue("costGuardMonthlyInput", costGuard.monthlyBudgetUsd ?? "");
 
   $("telegramEnabledInput").checked = Boolean(
     savedTelegram.enabled ?? telegram.enabled,
@@ -256,11 +270,8 @@ function render() {
     })),
     "No tables",
   );
-  renderRows(
-    "apiKeysList",
-    apiKeys.map((key) => ({ name: key.name || key.id, value: key.key_masked })),
-    "No API keys",
-  );
+  renderApiKeys(apiKeys);
+  renderAliases(aliases);
   renderProviders(providers);
   renderLimits(providerLimits);
   renderRows(
@@ -274,6 +285,33 @@ function render() {
   renderComboProviderOptions(providers);
   renderComboPicker(providers);
   renderCombos(combos);
+}
+
+function renderApiKeys(keys) {
+  const root = $("apiKeysList");
+  if (!keys.length) {
+    root.innerHTML = '<div class="empty">No API keys</div>';
+    return;
+  }
+  root.innerHTML = keys.map((key) => {
+    const policy = key.policy || {};
+    const quota = [
+      policy.requests_per_day ? `${formatNumber(policy.requests_per_day)} req/day` : null,
+      policy.tokens_per_day ? `${formatNumber(policy.tokens_per_day)} tokens/day` : null,
+      policy.cost_per_month_usd != null ? `${formatUsd(policy.cost_per_month_usd)}/month` : null,
+    ].filter(Boolean).join(" · ") || "unlimited";
+    return `<div class="row"><div><strong>${escapeHtml(key.name || key.id)}</strong><div class="row-meta"><span>${escapeHtml(key.key_masked)}</span><span>${escapeHtml(key.tenant_id || "default tenant")}</span><span>${escapeHtml(quota)}</span></div></div><div class="row-actions"><button class="secondary-button" data-key-edit="${escapeHtml(key.id)}" type="button">Edit</button><button class="secondary-button" data-key-rotate="${escapeHtml(key.id)}" type="button">Rotate</button></div></div>`;
+  }).join("");
+}
+
+function renderAliases(aliases) {
+  setBadge("aliasesBadge", `${aliases.length} aliases`, aliases.length ? "ok" : "muted");
+  const root = $("aliasesList");
+  if (!aliases.length) {
+    root.innerHTML = '<div class="empty">No model aliases</div>';
+    return;
+  }
+  root.innerHTML = aliases.map((alias) => `<div class="row"><div><strong>${escapeHtml(alias.alias)}</strong><div class="row-meta"><span>${escapeHtml(alias.target)}</span></div></div><button class="secondary-button" data-alias-delete="${escapeHtml(alias.id)}" type="button">Delete</button></div>`).join("");
 }
 
 function renderLimits(payload) {
@@ -807,14 +845,84 @@ $("saveTelegramButton").addEventListener("click", async () => {
 
 $("apiKeyForm").addEventListener("submit", async (event) => {
   event.preventDefault();
+  const policy = {
+    requests_per_day: numberOrNull($("apiKeyRequestsInput").value),
+    tokens_per_day: numberOrNull($("apiKeyTokensInput").value),
+    cost_per_month_usd: numberOrNull($("apiKeyCostInput").value),
+    provider_allowlist: csvValues($("apiKeyProvidersInput").value),
+    model_allowlist: csvValues($("apiKeyModelsInput").value),
+  };
+  const editId = $("apiKeyEditIdInput").value;
+  if (editId) {
+    await sendJson(`/api/setup/api-keys/${encodeURIComponent(editId)}`, "PUT", {
+      tenant_id: $("apiKeyTenantInput").value.trim() || null,
+      policy,
+    });
+    resetApiKeyForm();
+    await refresh();
+    return;
+  }
   const created = await sendJson("/api/setup/api-keys", "POST", {
     name: $("apiKeyNameInput").value,
     machine_id: $("apiKeyMachineInput").value,
+    tenant_id: $("apiKeyTenantInput").value.trim() || null,
+    policy,
   });
-  $("apiKeyNameInput").value = "";
-  $("apiKeyMachineInput").value = "";
+  resetApiKeyForm();
   showNewApiKey(created.key);
   await refresh();
+});
+
+$("apiKeyCancelEditButton").addEventListener("click", resetApiKeyForm);
+
+$("apiKeysList").addEventListener("click", async (event) => {
+  const editId = event.target.closest("[data-key-edit]")?.dataset.keyEdit;
+  if (editId) {
+    const key = state.apiKeys?.data?.find((item) => item.id === editId);
+    if (!key) return;
+    $("apiKeyEditIdInput").value = key.id;
+    setValue("apiKeyNameInput", key.name || "");
+    setValue("apiKeyMachineInput", key.machine_id || "");
+    setValue("apiKeyTenantInput", key.tenant_id || "");
+    setValue("apiKeyRequestsInput", key.policy?.requests_per_day ?? "");
+    setValue("apiKeyTokensInput", key.policy?.tokens_per_day ?? "");
+    setValue("apiKeyCostInput", key.policy?.cost_per_month_usd ?? "");
+    setValue("apiKeyProvidersInput", (key.policy?.provider_allowlist || []).join(", "));
+    setValue("apiKeyModelsInput", (key.policy?.model_allowlist || []).join(", "));
+    $("apiKeyNameInput").disabled = true;
+    $("apiKeyMachineInput").disabled = true;
+    setText("apiKeySubmitLabel", "Save Policy");
+    $("apiKeyCancelEditButton").classList.remove("hidden");
+    return;
+  }
+  const rotateId = event.target.closest("[data-key-rotate]")?.dataset.keyRotate;
+  if (rotateId) {
+    const created = await sendJson(`/api/setup/api-keys/${encodeURIComponent(rotateId)}/rotate`, "POST");
+    showNewApiKey(created.key);
+    await refresh();
+  }
+});
+
+$("aliasForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await sendJson("/api/setup/aliases", "POST", {
+    alias: $("aliasNameInput").value.trim(),
+    target: $("aliasTargetInput").value.trim(),
+  });
+  $("aliasForm").reset();
+  await refresh();
+});
+
+$("aliasesList").addEventListener("click", async (event) => {
+  const id = event.target.closest("[data-alias-delete]")?.dataset.aliasDelete;
+  if (!id) return;
+  await sendJson(`/api/setup/aliases/${encodeURIComponent(id)}`, "DELETE");
+  await refresh();
+});
+
+$("costGuardForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await saveConfig();
 });
 
 $("providerForm").addEventListener("submit", async (event) => {
@@ -1421,10 +1529,30 @@ async function saveConfig() {
     telegram_link_code_ttl_seconds: Number($("telegramTtlInput").value || 300),
     telegram_use_webhook: $("telegramWebhookInput").checked,
     telegram_webhook_url: $("telegramWebhookUrlInput").value.trim() || null,
+    health_probe_enabled: $("healthProbeEnabledInput").checked,
+    health_probe_interval_seconds: Number($("healthProbeIntervalInput").value || 30),
+    health_probe_timeout_seconds: Number($("healthProbeTimeoutInput").value || 5),
+    health_probe_failure_threshold: Number($("healthProbeThresholdInput").value || 3),
+    cost_guard_enabled: $("costGuardEnabledInput").checked,
+    cost_guard_daily_budget_usd: numberOrNull($("costGuardDailyInput").value),
+    cost_guard_monthly_budget_usd: numberOrNull($("costGuardMonthlyInput").value),
   };
   await sendJson("/api/setup/config", "PUT", payload);
   setBadge("configSaveBadge", "Saved", "ok");
   await refresh();
+}
+
+function csvValues(value) {
+  return value.split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+function resetApiKeyForm() {
+  $("apiKeyForm").reset();
+  $("apiKeyEditIdInput").value = "";
+  $("apiKeyNameInput").disabled = false;
+  $("apiKeyMachineInput").disabled = false;
+  setText("apiKeySubmitLabel", "Create API Key");
+  $("apiKeyCancelEditButton").classList.add("hidden");
 }
 
 function parseAdminIds(value) {

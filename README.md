@@ -8,6 +8,9 @@ Current implementation status:
 - `blackrouter` binary loads env config, initializes a 9Router-compatible SQLite schema, and starts an Axum HTTP server.
 - Minimal setup UI is available at `/setup`.
 - Setup UI can write saved config, provider connections, and API keys to the BlackRouter SQLite DB.
+- API keys support tenant IDs, daily request/token quotas, monthly cost quotas, and provider/model allowlists.
+- Runtime settings reload immediately and retain version history; providers are probed proactively in the background.
+- Redis can provide shared request limiting, RTK snapshots, and response cache for multi-replica deployments.
 - Provider setup can create, edit, enable/disable, delete, run a basic connection check, and fetch supported model IDs into provider `data.models`.
 - Cline Router and Command Code use built-in model catalogs when their live `/models` endpoint is unavailable.
 - Provider setup includes presets derived from `9router-custom`, including required `commandcode` and `cline` router entries.
@@ -62,6 +65,13 @@ Build and run with Docker Compose:
 docker compose up --build
 ```
 
+For the optional Redis service, enable the `cluster` profile and set
+`BLACKROUTER_REDIS_URL=redis://redis:6379/`:
+
+```bash
+docker compose --profile cluster up --build
+```
+
 The compose setup reads `.env`, binds `BLACKROUTER_PORT`, and mounts `./data` into the container as `/data`. Inside Docker, these values are forced to container-safe paths:
 
 ```env
@@ -73,6 +83,7 @@ With the current `.env`, open:
 
 ```bash
 curl http://localhost:20129/health
+curl http://localhost:20129/readyz
 ```
 
 For Zed/OpenAI-compatible clients, use:
@@ -93,4 +104,6 @@ curl http://localhost:20129/v1/models
 
 ## Notes
 
-The setup database is independent from `9router-custom` by default. The chat completions route resolves direct `provider/model` IDs and configured combo names, then proxies OpenAI-compatible providers with combo fallback. Provider-specific translators, RTK, and the responses/messages routes are still pending.
+The setup database is independent from `9router-custom` by default. See
+[`docs/OPERATIONS.md`](docs/OPERATIONS.md) for probes, tenant policy, hot reload,
+Redis, backup, and incident procedures.

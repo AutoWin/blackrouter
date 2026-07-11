@@ -16,10 +16,10 @@ use blackrouter_providers::{
 };
 use blackrouter_rtk::{LoadBalanceStrategy, RequestKey, Rtk};
 use blackrouter_storage::{
-    ApiKeyRecord, CachedProviderModels, ComboRecord, CreatedApiKey, DailyUsage, ModelAliasRecord,
-    ModelListItem, NewApiKey, NewCombo, NewModelAlias, NewProviderConnection,
-    ProviderConnectionRecord, RawProviderConnection, RequestDetailEntry, Storage, StorageError,
-    StorageStatus, UsageEntry, UsageRow,
+    ApiKeyPolicy, ApiKeyRecord, CachedProviderModels, ComboRecord, CreatedApiKey, DailyUsage,
+    ModelAliasRecord, ModelListItem, NewApiKey, NewCombo, NewModelAlias, NewProviderConnection,
+    ProviderConnectionRecord, RawProviderConnection, RequestDetailEntry, SettingsVersion, Storage,
+    StorageError, StorageStatus, UsageEntry, UsageRow,
 };
 use blackrouter_telegram::{
     TelegramBot, TelegramBotConfig, TelegramRuntime, Update as TelegramUpdate,
@@ -85,7 +85,10 @@ async fn request_id_middleware(request: Request, next: Next) -> Response {
 
 // Re-export key types so `blackrouter_bin` (and existing handler code) can
 // reference them without qualifying through sub-modules.
-pub use auth::{authorize_v1, extract_api_key, storage_error_to_api, ApiErrorResponse};
+pub use auth::{
+    authorize_v1, enforce_route_scope, extract_api_key, reserve_request_quota,
+    storage_error_to_api, ApiErrorResponse,
+};
 pub use metrics::Metrics;
 pub use state::AppState;
 
@@ -122,7 +125,13 @@ pub fn build_router(state: AppState) -> Router {
     let control_routes = Router::new()
         .route("/runtime/status", get(runtime_status))
         .route("/setup/config", get(setup_config).put(save_setup_config))
+        .route("/setup/config/versions", get(list_settings_versions))
+        .route(
+            "/setup/config/versions/{version}/restore",
+            post(restore_settings_version),
+        )
         .route("/setup/api-keys", get(list_api_keys).post(create_api_key))
+        .route("/setup/api-keys/{id}", put(update_api_key_policy))
         .route("/setup/api-keys/{id}/rotate", post(rotate_api_key))
         .route(
             "/setup/providers",
@@ -157,6 +166,7 @@ pub fn build_router(state: AppState) -> Router {
             get(get_lb_strategy).put(set_lb_strategy),
         )
         .route("/provider-limits", get(provider_limits))
+        .route("/provider-health", get(provider_health))
         .route("/rtk/metrics", get(rtk_metrics))
         .route("/rtk/status/{provider}/{model}", get(rtk_status))
         .route("/usage", get(usage_stats))
@@ -358,7 +368,40 @@ async fn readyz(
         detail: format!("{active_providers} active"),
     });
 
-    // 3. RTK runtime initialized (uptime > 0 means the tracker is alive).
+    if let Some(shared) = &state.shared_state {
+        let redis_ok = shared.ping().await;
+        if !redis_ok {
+            ready = false;
+        }
+        checks.push(ReadinessCheck {
+            name: "redis".to_string(),
+            ok: redis_ok,
+            detail: if redis_ok { "connected" } else { "unavailable" }.to_string(),
+        });
+    }
+
+    // 3. Proactive provider probe (after its first run). Before the first run,
+    // provider presence remains the readiness signal to avoid a startup race.
+    let probe = state.provider_probe_summary();
+    let probe_enabled = state.runtime_settings().health_probe_enabled;
+    let probe_ok = !probe_enabled || probe.last_run_unix.is_none() || probe.healthy > 0;
+    if !probe_ok {
+        ready = false;
+    }
+    checks.push(ReadinessCheck {
+        name: "provider_probe".to_string(),
+        ok: probe_ok,
+        detail: if probe_enabled {
+            format!(
+                "{} healthy, {} unhealthy, {} pending",
+                probe.healthy, probe.unhealthy, probe.pending
+            )
+        } else {
+            "disabled".to_string()
+        },
+    });
+
+    // 4. RTK runtime initialized (uptime > 0 means the tracker is alive).
     let rtk_ok = state.rtk.uptime().as_secs() > 0;
     if !rtk_ok {
         ready = false;
@@ -390,6 +433,10 @@ async fn version() -> Json<BuildInfo> {
 async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoResponse {
     let body = state.metrics.encode();
     ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body)
+}
+
+async fn provider_health(State(state): State<AppState>) -> Json<state::ProviderProbeSummary> {
+    Json(state.provider_probe_summary())
 }
 
 #[derive(Serialize)]
@@ -431,6 +478,20 @@ struct SetupConfigPayload {
     telegram_link_code_ttl_seconds: u64,
     telegram_use_webhook: bool,
     telegram_webhook_url: Option<String>,
+    #[serde(default)]
+    health_probe_enabled: Option<bool>,
+    #[serde(default)]
+    health_probe_interval_seconds: Option<u64>,
+    #[serde(default)]
+    health_probe_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    health_probe_failure_threshold: Option<u32>,
+    #[serde(default)]
+    cost_guard_enabled: Option<bool>,
+    #[serde(default)]
+    cost_guard_daily_budget_usd: Option<Value>,
+    #[serde(default)]
+    cost_guard_monthly_budget_usd: Option<Value>,
 }
 
 async fn setup_config(
@@ -447,22 +508,96 @@ async fn save_setup_config(
     State(state): State<AppState>,
     Json(payload): Json<SetupConfigPayload>,
 ) -> Result<Json<SetupConfigResponse>, ApiErrorResponse> {
-    let settings = json!({
-        "requireApiKey": payload.require_api_key,
-        "telegram": {
+    let mut settings = state.storage.settings_json().unwrap_or_else(|_| json!({}));
+    let object = settings
+        .as_object_mut()
+        .ok_or_else(|| ApiErrorResponse::bad_request("saved settings must be a JSON object"))?;
+    object.insert("requireApiKey".to_string(), json!(payload.require_api_key));
+    object.insert(
+        "telegram".to_string(),
+        json!({
             "enabled": payload.telegram_enabled,
             "adminIds": payload.telegram_admin_ids,
             "linkCodeTtlSeconds": payload.telegram_link_code_ttl_seconds,
             "useWebhook": payload.telegram_use_webhook,
             "webhookUrl": payload.telegram_webhook_url,
-        }
-    });
+        }),
+    );
+    let current = state.runtime_settings();
+    object.insert(
+        "healthProbe".to_string(),
+        json!({
+            "enabled": payload.health_probe_enabled.unwrap_or(current.health_probe_enabled),
+            "intervalSeconds": payload.health_probe_interval_seconds.unwrap_or(current.health_probe_interval_seconds),
+            "timeoutSeconds": payload.health_probe_timeout_seconds.unwrap_or(current.health_probe_timeout_seconds),
+            "failureThreshold": payload.health_probe_failure_threshold.unwrap_or(current.health_probe_failure_threshold),
+        }),
+    );
+    let current_guard = object
+        .get("costGuard")
+        .or_else(|| object.get("cost_guard"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let daily_budget = budget_update(
+        payload.cost_guard_daily_budget_usd,
+        current_guard.get("dailyBudgetUsd").and_then(Value::as_f64),
+    );
+    let monthly_budget = budget_update(
+        payload.cost_guard_monthly_budget_usd,
+        current_guard
+            .get("monthlyBudgetUsd")
+            .and_then(Value::as_f64),
+    );
+    object.insert(
+        "costGuard".to_string(),
+        json!({
+            "enabled": payload.cost_guard_enabled.unwrap_or_else(|| current_guard.get("enabled").and_then(Value::as_bool).unwrap_or(true)),
+            "dailyBudgetUsd": daily_budget,
+            "monthlyBudgetUsd": monthly_budget,
+        }),
+    );
 
     let settings = state
         .storage
         .save_settings_json(&settings)
         .map_err(|error| ApiErrorResponse::internal(format!("settings save failed: {error}")))?;
+    state.reload_runtime_settings();
 
+    Ok(Json(SetupConfigResponse { settings }))
+}
+
+fn budget_update(input: Option<Value>, fallback: Option<f64>) -> Option<f64> {
+    match input {
+        None => fallback,
+        Some(Value::Null) => None,
+        Some(value) => value.as_f64(),
+    }
+}
+
+#[derive(Serialize)]
+struct SettingsVersionsResponse {
+    data: Vec<SettingsVersion>,
+}
+
+async fn list_settings_versions(
+    State(state): State<AppState>,
+) -> Result<Json<SettingsVersionsResponse>, ApiErrorResponse> {
+    let data = state
+        .storage
+        .list_settings_versions(50)
+        .map_err(|error| ApiErrorResponse::internal(format!("settings history failed: {error}")))?;
+    Ok(Json(SettingsVersionsResponse { data }))
+}
+
+async fn restore_settings_version(
+    State(state): State<AppState>,
+    Path(version): Path<u64>,
+) -> Result<Json<SetupConfigResponse>, ApiErrorResponse> {
+    let settings = state
+        .storage
+        .restore_settings_version(version)
+        .map_err(|error| storage_error_to_api(error, "settings restore failed"))?;
+    state.reload_runtime_settings();
     Ok(Json(SetupConfigResponse { settings }))
 }
 
@@ -501,6 +636,25 @@ async fn rotate_api_key(
         .rotate_api_key(&id)
         .map_err(|error| ApiErrorResponse::not_found(format!("API key not found: {error}")))?;
     Ok(Json(rotated))
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateApiKeyPolicyPayload {
+    tenant_id: Option<String>,
+    #[serde(default)]
+    policy: ApiKeyPolicy,
+}
+
+async fn update_api_key_policy(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<UpdateApiKeyPolicyPayload>,
+) -> Result<Json<ApiKeyRecord>, ApiErrorResponse> {
+    let record = state
+        .storage
+        .update_api_key_policy(&id, payload.tenant_id, payload.policy)
+        .map_err(|error| storage_error_to_api(error, "API key update failed"))?;
+    Ok(Json(record))
 }
 
 #[derive(Serialize)]
@@ -1161,6 +1315,13 @@ fn first_provider_model(data: &Value) -> Option<String> {
 }
 
 async fn check_provider_connection(provider: RawProviderConnection) -> ProviderTestResponse {
+    check_provider_connection_with_timeout(provider, 10).await
+}
+
+async fn check_provider_connection_with_timeout(
+    provider: RawProviderConnection,
+    timeout_seconds: u64,
+) -> ProviderTestResponse {
     let base_url = provider
         .data
         .get("baseUrl")
@@ -1207,7 +1368,7 @@ async fn check_provider_connection(provider: RawProviderConnection) -> ProviderT
     }
 
     let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(timeout_seconds.max(1)))
         .redirect(reqwest::redirect::Policy::limited(3))
         .build()
     {
@@ -1277,6 +1438,100 @@ async fn check_provider_connection(provider: RawProviderConnection) -> ProviderT
             },
         }
     }
+}
+
+pub(crate) fn spawn_provider_health_prober(state: AppState) {
+    tokio::spawn(async move {
+        let mut consecutive_failures = std::collections::HashMap::<String, u32>::new();
+        loop {
+            let settings = state.runtime_settings();
+            if settings.health_probe_enabled {
+                let providers = match state.storage.list_provider_connections() {
+                    Ok(providers) => providers,
+                    Err(error) => {
+                        tracing::warn!(%error, "provider health probe listing failed");
+                        tokio::time::sleep(Duration::from_secs(
+                            settings.health_probe_interval_seconds,
+                        ))
+                        .await;
+                        continue;
+                    }
+                };
+                let active: Vec<_> = providers
+                    .into_iter()
+                    .filter(|provider| provider.is_active)
+                    .collect();
+                let mut summary = state::ProviderProbeSummary {
+                    last_run_unix: Some(unix_timestamp()),
+                    pending: active.len(),
+                    ..Default::default()
+                };
+                for provider_record in active {
+                    let provider = match state
+                        .storage
+                        .get_provider_connection_raw(&provider_record.id)
+                    {
+                        Ok(provider) => provider,
+                        Err(error) => {
+                            tracing::warn!(provider_id = %provider_record.id, %error, "provider health probe load failed");
+                            summary.pending = summary.pending.saturating_sub(1);
+                            summary.unhealthy += 1;
+                            continue;
+                        }
+                    };
+                    let result = check_provider_connection_with_timeout(
+                        provider.clone(),
+                        settings.health_probe_timeout_seconds,
+                    )
+                    .await;
+                    summary.pending = summary.pending.saturating_sub(1);
+                    if result.ok {
+                        consecutive_failures.remove(&provider.id);
+                        summary.healthy += 1;
+                        let _ = state.storage.set_provider_runtime_status(
+                            &provider.id,
+                            "healthy",
+                            None,
+                            provider.expires_at,
+                        );
+                    } else {
+                        let failures = consecutive_failures.entry(provider.id.clone()).or_default();
+                        *failures += 1;
+                        summary.unhealthy += 1;
+                        let threshold_reached =
+                            *failures >= settings.health_probe_failure_threshold;
+                        let status = if threshold_reached {
+                            "unhealthy"
+                        } else {
+                            "degraded"
+                        };
+                        let cooldown = threshold_reached.then(|| {
+                            (unix_timestamp() + settings.health_probe_interval_seconds * 2)
+                                .to_string()
+                        });
+                        let _ = state.storage.set_provider_runtime_status(
+                            &provider.id,
+                            status,
+                            cooldown,
+                            provider.expires_at,
+                        );
+                        tracing::warn!(
+                            provider = %provider.provider,
+                            provider_id = %provider.id,
+                            failures = *failures,
+                            message = %result.message,
+                            "provider health probe failed"
+                        );
+                    }
+                }
+                state.set_provider_probe_summary(summary);
+            }
+            tokio::time::sleep(Duration::from_secs(
+                state.runtime_settings().health_probe_interval_seconds,
+            ))
+            .await;
+        }
+    });
 }
 
 fn provider_check_uses_post(format: &str) -> bool {
@@ -1958,12 +2213,20 @@ async fn v1_models(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<ModelListResponse>, ApiErrorResponse> {
-    authorize_v1(&state, &headers)?;
+    let auth = authorize_v1(&state, &headers)?;
 
-    let data = state
+    let mut data = state
         .storage
         .list_model_shell_items()
         .map_err(|error| ApiErrorResponse::internal(format!("model listing failed: {error}")))?;
+    if !auth.policy.provider_allowlist.is_empty() || !auth.policy.model_allowlist.is_empty() {
+        data.retain(|item| {
+            let mut value = json!({ "model": item.id });
+            normalize_model_request_body(&state.storage, &mut value)
+                .and_then(|route| enforce_route_scope(&auth, &route))
+                .is_ok()
+        });
+    }
 
     Ok(Json(ModelListResponse {
         object: "list",
@@ -2027,7 +2290,15 @@ fn merge_session_messages(stored: &[Value], incoming: &[Value]) -> Vec<Value> {
         .filter(|m| !is_system_message(m))
         .cloned()
         .collect();
-    let mut out = incoming_system;
+    let mut out = if incoming_system.is_empty() {
+        stored
+            .iter()
+            .filter(|message| is_system_message(message))
+            .cloned()
+            .collect()
+    } else {
+        incoming_system
+    };
     out.extend(stored_non_system);
     out.extend(incoming_non_system);
     out
@@ -2325,9 +2596,10 @@ async fn chat_completions_shell(
     Extension(req_id): Extension<RequestId>,
     Json(mut body): Json<Value>,
 ) -> Result<Response, ApiErrorResponse> {
-    authorize_v1(&state, &headers)?;
-    let api_key = extract_api_key(&headers);
+    let auth = authorize_v1(&state, &headers)?;
     let route = normalize_model_request_body(&state.storage, &mut body)?;
+    enforce_route_scope(&auth, &route)?;
+    reserve_request_quota(&state, &auth)?;
 
     // ── Phase 8: conversation memory ──
     // When `x-session-id` is supplied, assemble the full history from stored
@@ -2343,7 +2615,7 @@ async fn chat_completions_shell(
         .unwrap_or(false);
 
     let response =
-        proxy_chat_completions(&state, effective_body, route, api_key, &req_id.0).await?;
+        proxy_chat_completions(&state, effective_body, route, auth.key_id, &req_id.0).await?;
 
     if let Some(session_id) = session_id {
         Ok(wrap_session_response(
@@ -2805,6 +3077,7 @@ fn cost_guard_config(storage: &Storage) -> Result<CostGuardConfig, StorageError>
 #[allow(clippy::too_many_arguments)]
 fn record_usage_async(
     usage_tx: &tokio::sync::mpsc::UnboundedSender<UsageEntry>,
+    api_key_id: Option<&str>,
     connection_id: Option<&str>,
     provider: &str,
     model: &str,
@@ -2820,7 +3093,7 @@ fn record_usage_async(
         provider: provider.to_string(),
         model: model.to_string(),
         connection_id: connection_id.map(str::to_string),
-        api_key: None,
+        api_key: api_key_id.map(str::to_string),
         endpoint: endpoint.to_string(),
         prompt_tokens,
         completion_tokens,
@@ -3450,7 +3723,7 @@ async fn proxy_single_chat_completion(
     // ── Response Cache check (Phase 4.2) ──────────────────────────────
     if !is_stream {
         if let Some(cache_key) = generate_cache_key(model, body) {
-            if let Some((cached_body, content_type)) = state.response_cache.get(&cache_key).await {
+            if let Some((cached_body, content_type)) = state.cache_get(&cache_key).await {
                 tracing::debug!("cache hit for model {}/{}", model.provider, model.model);
                 state
                     .metrics
@@ -3787,6 +4060,30 @@ async fn proxy_with_specific_provider(
         api_key: api_key.map(|k| k.to_string()),
     };
 
+    let distributed_key = state.shared_state.as_ref().map(|_| {
+        format!(
+            "{}:{}:{}",
+            request_key.provider,
+            request_key.model,
+            request_key.api_key.as_deref().unwrap_or("anonymous")
+        )
+    });
+    let _shared_permit =
+        if let (Some(shared), Some(key)) = (&state.shared_state, distributed_key.as_deref()) {
+            match shared.acquire_rate_permit(key, 60, 100_000, 10).await {
+                Ok(permit) => permit,
+                Err(()) => {
+                    return Err(ApiErrorResponse::new(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "Shared rate limit exceeded",
+                        "rate_limit_error",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
     // Check rate limit (with request queuing — Phase 4.3)
     let mut rate_limit_retries = 0u32;
     loop {
@@ -4031,6 +4328,11 @@ async fn proxy_with_specific_provider(
         } else {
             parse_token_usage(&bytes, target_format)
         };
+    if let (Some(shared), Some(key)) = (&state.shared_state, distributed_key.as_deref()) {
+        shared
+            .record_tokens(key, prompt_tokens.saturating_add(completion_tokens))
+            .await;
+    }
 
     // Cost calculation (Phase 3.1)
     let cost = calculate_cost(
@@ -4077,6 +4379,7 @@ async fn proxy_with_specific_provider(
     // Record to usage storage (async, non-blocking, batched)
     record_usage_async(
         &state.usage_tx,
+        request_key.api_key.as_deref(),
         Some(&provider.id),
         &model.provider,
         &model.model,
@@ -4147,8 +4450,7 @@ async fn proxy_with_specific_provider(
     if !is_stream {
         if let Some(cache_key) = generate_cache_key(model, body) {
             state
-                .response_cache
-                .put(cache_key, response_body.clone(), content_type_for_cache)
+                .cache_put(cache_key, response_body.clone(), content_type_for_cache)
                 .await;
         }
     }
@@ -4402,7 +4704,7 @@ async fn responses_proxy(
     Extension(req_id): Extension<RequestId>,
     Json(body): Json<Value>,
 ) -> Result<Response, ApiErrorResponse> {
-    authorize_v1(&state, &headers)?;
+    let auth = authorize_v1(&state, &headers)?;
 
     let model = body
         .get("model")
@@ -4415,6 +4717,8 @@ async fn responses_proxy(
     })?;
 
     let route = normalize_model_request_body(&state.storage, &mut chat_body)?;
+    enforce_route_scope(&auth, &route)?;
+    reserve_request_quota(&state, &auth)?;
     let normalized_model = chat_body
         .get("model")
         .and_then(Value::as_str)
@@ -4422,14 +4726,7 @@ async fn responses_proxy(
         .to_string();
 
     // Proxy through chat completions (reuse all streaming/translation/pooling logic)
-    let response = proxy_chat_completions(
-        &state,
-        chat_body,
-        route,
-        extract_api_key(&headers),
-        &req_id.0,
-    )
-    .await?;
+    let response = proxy_chat_completions(&state, chat_body, route, auth.key_id, &req_id.0).await?;
 
     // For non-streaming responses, convert chat completion → Responses API format
     let is_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
@@ -4473,10 +4770,12 @@ async fn messages_proxy(
     Extension(req_id): Extension<RequestId>,
     Json(mut body): Json<Value>,
 ) -> Result<Response, ApiErrorResponse> {
-    authorize_v1(&state, &headers)?;
-    let api_key = extract_api_key(&headers);
+    let auth = authorize_v1(&state, &headers)?;
+    let api_key = auth.key_id.clone();
 
     let route = normalize_model_request_body(&state.storage, &mut body)?;
+    enforce_route_scope(&auth, &route)?;
+    reserve_request_quota(&state, &auth)?;
 
     // Check if target provider is Claude — if so, passthrough directly
     let models = match &route {
@@ -4633,6 +4932,7 @@ async fn messages_proxy(
         // Record to usage storage (async, non-blocking, batched)
         record_usage_async(
             &state.usage_tx,
+            api_key.as_deref(),
             Some(&provider.id),
             &first_model.provider,
             &first_model.model,
@@ -4705,16 +5005,16 @@ mod tests {
     use super::{
         builtin_provider_models, classify_provider_post_response, codex_stream_to_chat_response,
         commandcode_stream_error, commandcode_upstream_model, derive_models_url, extract_api_key,
-        extract_codex_model_ids, extract_model_ids, extract_session_id, is_retryable_error,
-        merge_session_messages, provider_check_post_body, provider_check_uses_post,
-        provider_uses_codex_model_catalog, request_modalities, sanitize_codex_responses_body,
-        should_cooldown_provider,
+        extract_assistant_message, extract_codex_model_ids, extract_model_ids, extract_session_id,
+        is_retryable_error, merge_session_messages, provider_check_post_body,
+        provider_check_uses_post, provider_uses_codex_model_catalog, request_modalities,
+        sanitize_codex_responses_body, should_cooldown_provider,
     };
     use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
     use base64::Engine;
     use blackrouter_core::ModelRef;
     use blackrouter_storage::RawProviderConnection;
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     #[test]
     fn extracts_bearer_api_key() {
