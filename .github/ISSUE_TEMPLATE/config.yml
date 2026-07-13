@@ -1,0 +1,12 @@
+name: 📦 Dependency update
+about: Automated or manual dependency bump
+title: "deps: "
+labels: dependencies
+assignees: ''
+---
+
+## Summary
+Which dependency and version changed, and why.
+
+## Risk / testing notes
+Any breaking changes or areas to watch.

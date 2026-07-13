@@ -1,109 +1,120 @@
 # BlackRouter
 
-Rust runtime scaffold for the 9Router-to-BlackRouter migration.
+[![CI](https://github.com/AutoWin/blackrouter/actions/workflows/ci.yml/badge.svg)](https://github.com/AutoWin/blackrouter/actions)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Docker](https://img.shields.io/badge/docker-available-0db7ed.svg)](docker-compose.yml)
 
-Current implementation status:
+**BlackRouter** is a self-hosted, OpenAI-compatible **AI gateway / LLM router**
+written in Rust. One endpoint and one API key to access many AI providers, with
+smart routing, failover, cost control, rate limiting, and full observability.
 
-- Rust workspace with separate crates for API, binary, config, common utilities, core routing, provider boundaries, RTK, translators, SQLite storage, and Telegram command parsing.
-- `blackrouter` binary loads env config, initializes a 9Router-compatible SQLite schema, and starts an Axum HTTP server.
-- Minimal setup UI is available at `/setup`.
-- Setup UI can write saved config, provider connections, and API keys to the BlackRouter SQLite DB.
-- API keys support tenant IDs, daily request/token quotas, monthly cost quotas, and provider/model allowlists.
-- Runtime settings reload immediately and retain version history; providers are probed proactively in the background.
-- Redis can provide shared request limiting, RTK snapshots, and response cache for multi-replica deployments.
-- Provider setup can create, edit, enable/disable, delete, run a basic connection check, and fetch supported model IDs into provider `data.models`.
-- Cline Router and Command Code use built-in model catalogs when their live `/models` endpoint is unavailable.
-- Provider setup includes presets derived from `9router-custom`, including required `commandcode` and `cline` router entries.
-- Combo setup can create, edit, delete, list, and resolve fallback model combos stored in the BlackRouter SQLite DB.
-- Implemented routes:
-  - `GET /` redirecting to `/setup`
-  - `GET /setup`
-  - `GET /setup.css`
-  - `GET /setup.js`
-  - `GET /health`
-  - `GET /version`
-  - `GET /api/runtime/status`
-  - `GET|PUT /api/setup/config`
-  - `GET|POST /api/setup/api-keys`
-  - `GET|POST /api/setup/providers`
-  - `GET|PUT|DELETE /api/setup/providers/{id}`
-  - `POST /api/setup/providers/{id}/toggle`
-  - `POST /api/setup/providers/{id}/test`
-  - `POST /api/setup/providers/{id}/models`
-  - `GET /api/setup/provider-catalog`
-  - `GET|POST /api/setup/combos`
-  - `GET|PUT|DELETE /api/setup/combos/{id}`
-  - `GET /v1/models`
-  - `GET /v1beta/models`
-  - `POST /v1/chat/completions` with minimal OpenAI-compatible provider proxy and combo fallback
-  - `POST /v1/responses` as a compatibility shell
-  - `POST /v1/messages` as a compatibility shell
-- Telegram settings are represented in config; bot runtime is intentionally left for the later Telegram phase.
-- Telegram command parser supports the read-only/control command vocabulary from the migration plan; network bot runtime is not wired yet.
+> Bring your own provider keys. BlackRouter never stores provider credentials
+> anywhere except your own database. You stay in control of your data and spend.
 
-## Run
+## Features
 
-Install Rust, then:
+- **Unified OpenAI-compatible API** — point any OpenAI-compatible client
+  (Zed, Continue, OpenWebUI, LiteLLM, the OpenAI SDK, …) at `/v1` and route to
+  any backend.
+- **Many providers** — OpenAI / Codex, Google Gemini, Anthropic Claude,
+  GitHub Copilot, Antigravity, and more, configured through the setup UI.
+- **OAuth login** — connect provider accounts (Google, Antigravity, OpenAI/Codex,
+  GitHub) directly from the browser without copying tokens manually. Callbacks
+  work in any deployment (local, LAN, Docker, or behind a reverse proxy) via a
+  same-origin `/oauth/callback` relay.
+- **Combos & fallback** — compose fallback model chains (e.g. `gpt-4o` →
+  `claude-*` → `gemini-*`) with automatic failover.
+- **Aliases** — friendly model aliases resolved at request time.
+- **API keys & quotas** — issue gateway API keys with per-key tenant IDs, daily
+  request/token quotas, monthly cost quotas, and provider/model allowlists.
+- **Cost guard & rate limiting** — cap spend and requests; optional shared
+  limiting across replicas via Redis.
+- **Observability** — Prometheus metrics + Grafana dashboards
+  (see `deploy/observability`).
+- **Multi-replica** — Redis-backed shared state/cache for horizontally scaled
+  deployments.
+- **Telegram bot** — link accounts and receive notifications (optional).
+- **9Router-compatible** — reuses the 9Router SQLite schema and provider presets
+  for an easy migration path.
+
+## Quick start
+
+### Docker (recommended)
+
+```bash
+cp .env.example .env        # then edit at least BLACKROUTER_BASE_URL
+docker compose up --build
+```
+
+Open <http://localhost:20129/setup> and add your provider connections.
+
+### From source
 
 ```bash
 cargo run -p blackrouter-bin
+# then open http://localhost:20129/setup
 ```
-
-The local `.env` currently uses port `20129` and stores data under `/Users/ccm/Documents/blackrouter/data`.
 
 To point at an existing 9Router data directory:
 
 ```bash
-BLACKROUTER_DATA_DIR=/Users/ccm/.9router cargo run -p blackrouter-bin
+BLACKROUTER_DATA_DIR=~/.9router cargo run -p blackrouter-bin
 ```
 
-## Docker
+## Configuration
 
-Build and run with Docker Compose:
+All configuration is via environment variables (see `.env.example`):
+
+| Variable | Purpose |
+|---|---|
+| `BLACKROUTER_HOST` / `BLACKROUTER_PORT` | Listen address |
+| `BLACKROUTER_BASE_URL` | Public base URL (used for OAuth callbacks if not auto-detected) |
+| `BLACKROUTER_DATA_DIR` / `BLACKROUTER_DATABASE_URL` | Storage |
+| `BLACKROUTER_REDIS_URL` | Shared state for multi-replica (optional) |
+| `BLACKROUTER_REQUIRE_API_KEY` | Require gateway API keys |
+| `BLACKROUTER_CONTROL_API_ENABLED` / `BLACKROUTER_CONTROL_TOKEN` | Protect the control plane |
+| `OAUTH_*_CLIENT_ID` / `OAUTH_*_CLIENT_SECRET` | Provider OAuth apps |
+
+### OAuth redirect URIs
+
+Register these with your provider's OAuth console:
+
+- `https://<your-host>/oauth/callback` — Google, Antigravity (recommended, single URI)
+- `https://<your-host>/api/oauth/{provider}/callback` — legacy per-provider URIs still work
+- `http://localhost:1455/auth/callback` — OpenAI/Codex loopback (or use the manual "paste code" fallback when self-hosting remotely)
+
+## Architecture
+
+Rust workspace (axum HTTP server):
+
+- `blackrouter-api` — HTTP API, routing, OAuth, providers, RTK, translators
+- `blackrouter-bin` — binary entrypoint
+- `blackrouter-config` / `blackrouter-common` / `blackrouter-core` — support crates
+- `blackrouter-cli` — CLI helpers
+
+Storage is SQLite (9Router-compatible schema). Redis is optional.
+
+## Development
 
 ```bash
-docker compose up --build
+cargo fmt --all
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-targets
+cargo build --workspace --release
 ```
 
-For the optional Redis service, enable the `cluster` profile and set
-`BLACKROUTER_REDIS_URL=redis://redis:6379/`:
+CI runs formatting, clippy, tests, and a release build on every push/PR.
 
-```bash
-docker compose --profile cluster up --build
-```
+## Contributing
 
-The compose setup reads `.env`, binds `BLACKROUTER_PORT`, and mounts `./data` into the container as `/data`. Inside Docker, these values are forced to container-safe paths:
+Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) and our
+[Code of Conduct](CODE_OF_CONDUCT.md).
 
-```env
-BLACKROUTER_DATA_DIR=/data
-BLACKROUTER_DATABASE_URL=sqlite:///data/blackrouter.db
-```
+## Security
 
-With the current `.env`, open:
+Found a vulnerability? Please follow our [security policy](SECURITY.md) and
+report it privately rather than opening a public issue.
 
-```bash
-curl http://localhost:20129/health
-curl http://localhost:20129/readyz
-```
+## License
 
-For Zed/OpenAI-compatible clients, use:
-
-```json
-"api_url": "http://localhost:20129/v1"
-```
-
-## Verify
-
-```bash
-curl http://localhost:20129/health
-curl http://localhost:20129/setup
-curl http://localhost:20129/version
-curl http://localhost:20129/api/runtime/status
-curl http://localhost:20129/v1/models
-```
-
-## Notes
-
-The setup database is independent from `9router-custom` by default. See
-[`docs/OPERATIONS.md`](docs/OPERATIONS.md) for probes, tenant policy, hot reload,
-Redis, backup, and incident procedures.
+[MIT](LICENSE) © The BlackRouter Authors.
