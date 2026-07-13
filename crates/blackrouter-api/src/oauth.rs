@@ -1,5 +1,5 @@
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Json, Response};
 use axum::routing::get;
 use axum::Router;
@@ -67,6 +67,10 @@ struct OAuthSession {
     project_id: Option<String>,
     #[allow(dead_code)]
     expires_at: Option<String>,
+    // The exact redirect_uri used in the authorization request. Persisted so the
+    // token exchange (whether via the server callback or the /exchange endpoint)
+    // always uses the same value the IdP expects — independent of BLACKROUTER_BASE_URL.
+    redirect_uri: Option<String>,
     status: String, // "pending", "done", "error"
     error: Option<String>,
 }
@@ -112,6 +116,15 @@ pub struct OAuthPollResponse {
 pub struct OAuthExchangeBody {
     code: String,
     state: String,
+}
+
+/// Optional body for `oauth_start`. When `redirect_uri` is supplied (frontend
+/// computes it from `window.location.origin`), it is used verbatim for the
+/// authorization request and persisted on the session — this is what makes the
+/// flow work in any deployment (Docker, remote, LAN) without BLACKROUTER_BASE_URL.
+#[derive(Debug, Deserialize)]
+pub struct OAuthStartBody {
+    redirect_uri: Option<String>,
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -169,6 +182,29 @@ fn redirect_uri(port: u16, provider: &str) -> String {
     )
 }
 
+/// Validate a client-supplied `redirect_uri` before trusting it in the
+/// authorization request. We only accept it when it points back to this app's
+/// own origin (same host as the incoming request, or localhost) and ends with
+/// the well-known `/oauth/callback` path. Anything else falls back to the
+/// server-derived `redirect_uri(port, provider)`.
+fn sanitize_redirect_uri(provided: &Option<String>, request_host: &str) -> Option<String> {
+    let provided = provided.as_ref()?;
+    let url = reqwest::Url::parse(provided).ok()?;
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return None;
+    }
+    if !url.path().ends_with("/oauth/callback") {
+        return None;
+    }
+    let host = url.host_str().unwrap_or("");
+    let request_host = request_host.split(':').next().unwrap_or(request_host);
+    if host == request_host || host == "localhost" || host == "127.0.0.1" {
+        Some(provided.clone())
+    } else {
+        None
+    }
+}
+
 fn codex_redirect_uri() -> String {
     format!("http://localhost:{CODEX_LOOPBACK_PORT}{CODEX_CALLBACK_PATH}")
 }
@@ -224,9 +260,17 @@ fn stop_codex_loopback_callback() {
 pub async fn oauth_start(
     Path(provider): Path<String>,
     State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<OAuthStartBody>>,
 ) -> Result<Json<OAuthStartResponse>, (StatusCode, Json<Value>)> {
     let port = state.config.port;
     let session_state = generate_state();
+    let request_host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let client_redirect_uri = body.as_ref().and_then(|b| b.redirect_uri.clone());
 
     // Validate credentials are configured
     let configured = match provider.as_str() {
@@ -289,6 +333,7 @@ pub async fn oauth_start(
                     email: None,
                     project_id: None,
                     expires_at: None,
+                    redirect_uri: None,
                     status: "pending".to_string(),
                     error: None,
                 },
@@ -307,8 +352,12 @@ pub async fn oauth_start(
         }
 
         "google" | "gemini" => {
-            // Google: Authorization Code Flow
-            let callback_url = redirect_uri(port, &provider);
+            // Google: Authorization Code Flow.
+            // Prefer the origin-based redirect_uri the frontend computed from
+            // `window.location.origin` (works in any deployment). Fall back to
+            // BLACKROUTER_BASE_URL only when the client didn't/couldn't supply one.
+            let callback_url = sanitize_redirect_uri(&client_redirect_uri, &request_host)
+                .unwrap_or_else(|| redirect_uri(port, &provider));
             let client_id = google_client_id();
 
             let auth_url = format!(
@@ -335,6 +384,7 @@ pub async fn oauth_start(
                     email: None,
                     project_id: None,
                     expires_at: None,
+                    redirect_uri: Some(callback_url.clone()),
                     status: "pending".to_string(),
                     error: None,
                 },
@@ -353,8 +403,9 @@ pub async fn oauth_start(
         }
 
         "antigravity" => {
-            // Antigravity: Authorization Code Flow with extended scopes
-            let callback_url = redirect_uri(port, &provider);
+            // Antigravity: Authorization Code Flow with extended scopes.
+            let callback_url = sanitize_redirect_uri(&client_redirect_uri, &request_host)
+                .unwrap_or_else(|| redirect_uri(port, &provider));
             let client_id = antigravity_client_id();
 
             let auth_url = format!(
@@ -382,6 +433,7 @@ pub async fn oauth_start(
                     email: None,
                     project_id: None,
                     expires_at: None,
+                    redirect_uri: Some(callback_url.clone()),
                     status: "pending".to_string(),
                     error: None,
                 },
@@ -400,10 +452,19 @@ pub async fn oauth_start(
         }
 
         "codex" | "openai" => {
-            // Codex/OpenAI: Authorization Code Flow with PKCE
-            start_codex_loopback_callback(state.clone())
-                .await
-                .map_err(|err| oauth_json_error(StatusCode::CONFLICT, err))?;
+            // Codex/OpenAI: Authorization Code Flow with PKCE.
+            //
+            // NOTE: OpenAI's OAuth app (including the shared fallback client id)
+            // only allows the loopback redirect `http://localhost:1455/auth/callback`,
+            // so we keep the loopback callback server for same-machine logins.
+            // When the browser cannot reach that loopback (remote/Docker, or the
+            // port is busy) the loopback bind is allowed to fail and the UI offers
+            // a manual "paste the callback URL" fallback instead of hard-failing.
+            if let Err(err) = start_codex_loopback_callback(state.clone()).await {
+                tracing::warn!(
+                    "OpenAI/Codex loopback callback unavailable; continuing with manual fallback: {err}"
+                );
+            }
             let callback_url = codex_redirect_uri();
             let code_verifier = generate_code_verifier();
             let code_challenge = base64_url(&sha256_digest(&code_verifier));
@@ -437,6 +498,7 @@ pub async fn oauth_start(
                     email: None,
                     project_id: None,
                     expires_at: None,
+                    redirect_uri: Some(callback_url.clone()),
                     status: "pending".to_string(),
                     error: None,
                 },
@@ -538,6 +600,16 @@ fn html_escape(input: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+/// GET /oauth/callback
+/// Static relay page. The OAuth popup lands here after the IdP redirects back.
+/// It reads `code`/`state` from the URL and relays them to the opener window
+/// (and to same-origin tabs via BroadcastChannel / localStorage) so the setup
+/// page can complete the exchange. This makes the flow work in any deployment
+/// without relying on a localhost loopback or BLACKROUTER_BASE_URL.
+pub async fn oauth_callback_page() -> Html<&'static str> {
+    Html(include_str!("../static/callback.html"))
 }
 
 fn oauth_redirect_html(success: bool, message: &str) -> String {
@@ -652,7 +724,7 @@ async fn exchange_code_for_token(
 ) -> Result<String, String> {
     match provider {
         "google" | "gemini" => {
-            let callback_url = redirect_uri(state.config.port, provider);
+            let callback_url = session_redirect_uri(session_state, state.config.port, provider);
             let client_id = google_client_id();
             let client_secret = google_client_secret();
             let resp = state
@@ -692,7 +764,7 @@ async fn exchange_code_for_token(
         }
 
         "antigravity" => {
-            let callback_url = redirect_uri(state.config.port, provider);
+            let callback_url = session_redirect_uri(session_state, state.config.port, provider);
             let client_id = antigravity_client_id();
             let client_secret = antigravity_client_secret();
             let resp = state
@@ -732,7 +804,7 @@ async fn exchange_code_for_token(
         }
 
         "codex" | "openai" => {
-            let callback_url = codex_redirect_uri();
+            let callback_url = session_redirect_uri(session_state, state.config.port, "openai");
             let code_verifier = OAUTH_SESSIONS
                 .lock()
                 .unwrap()
@@ -789,6 +861,18 @@ async fn exchange_code_for_token(
 
         _ => Err(format!("Unsupported provider for callback: {provider}")),
     }
+}
+
+/// Resolve the redirect_uri to use for the token exchange. Prefers the value
+/// persisted on the session (the exact one used in the authorization request),
+/// falling back to the server-derived default for safety.
+fn session_redirect_uri(session_state: &str, port: u16, provider: &str) -> String {
+    OAUTH_SESSIONS
+        .lock()
+        .unwrap()
+        .get(session_state)
+        .and_then(|s| s.redirect_uri.clone())
+        .unwrap_or_else(|| redirect_uri(port, provider))
 }
 
 // ── Exchange Code for Token ─────────────────────────────────────────────
@@ -940,7 +1024,7 @@ pub async fn oauth_exchange(
         }
 
         "codex" | "openai" => {
-            let callback_url = codex_redirect_uri();
+            let callback_url = session_redirect_uri(&body.state, port, "openai");
 
             // Get code_verifier from session
             let code_verifier = {

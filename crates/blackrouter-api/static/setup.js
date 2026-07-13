@@ -38,6 +38,11 @@ let comboModelDraft = [];
 // When set, the available-models picker is filtered to this provider type.
 let comboProviderFilter = "";
 
+// When set, an OAuth flow is in progress. Used by the relay listeners and the
+// manual-code fallback so they know which provider/state to resolve.
+let oauthPending = null; // { providerId, state }
+let oauthDone = false; // guards against double-exchanging (poll + relay)
+
 const $ = (id) => document.getElementById(id);
 
 function setValue(id, value) {
@@ -1320,26 +1325,74 @@ async function checkProvider(id) {
 
 async function startOAuth(providerId) {
   const notice = $("oauthNotice");
-  notice.textContent = "Starting OAuth flow...";
-  notice.classList.remove("hidden");
-  notice.classList.remove("error");
+  if (notice) {
+    notice.textContent = "Starting OAuth flow...";
+    notice.classList.remove("hidden");
+    notice.classList.remove("error");
+  }
+  // Hide the manual-code fallback from any previous attempt.
+  const manual = $("oauthManual");
+  if (manual) manual.classList.add("hidden");
+
+  // Reset in-progress tracking.
+  oauthDone = false;
+  oauthPending = { providerId, state: null };
+
+  // Open the popup synchronously, inside the click gesture, so the browser
+  // does not block it. We only learn the auth URL after the /start call,
+  // so start with about:blank and navigate it once we have the URL.
+  let popup = null;
+  try {
+    popup = window.open(
+      "about:blank",
+      "blackrouter-oauth",
+      "width=600,height=720,left=" +
+        (window.screenX + window.outerWidth / 2 - 300) +
+        ",top=" +
+        (window.screenY + window.outerHeight / 2 - 360),
+    );
+  } catch (e) {
+    popup = null;
+  }
 
   try {
+    // For browser-based providers (Google/Antigravity) we compute the
+    // redirect_uri from the page's own origin so the callback always lands on
+    // a host the browser can actually reach, independent of BLACKROUTER_BASE_URL
+    // or whether BlackRouter runs in Docker / behind a proxy.
+    const normalizedProvider = (providerId || "").trim().toLowerCase();
+    const usesOriginRedirect =
+      normalizedProvider === "google" ||
+      normalizedProvider === "gemini" ||
+      normalizedProvider === "antigravity";
+    const body = usesOriginRedirect
+      ? { redirect_uri: window.location.origin + "/oauth/callback" }
+      : {};
+
     const resp = await fetch(
       `/api/oauth/${encodeURIComponent(providerId)}/start`,
-      { method: "POST" },
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      },
     );
     const result = await readResponsePayload(resp);
 
     if (!resp.ok) {
+      if (popup) popup.close();
       notice.textContent =
         "❌ " + responseErrorMessage(result, "Failed to start OAuth");
       notice.classList.add("error");
+      oauthPending = null;
       return;
     }
 
+    oauthPending = { providerId, state: result.state };
+
     if (result.flow_type === "device_code") {
-      // Show device code UI
+      // Device-code flow has no popup — close it if we opened one.
+      if (popup) popup.close();
       notice.innerHTML = [
         "<strong>Login with " + result.provider + "</strong>",
         "<p>1. Open this URL:</p>",
@@ -1349,9 +1402,12 @@ async function startOAuth(providerId) {
         "<p>3. Waiting for authorization...</p>",
       ].join("");
 
-      // Poll for token
       pollOAuthToken(providerId, result.state, 5000);
     } else {
+      // authorization_code flow (OpenAI/Codex loopback, Google, etc.)
+      // Keep this setup page open so it can receive the token. The popup
+      // handles the provider login and is redirected back; a full-page
+      // redirect would replace this page and the token could never flow back.
       sessionStorage.setItem(
         "blackrouter.oauth.pending",
         JSON.stringify({
@@ -1360,77 +1416,234 @@ async function startOAuth(providerId) {
           startedAt: Date.now(),
         }),
       );
-      notice.innerHTML =
-        "<strong>Login with " +
-        result.provider +
-        "</strong><p>Redirecting to browser authorization...</p>";
-      window.location.href = result.url;
+
+      if (!popup) {
+        notice.innerHTML =
+          "<strong>Login with " +
+          result.provider +
+          "</strong><p>Popup was blocked. Redirecting to browser authorization...</p>";
+        window.location.href = result.url;
+      } else {
+        popup.location.href = result.url;
+        notice.innerHTML =
+          "<strong>Login with " +
+          result.provider +
+          "</strong><p>A login window has opened. Complete authorization there — this page will update automatically.</p>";
+      }
+
+      // OpenAI/Codex use a localhost loopback the browser may not reach
+      // (remote/Docker/port busy). Offer a manual paste fallback so login
+      // can always complete.
+      if (normalizedProvider === "codex" || normalizedProvider === "openai") {
+        const manualBox = $("oauthManual");
+        if (manualBox) manualBox.classList.remove("hidden");
+      }
+
+      pollOAuthToken(providerId, result.state, 3000);
     }
   } catch (error) {
+    if (popup) popup.close();
     notice.textContent = "❌ OAuth failed: " + error.message;
     notice.classList.add("error");
+    oauthPending = null;
   }
 }
 
 async function pollOAuthToken(providerId, state, interval) {
   for (let i = 0; i < 60; i++) {
+    if (oauthDone) return;
     await new Promise((r) => setTimeout(r, interval));
+    if (oauthDone) return;
     try {
       const resp = await fetch(
         `/api/oauth/${encodeURIComponent(providerId)}/status?state=${encodeURIComponent(state)}`,
       );
       const data = await resp.json();
-
       if (data.status === "done" && data.access_token) {
-        $("providerApiKeyInput").value = data.access_token;
-        // Store email if returned from OAuth
-        if (data.email) {
-          $("providerEmailInput").value = data.email;
-          $("providerNameInput").value =
-            $("providerNameInput").value || data.email.split("@")[0];
-        }
-        // Store long-lived OAuth metadata in provider data when available.
-        if (
-          data.project_id ||
-          data.refresh_token ||
-          data.token_expires_at ||
-          providerId === "antigravity"
-        ) {
-          try {
-            const existing = JSON.parse($("providerDataInput").value || "{}");
-            if (data.project_id) existing.projectId = data.project_id;
-            if (data.refresh_token) existing.refreshToken = data.refresh_token;
-            if (data.token_expires_at)
-              existing.tokenExpiresAt = data.token_expires_at;
-            $("providerDataInput").value = JSON.stringify(existing, null, 2);
-          } catch (e) {}
-        }
-        const extra = data.email
-          ? ` (${data.email})`
-          : data.project_id
-            ? ` (Project: ${data.project_id})`
-            : "";
-        sessionStorage.removeItem("blackrouter.oauth.pending");
-        $("oauthNotice").innerHTML =
-          `<strong>✅ Token received!</strong>${extra} Fill remaining fields and save.`;
-        $("oauthNotice").classList.remove("error");
+        applyOAuthResult(data);
         return;
       }
       if (data.status === "error") {
-        sessionStorage.removeItem("blackrouter.oauth.pending");
-        $("oauthNotice").textContent =
-          "❌ OAuth error: " + (data.error || "Unknown");
-        $("oauthNotice").classList.add("error");
+        applyOAuthResult(data);
         return;
       }
     } catch (e) {
       // Continue polling
     }
   }
+  if (oauthDone) return;
   sessionStorage.removeItem("blackrouter.oauth.pending");
-  $("oauthNotice").innerHTML =
-    "<strong>⏰ Login timed out.</strong> Please try again.";
-  $("oauthNotice").classList.add("error");
+  $("oauthManual")?.classList.add("hidden");
+  const notice = $("oauthNotice");
+  notice.innerHTML = "<strong>⏰ Login timed out.</strong> Please try again.";
+  notice.classList.add("error");
+}
+
+// Shared handler for a completed OAuth result (used by both the status poll and
+// the relay/manual-code paths). Idempotent: once resolved, it is a no-op.
+function applyOAuthResult(data) {
+  if (oauthDone) return;
+  // Capture the provider id before clearing in-progress state.
+  const providerId = oauthPendingProviderId();
+  oauthDone = true;
+  oauthPending = null;
+  sessionStorage.removeItem("blackrouter.oauth.pending");
+  $("oauthManual")?.classList.add("hidden");
+  const notice = $("oauthNotice");
+
+  if (data.error && !data.access_token) {
+    notice.textContent = "❌ OAuth error: " + (data.error || "Unknown");
+    notice.classList.add("error");
+    return;
+  }
+  if (!data.access_token) {
+    notice.textContent = "❌ OAuth failed: no access token returned.";
+    notice.classList.add("error");
+    return;
+  }
+
+  $("providerApiKeyInput").value = data.access_token;
+  if (data.email) {
+    $("providerEmailInput").value = data.email;
+    $("providerNameInput").value =
+      $("providerNameInput").value || data.email.split("@")[0];
+  }
+
+  if (
+    data.project_id ||
+    data.refresh_token ||
+    data.token_expires_at ||
+    providerId === "antigravity"
+  ) {
+    try {
+      const existing = JSON.parse($("providerDataInput").value || "{}");
+      if (data.project_id) existing.projectId = data.project_id;
+      if (data.refresh_token) existing.refreshToken = data.refresh_token;
+      if (data.token_expires_at) existing.tokenExpiresAt = data.token_expires_at;
+      $("providerDataInput").value = JSON.stringify(existing, null, 2);
+    } catch (e) {}
+  }
+
+  const extra = data.email
+    ? ` (${data.email})`
+    : data.project_id
+      ? ` (Project: ${data.project_id})`
+      : "";
+  notice.innerHTML =
+    `<strong>✅ Token received!</strong>${extra} Fill remaining fields and save.`;
+  notice.classList.remove("error");
+}
+
+function oauthPendingProviderId() {
+  try {
+    const raw = sessionStorage.getItem("blackrouter.oauth.pending");
+    if (raw) return JSON.parse(raw).providerId;
+  } catch (e) {}
+  return oauthPending?.providerId || null;
+}
+
+// Relay listeners: receive the OAuth code/state from the popup (or another
+// same-origin tab) and complete the exchange. Mirrors 9router's pattern using
+// postMessage + BroadcastChannel + localStorage for maximum robustness.
+function handleOAuthRelay(data) {
+  if (oauthDone || !oauthPending) return;
+  if (!data) return;
+  if (data.error) {
+    oauthDone = true;
+    oauthPending = null;
+    sessionStorage.removeItem("blackrouter.oauth.pending");
+    $("oauthManual")?.classList.add("hidden");
+    const notice = $("oauthNotice");
+    notice.textContent =
+      "❌ OAuth error: " + (data.errorDescription || data.error);
+    notice.classList.add("error");
+    return;
+  }
+  if (!data.code) return;
+  const providerId = oauthPending.providerId;
+  const state = data.state || oauthPending.state;
+  sendJson(
+    `/api/oauth/${encodeURIComponent(providerId)}/exchange`,
+    "POST",
+    { code: data.code, state },
+  )
+    .then(applyOAuthResult)
+    .catch((err) => {
+      const notice = $("oauthNotice");
+      notice.textContent = "❌ OAuth exchange failed: " + err.message;
+      notice.classList.add("error");
+    });
+}
+
+function initOAuthRelay() {
+  window.addEventListener("message", (event) => {
+    const isLocal =
+      event.origin.includes("localhost") || event.origin.includes("127.0.0.1");
+    if (event.origin !== window.location.origin && !isLocal) return;
+    if (event.data && event.data.type === "oauth_callback") {
+      handleOAuthRelay(event.data.data);
+    }
+  });
+  try {
+    const channel = new BroadcastChannel("oauth_callback");
+    channel.onmessage = (event) => handleOAuthRelay(event.data);
+  } catch (e) {}
+  window.addEventListener("storage", (event) => {
+    if (event.key === "oauth_callback" && event.newValue) {
+      try {
+        handleOAuthRelay(JSON.parse(event.newValue));
+        localStorage.removeItem("oauth_callback");
+      } catch (e) {}
+    }
+  });
+}
+
+// Manual fallback for OpenAI/Codex when the localhost loopback can't be reached
+// (remote/Docker). The user pastes the redirected callback URL (or raw code).
+async function submitOAuthManual() {
+  if (!oauthPending) return;
+  const raw = ($("oauthManualInput").value || "").trim();
+  if (!raw) return;
+  let code = null;
+  let state = oauthPending.state;
+  if (raw.startsWith("eyJ") && raw.includes(".")) {
+    code = raw; // raw JWT access token
+  } else {
+    try {
+      const candidate = raw.includes("://")
+        ? raw
+        : "http://localhost/" + raw.replace(/^\?/, "");
+      const url = new URL(candidate);
+      code = url.searchParams.get("code");
+      state = url.searchParams.get("state") || state;
+      if (!code) code = raw; // treat as a raw code
+    } catch (e) {
+      code = raw;
+    }
+  }
+  if (!code) {
+    const notice = $("oauthNotice");
+    notice.textContent = "❌ No code found in input.";
+    notice.classList.add("error");
+    return;
+  }
+  try {
+    const data = await sendJson(
+      `/api/oauth/${encodeURIComponent(oauthPending.providerId)}/exchange`,
+      "POST",
+      { code, state },
+    );
+    applyOAuthResult(data);
+  } catch (err) {
+    const notice = $("oauthNotice");
+    notice.textContent = "❌ Exchange failed: " + err.message;
+    notice.classList.add("error");
+  }
+}
+
+function initOAuthManual() {
+  const btn = $("oauthManualButton");
+  if (btn) btn.addEventListener("click", submitOAuthManual);
 }
 
 function showOauthButton(providerId) {
@@ -1639,6 +1852,10 @@ async function refreshLimits() {
 
 refresh()
   .then(resumePendingOAuth)
+  .then(() => {
+    initOAuthRelay();
+    initOAuthManual();
+  })
   .catch((error) => {
     setBadge("healthBadge", "Offline", "error");
     console.error(error);

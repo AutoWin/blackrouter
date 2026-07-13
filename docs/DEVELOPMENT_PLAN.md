@@ -54,7 +54,7 @@ _Updated: 2026-07-06_
 ### ✅ Completed (Phase 0 + Phase 1)
 
 **Infrastructure:**
-- Rust workspace with 10 crates
+- Rust workspace with 11 crates
 - SQLite storage with 9Router-compatible schema
 - Config loader with env mapping (`BLACKROUTER_*`, legacy `DATA_DIR`, `PORT`)
 - Axum HTTP server with graceful shutdown

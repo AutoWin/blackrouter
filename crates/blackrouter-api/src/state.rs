@@ -17,6 +17,10 @@ pub struct RuntimeSettings {
     pub health_probe_interval_seconds: u64,
     pub health_probe_timeout_seconds: u64,
     pub health_probe_failure_threshold: u32,
+    pub semantic_memory_enabled: bool,
+    pub semantic_memory_top_k: usize,
+    pub semantic_memory_dim: usize,
+    pub semantic_memory_embedder: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -228,6 +232,29 @@ impl RuntimeSettings {
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(3)
                 .max(1) as u32,
+            semantic_memory_enabled: settings
+                .get("semanticMemory")
+                .and_then(|value| value.get("enabled"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            semantic_memory_top_k: settings
+                .get("semanticMemory")
+                .and_then(|value| value.get("topK"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(3)
+                .max(1) as usize,
+            semantic_memory_dim: settings
+                .get("semanticMemory")
+                .and_then(|value| value.get("dim"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(256)
+                .max(16) as usize,
+            semantic_memory_embedder: settings
+                .get("semanticMemory")
+                .and_then(|value| value.get("embedder"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("local")
+                .to_string(),
         }
     }
 }

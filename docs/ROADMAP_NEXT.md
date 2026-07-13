@@ -6,23 +6,28 @@
 
 ## Bối cảnh hiện tại (thực tế từ code)
 
-BlackRouter là LLM gateway/proxy viết Rust (Axum), workspace 10 crates. Đã vững:
+BlackRouter là LLM gateway/proxy viết Rust (Axum), workspace 11 crates. Đã vững:
 
 - **Routing/proxy**: OpenAI chat/responses, Anthropic messages, Codex, CommandCode + format translation.
 - **Resilience**: load-balancing (round-robin/weighted/least-conn/response-time), circuit breaker, RTK rate-limit (sliding window in-memory).
 - **Cost guard**, **combos** (fallback chains), **context window trimming** (tiktoken/cl100k_base).
 - **Persistence**: SQLite (`blackrouter-storage`) — providers, usage, requestDetails, kv, settings.
-- **Observability sơ khởi**: Prometheus `/metrics`, RTK metrics; deps OpenTelemetry đã có nhưng chưa wired.
-- **Control plane**: token-guarded API + setup UI; `/health`, `/version`.
-- **Deployment**: Dockerfile + docker-compose.
+- **Observability**: Prometheus `/metrics` + Grafana dashboard; OpenTelemetry đã wired (gated bởi `OTEL_EXPORTER_OTLP_ENDPOINT`), middleware `x-request-id`, `/readyz` có readiness/dependency checks.
+- **Control plane**: token-guarded API + setup UI; `/health`, `/healthz`, `/readyz`, `/version`.
+- **Deployment**: Dockerfile + docker-compose (+ observability stack, Redis profile).
+- **CI**: GitHub Actions chạy `cargo fmt --check`, `clippy -D warnings`, `cargo test`, `build --release`.
+- **Durable state**: RTK + circuit breaker snapshot xuống SQLite `rtk_state` và Redis khi `BLACKROUTER_REDIS_URL` set; không mất state khi restart.
+- **Multi-tenancy**: API key `tenantId` + policy (quota requests/tokens/cost, provider/model allowlist), rotation giữ policy.
+- **Conversation memory**: session-scoped qua `x-session-id` (kv store), đã wire vào `/v1/chat/completions`.
 
-Khoảng trống lớn:
+Khoảng trống lớn (còn lại):
 
-- Không có CI / test harness diện rộng.
-- OTel chưa nối vào traces.
-- Health chỉ liveness (thiếu readiness / dependency checks).
-- RTK + circuit-breaker state in-memory → mất khi restart.
-- Không có conversation/memory layer, không multi-tenant, auth provider chưa granular.
+- **Conversation memory chưa đẩy đủ**: mới wire vào `/v1/chat/completions`; `/v1/messages` và `/v1/responses` vẫn là shell (chưa có memory/trimming).
+- **Semantic memory (8.3)**: chưa làm (optional, cần nhu cầu thực tế).
+- **Plugin system**: chưa có.
+- **Telegram webhook mode**: mới có long-polling.
+- **Account fallback / multi-connection failover**: health probing có, nhưng failover khi nhiều connection cùng 1 provider chưa có.
+- **Docker image optimization**: chức năng ổn nhưng chưa slim.
 
 ## Nguyên tắc ưu tiên
 
@@ -145,8 +150,10 @@ Test: `retryable_errors_are_transient_only`, `request_modalities_detects_vision_
 
 **Đã implement (done):**
 - **8.1** — bảng `kv` sẵn có tái sử dụng làm store với `scope = "conversation"`, key = `session_id` (`blackrouter-storage`: thêm `get_kv` / `set_kv` / `delete_kv` / `list_kv`). Header `x-session-id` bật conversation memory trên `/v1/chat/completions`: load lịch sử đã lưu → merge với `messages` incoming (system message incoming thay thế system block đã lưu; các message còn lại append) → gửi; sau response thành công, append assistant message và persist. Response echo `x-session-id`. Control endpoints (gated bởi control-token): `GET /api/conversations`, `GET|DELETE /api/conversations/{session_id}`.
-- **8.2** — `assemble_session_body` merge lịch sử + trim toàn bộ history đã merge bằng `trim_context_to_fit`, dùng `route_context_window` (min của model_catalog / built-in table, default 128k) và `route_max_output_tokens` làm budget; `proxy_with_specific_provider` vẫn re-trim per-provider làm backstop. Tái dụng `count_chat_tokens` (cl100k_base). Streaming vẫn giữ latency: body được tee (forward + accumulate) qua `wrap_session_response`, capture assistant message sau khi stream kết thúc (cả JSON và SSE, có reconstruct `tool_calls`).
-- **8.3** — chưa làm (optional, không có nhu cầu thực tế). Lưu ý: session hiện chỉ tích hợp `/v1/chat/completions`; `/v1/messages` (Anthropic) và `/v1/responses` là follow-up.
+- **8.2** — `assemble_session_body` merge lịch sử + trim toàn bộ history đã merge bằng `trim_context_to_fit`, dùng `route_context_window` (min của model_catalog / built-in table, default 128k) và `route_max_output_tokens` làm budget; `proxy_with_specific_provider` vẫn re-trim per-provider làm backstop. Tái dùng `count_chat_tokens` (cl100k_base). Streaming vẫn giữ latency: body được tee (forward + accumulate) qua `wrap_session_response`, capture assistant message sau khi stream kết thúc (cả JSON và SSE, có reconstruct `tool_calls`).
+- **8.3** — **đã implement (foundation, opt-in).** Bảng `memoryVectors (id, sessionId, role, chunk, embedding, createdAt)` + `upsert_memory_vector` / `search_memory_vectors` (cosine) / `delete_memory_vectors` trong `blackrouter-storage`. Embedder abstraction (`blackrouter-api::embeddings`: trait `Embedder` + `LocalLexicalEmbedder` dùng hashing trick, deterministic, không phụ thuộc external) và `build_embedder`. Khi `settings.semanticMemory.enabled`, mỗi turn được index vào `memoryVectors` (`persist_assistant_message`) và truy vấn incoming được embed để recall top-K chunk cũ nhất vào system message (`assemble_session_body`). Recall trong phạm vi session (khôi phục context bị trim). Lưu ý: default embedder là **lexical**, chưa phải neural — upgrade path là implement `Embedder` gọi embeddings endpoint thật (OpenAI `/v1/embeddings`...) và đổi `semanticMemory.embedder`. `delete_conversation` cũng xoá `memoryVectors` đi kèm.
+
+**Đã implement (done) — mở rộng (2026-07-13):** Conversation memory giờ tích hợp cả `/v1/chat/completions`, `/v1/responses` (full stream + non-stream) và `/v1/messages` **translate path** (non-Claude provider, full stream + non-stream). Persistence dùng chung `wrap_session_response` + `extract_assistant_message` (OpenAI chat format). Claude-native passthrough path của `/v1/messages` chưa gắn session memory (khác wire format + SSE extraction) — là known limitation.
 
 **Definition of Done (Phase 8):** duy trì hội thoại qua nhiều request; context tự động trim từ lịch sử.
 
@@ -244,7 +251,8 @@ Test: `retryable_errors_are_transient_only`, `request_modalities_detects_vision_
 - [x] 7.2 Cost-aware routing
 - [x] 7.3 Combo hedge/fallback-by-error
 - [x] 7.4 Capability routing
-- [x] 8.1 Session store (nếu agentic)
+- [x] 8.1 Session store (chat/completions + responses + messages translate path)
+- [x] 8.3 Semantic memory foundation (memoryVectors + local lexical embedder, opt-in)
 - [x] 9.1 Multi-tenant API key scoping
 - [x] 9.2 Proactive health probing
 - [x] 9.3 Config hot-reload

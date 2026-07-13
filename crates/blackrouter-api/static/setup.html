@@ -457,6 +457,31 @@
                         class="notice hidden"
                         style="margin-bottom: 12px"
                     ></div>
+                    <div
+                        id="oauthManual"
+                        class="notice hidden"
+                        style="margin-bottom: 12px"
+                    >
+                        <p style="margin: 0 0 6px">
+                            If the login window can't redirect back automatically
+                            (e.g. BlackRouter runs remotely/Docker), copy the URL
+                            from its address bar and paste it below:
+                        </p>
+                        <input
+                            id="oauthManualInput"
+                            type="text"
+                            placeholder="http://localhost:1455/auth/callback?code=...&amp;state=..."
+                            style="width: 100%; box-sizing: border-box"
+                        />
+                        <button
+                            id="oauthManualButton"
+                            type="button"
+                            class="oauth-button"
+                            style="margin-top: 6px"
+                        >
+                            Submit code
+                        </button>
+                    </div>
                     <div id="providerTestNotice" class="notice hidden"></div>
                     <div
                         id="providersList"

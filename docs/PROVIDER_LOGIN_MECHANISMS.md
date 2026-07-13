@@ -9,10 +9,12 @@ BlackRouter hỗ trợ 3 loại xác thực chính cho providers:
 | Loại | Mô tả | Providers |
 |------|--------|-----------|
 | `api-key` | Xác thực bằng API key | OpenAI, Anthropic, Gemini, DeepSeek, Groq, xAI, Mistral, Perplexity, Together, Fireworks, NVIDIA, OpenRouter, Cline, Command Code |
-| `oauth` | Xác thực qua OAuth 2.0 | GitHub Copilot, Codex (OpenAI), Antigravity (Google), Cursor, Kiro |
+| `oauth` | Xác thực qua OAuth 2.0 (luồng login tương tác) | GitHub Copilot, Codex (OpenAI), Antigravity (Google) |
 | `none` | Không cần xác thực | Ollama Local, OpenCode |
 
 ---
+
+> **Lưu ý:** cursor và kiro có `auth_type: oauth` trong catalog nhưng **chưa có luồng login tương tác** trên server (không nằm trong `oauth_start`). Hiện tại cần tự paste OAuth/session token vào trường API key khi thêm provider. Các provider có login tự động: `github`, `codex`/`openai`, `google`/`gemini`, `antigravity`.
 
 ## 1. API Key Authentication
 
@@ -174,7 +176,7 @@ GET  /api/oauth/antigravity/status     → Kiểm tra trạng thái
 2. BlackRouter tạo `code_verifier` và `code_challenge` (PKCE)
 3. Nhận URL authorization với PKCE parameters
 4. Người dùng mở URL và đăng nhập OpenAI
-5. OpenAI redirect về `/api/oauth/codex/callback`
+5. OpenAI redirect về loopback `http://localhost:1455/auth/callback` (BlackRouter khởi chạy một local callback server tạm thời trên port 1455 trong lúc đăng nhập)
 6. BlackRouter đổi code lấy access token (kèm code_verifier)
 7. Trích xuất email từ `id_token` (JWT)
 
@@ -185,8 +187,8 @@ OAUTH_CODEX_CLIENT_ID=your_codex_client_id
 
 **API Endpoints:**
 ```
-POST /api/oauth/codex/start      → Tạo authorization URL (với PKCE)
-GET  /api/oauth/codex/callback   → OAuth callback (tự động)
+POST /api/oauth/codex/start      → Tạo authorization URL (với PKCE), đồng thời khởi chạy loopback callback trên localhost:1455
+Loopback GET http://localhost:1455/auth/callback → OAuth callback (tự động, do local loopback server xử lý)
 POST /api/oauth/codex/exchange   → Manual code exchange
 GET  /api/oauth/codex/status     → Kiểm tra trạng thái
 ```
@@ -351,8 +353,8 @@ OAUTH_ANTIGRAVITY_CLIENT_SECRET=
 # Codex/OpenAI OAuth (Authorization Code + PKCE)
 OAUTH_CODEX_CLIENT_ID=
 
-# Base URL cho OAuth callbacks
-BLACKROUTER_BASE_URL=http://localhost:20130
+# Base URL cho OAuth callbacks (mặc định port 20129)
+BLACKROUTER_BASE_URL=http://localhost:20129
 ```
 
 ---

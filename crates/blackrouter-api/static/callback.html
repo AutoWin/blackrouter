@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>OAuth Callback</title>
+<style>
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; max-width: 520px; margin: 100px auto; text-align: center; color: #1f2933; }
+  h1 { font-size: 1.25rem; }
+  p { color: #52606d; }
+  .ok { color: #2f7d5b; }
+  .err { color: #b5453f; }
+  code { display:block; word-break: break-all; background:#f4f5f7; border:1px solid #e4e7eb; border-radius:8px; padding:10px; font-size:12px; margin-top:12px; text-align:left; }
+</style>
+</head>
+<body>
+  <h1 id="title">Completing authorization…</h1>
+  <p id="message">Please wait while we send the result back to BlackRouter.</p>
+  <div id="manual" style="display:none">
+    <p>If this tab did not close automatically, copy the address below and paste it into BlackRouter's “Submit code” box:</p>
+    <code id="url"></code>
+  </div>
+
+  <script>
+    (function () {
+      var params = new URLSearchParams(window.location.search);
+      var code = params.get("code");
+      var state = params.get("state");
+      var error = params.get("error");
+      var errorDescription = params.get("error_description");
+
+      var data = {
+        code: code,
+        state: state,
+        error: error,
+        errorDescription: errorDescription,
+        fullUrl: window.location.href
+      };
+
+      function setStatus(kind, title, message) {
+        var t = document.getElementById("title");
+        var m = document.getElementById("message");
+        t.textContent = title;
+        t.className = kind;
+        m.textContent = message;
+      }
+
+      // Trusted origins we are willing to relay the code/state to. We only ever
+      // post to our own origin (the setup page) or the Codex loopback origin.
+      var expectedOrigins = [window.location.origin, "http://localhost:1455"];
+
+      var relayed = false;
+
+      // Method 1: postMessage to the opener window (popup mode).
+      if (window.opener) {
+        expectedOrigins.forEach(function (origin) {
+          try {
+            window.opener.postMessage({ type: "oauth_callback", data: data }, origin);
+            relayed = true;
+          } catch (e) { /* ignore */ }
+        });
+      }
+
+      // Method 2: BroadcastChannel (other same-origin tabs).
+      try {
+        var channel = new BroadcastChannel("oauth_callback");
+        channel.postMessage(data);
+        channel.close();
+        relayed = true;
+      } catch (e) { /* ignore */ }
+
+      // Method 3: localStorage event (fallback for any tab listening).
+      try {
+        localStorage.setItem("oauth_callback", JSON.stringify(Object.assign({}, data, { timestamp: Date.now() })));
+        relayed = true;
+      } catch (e) { /* ignore */ }
+
+      if (error) {
+        setStatus("err", "Authorization Failed", errorDescription || error);
+        return;
+      }
+      if (!code) {
+        // Landed without a code (e.g. user opened the URL directly).
+        setStatus("", "Nothing to relay", "No authorization code was found in this URL.");
+        document.getElementById("manual").style.display = "block";
+        document.getElementById("url").textContent = window.location.href;
+        return;
+      }
+
+      setStatus("ok", "Authorization Successful", "This window will close automatically…");
+
+      // Close the popup if we opened it; otherwise show the manual copy box.
+      setTimeout(function () {
+        if (window.opener) {
+          window.close();
+        } else {
+          document.getElementById("manual").style.display = "block";
+          document.getElementById("url").textContent = window.location.href;
+        }
+      }, 1200);
+    })();
+  </script>
+</body>
+</html>

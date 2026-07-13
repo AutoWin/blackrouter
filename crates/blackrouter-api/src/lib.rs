@@ -43,6 +43,7 @@ use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 pub mod auth;
+pub mod embeddings;
 pub mod metrics;
 pub mod oauth;
 pub mod state;
@@ -109,6 +110,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/setup", get(setup_page))
         .route("/setup.css", get(setup_css))
         .route("/setup.js", get(setup_js))
+        .route("/oauth/callback", get(oauth::oauth_callback_page))
         .route("/health", get(health))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
@@ -2304,6 +2306,48 @@ fn merge_session_messages(stored: &[Value], incoming: &[Value]) -> Vec<Value> {
     out
 }
 
+/// Extract a flat text representation of a chat-format message (role + content),
+/// handling both string and structured (`[{ "text": ... }]`) content. Used for
+/// semantic-memory indexing and recall queries (Phase 8.3).
+fn message_text(message: &Value) -> String {
+    let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+    let content = match message.get("content") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str).map(str::to_owned))
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => String::new(),
+    };
+    if content.is_empty() {
+        String::new()
+    } else {
+        format!("{role}: {content}")
+    }
+}
+
+/// Inject recalled semantic-memory context into a message list by extending the
+/// existing `system` message (or creating one if absent). Keeps `system` first.
+fn inject_semantic_context(messages: &mut Vec<Value>, context: &str) {
+    if context.trim().is_empty() {
+        return;
+    }
+    let block = format!("Relevant context recalled from earlier in this conversation:\n{context}");
+    if let Some(system) = messages
+        .iter_mut()
+        .find(|message| is_system_message(message))
+    {
+        if let Some(Value::String(existing)) = system.get_mut("content") {
+            existing.push_str(&format!("\n\n{block}"));
+        } else if let Some(object) = system.as_object_mut() {
+            object.insert("content".to_string(), json!(block));
+        }
+    } else {
+        messages.insert(0, json!({ "role": "system", "content": block }));
+    }
+}
+
 /// Resolve the (minimum) context window for a route, used to trim session
 /// history before dispatch (Phase 8.2). Uses the model catalog when present,
 /// otherwise the built-in provider model table, otherwise a safe default.
@@ -2360,11 +2404,13 @@ fn route_max_output_tokens(route: &RouteKind) -> u32 {
 /// Returns the modified body and the trimmed history (used later to persist
 /// the assistant turn).
 fn assemble_session_body(
-    storage: &Storage,
+    state: &AppState,
     session_id: &str,
     mut body: Value,
     route: &RouteKind,
 ) -> (Value, Vec<Value>) {
+    let storage = &state.storage;
+    let runtime = state.runtime_settings();
     let incoming = body
         .get("messages")
         .and_then(Value::as_array)
@@ -2391,11 +2437,43 @@ fn assemble_session_body(
     let max_output = route_max_output_tokens(route);
     trim_context_to_fit(&mut body, context_window, max_output);
 
-    let trimmed = body
+    let mut trimmed = body
         .get("messages")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+
+    // ── Phase 8.3: semantic recall ──
+    // When enabled, embed the incoming turn and retrieve the most similar stored
+    // chunks for this session, then inject them as recalled context. This surfaces
+    // earlier turns that context trimming may have dropped.
+    if runtime.semantic_memory_enabled {
+        let query_text: String = incoming
+            .iter()
+            .map(message_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !query_text.trim().is_empty() {
+            let embedder = crate::embeddings::build_embedder(
+                &runtime.semantic_memory_embedder,
+                runtime.semantic_memory_dim,
+            );
+            let query = embedder.embed(&query_text);
+            if let Ok(results) =
+                storage.search_memory_vectors(session_id, &query, runtime.semantic_memory_top_k)
+            {
+                let context = results
+                    .iter()
+                    .map(|(chunk, _score)| chunk.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n---\n");
+                inject_semantic_context(&mut trimmed, &context);
+                if let Some(object) = body.as_object_mut() {
+                    object.insert("messages".to_string(), Value::Array(trimmed.clone()));
+                }
+            }
+        }
+    }
 
     (body, trimmed)
 }
@@ -2509,11 +2587,35 @@ fn persist_assistant_message(
     base_history: &[Value],
     response_bytes: &[u8],
     is_stream: bool,
+    runtime: &state::RuntimeSettings,
 ) {
     let assistant = match extract_assistant_message(response_bytes, is_stream) {
         Some(message) => message,
         None => return,
     };
+
+    // ── Phase 8.3: index turns into semantic memory (opt-in) ──
+    if runtime.semantic_memory_enabled {
+        let embedder = crate::embeddings::build_embedder(
+            &runtime.semantic_memory_embedder,
+            runtime.semantic_memory_dim,
+        );
+        let now = unix_timestamp();
+        let index_turn = |storage: &Storage, role: &str, text: &str| {
+            if text.trim().is_empty() {
+                return;
+            }
+            let vector = embedder.embed(text);
+            if let Err(error) = storage.upsert_memory_vector(session_id, role, text, &vector, now) {
+                tracing::warn!("failed to index memory vector for {session_id}: {error}");
+            }
+        };
+        for message in base_history {
+            let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+            index_turn(storage, role, &message_text(message));
+        }
+        index_turn(storage, "assistant", &message_text(&assistant));
+    }
 
     let created_at = storage
         .get_kv(CONVERSATION_SCOPE, session_id)
@@ -2550,6 +2652,7 @@ fn wrap_session_response(
     session_id: String,
     base_history: Vec<Value>,
     is_stream: bool,
+    runtime: state::RuntimeSettings,
 ) -> Response {
     let status = response.status();
     let (mut parts, body) = response.into_parts();
@@ -2579,9 +2682,17 @@ fn wrap_session_response(
         let storage = storage.clone();
         let session_id = session_id.clone();
         let base_history = base_history.clone();
+        let runtime = runtime.clone();
         async move {
             let bytes = std::mem::take(&mut *collected.lock().unwrap());
-            persist_assistant_message(&storage, &session_id, &base_history, &bytes, is_stream);
+            persist_assistant_message(
+                &storage,
+                &session_id,
+                &base_history,
+                &bytes,
+                is_stream,
+                &runtime,
+            );
             Ok::<Bytes, axum::Error>(Bytes::new())
         }
     });
@@ -2605,8 +2716,9 @@ async fn chat_completions_shell(
     // When `x-session-id` is supplied, assemble the full history from stored
     // session state + this request, and persist the assistant turn afterwards.
     let session_id = extract_session_id(&headers);
+    let runtime = state.runtime_settings();
     let (effective_body, base_history) = match &session_id {
-        Some(session_id) => assemble_session_body(&state.storage, session_id, body, &route),
+        Some(session_id) => assemble_session_body(&state, session_id, body, &route),
         None => (body, Vec::new()),
     };
     let is_stream = effective_body
@@ -2624,6 +2736,7 @@ async fn chat_completions_shell(
             session_id,
             base_history,
             is_stream,
+            runtime,
         ))
     } else {
         Ok(response)
@@ -4695,6 +4808,10 @@ async fn delete_conversation(
     Path(session_id): Path<String>,
 ) -> Json<Value> {
     let _ = state.storage.delete_kv(CONVERSATION_SCOPE, &session_id);
+    // Drop the semantic-memory vectors too so the two stores stay consistent.
+    if let Err(error) = state.storage.delete_memory_vectors(&session_id) {
+        tracing::warn!("failed to delete memory vectors for {session_id}: {error}");
+    }
     Json(json!({ "ok": true }))
 }
 
@@ -4725,17 +4842,45 @@ async fn responses_proxy(
         .unwrap_or(model)
         .to_string();
 
-    // Proxy through chat completions (reuse all streaming/translation/pooling logic)
-    let response = proxy_chat_completions(&state, chat_body, route, auth.key_id, &req_id.0).await?;
+    // ── Phase 8: conversation memory ──
+    // Reuse the chat-completions session machinery: assemble history into the
+    // converted chat body, proxy, then persist the assistant turn from the
+    // chat-format response before converting back to Responses API format.
+    let session_id = extract_session_id(&headers);
+    let runtime = state.runtime_settings();
+    let (effective_chat_body, base_history) = match &session_id {
+        Some(session_id) => assemble_session_body(&state, session_id, chat_body, &route),
+        None => (chat_body, Vec::new()),
+    };
+    let is_stream = effective_chat_body
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
-    // For non-streaming responses, convert chat completion → Responses API format
-    let is_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    // Proxy through chat completions (reuse all streaming/translation/pooling logic)
+    let response =
+        proxy_chat_completions(&state, effective_chat_body, route, auth.key_id, &req_id.0).await?;
+
+    // Wrap with session persistence (persists on success; chat-format bytes are
+    // compatible with `extract_assistant_message`).
+    let response = match &session_id {
+        Some(session_id) => wrap_session_response(
+            response,
+            state.storage.clone(),
+            session_id.clone(),
+            base_history,
+            is_stream,
+            runtime,
+        ),
+        None => response,
+    };
+
     if is_stream {
         // Streaming: return SSE as-is (chat completion SSE is compatible enough)
         return Ok(response);
     }
 
-    // Non-streaming: read response body, convert to Responses format
+    // Non-streaming: read response body (persist runs), convert to Responses format
     let status = response.status();
     let content_type = response
         .headers()
@@ -4955,15 +5100,45 @@ async fn messages_proxy(
     }
 
     // Non-Claude provider: translate Claude request → OpenAI Chat, proxy, translate back
-    let is_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-
     let chat_body = translate_request(&body, WireFormat::ClaudeMessages, WireFormat::OpenAiChat)
         .map_err(|error| {
             ApiErrorResponse::bad_request(format!("claude→openai translation failed: {error}"))
         })?;
 
-    let chat_response =
-        proxy_chat_completions(&state, chat_body, route, api_key.clone(), &req_id.0).await?;
+    // ── Phase 8: conversation memory ──
+    // `route` was resolved from the incoming Claude body; reuse it for session
+    // assembly on the translated chat body, then persist the assistant turn.
+    let session_id = extract_session_id(&headers);
+    let runtime = state.runtime_settings();
+    let (effective_chat_body, base_history) = match &session_id {
+        Some(session_id) => assemble_session_body(&state, session_id, chat_body, &route),
+        None => (chat_body, Vec::new()),
+    };
+    let is_stream = effective_chat_body
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let chat_response = proxy_chat_completions(
+        &state,
+        effective_chat_body,
+        route,
+        api_key.clone(),
+        &req_id.0,
+    )
+    .await?;
+
+    let chat_response = match &session_id {
+        Some(session_id) => wrap_session_response(
+            chat_response,
+            state.storage.clone(),
+            session_id.clone(),
+            base_history,
+            is_stream,
+            runtime,
+        ),
+        None => chat_response,
+    };
 
     // For non-streaming, convert OpenAI response → Claude Messages format
     if is_stream {

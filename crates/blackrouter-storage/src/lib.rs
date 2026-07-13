@@ -54,6 +54,7 @@ const BLACKROUTER_TABLES: &[&str] = &[
     "runtimeEvents",
     "settingsHistory",
     "apiKeyQuotaCounters",
+    "memoryVectors",
 ];
 
 #[derive(Clone, Debug)]
@@ -1623,6 +1624,98 @@ impl Storage {
         Ok(())
     }
 
+    // ── Semantic Memory (Phase 8.3) ────────────────────────────────────────
+
+    /// Persist a single memory chunk (with its embedding) for a session. The
+    /// `embedding` is serialized as a JSON array of floats.
+    pub fn upsert_memory_vector(
+        &self,
+        session_id: &str,
+        role: &str,
+        chunk: &str,
+        embedding: &[f32],
+        created_at: u64,
+    ) -> Result<()> {
+        let conn = self.open()?;
+        let serialized = serde_json::to_string(embedding)?;
+        conn.execute(
+            "INSERT INTO memoryVectors (id, sessionId, role, chunk, embedding, createdAt) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                Uuid::new_v4().to_string(),
+                session_id,
+                role,
+                chunk,
+                serialized,
+                created_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Return up to `top_k` stored chunks for a session whose embedding is most
+    /// similar to `query` (cosine similarity). Results are ordered by descending
+    /// similarity. Chunks with a malformed embedding are skipped.
+    pub fn search_memory_vectors(
+        &self,
+        session_id: &str,
+        query: &[f32],
+        top_k: usize,
+    ) -> Result<Vec<(String, f64)>> {
+        let conn = self.open()?;
+        let mut stmt = conn.prepare(
+            "SELECT chunk, embedding FROM memoryVectors WHERE sessionId = ?1 ORDER BY createdAt ASC",
+        )?;
+        let mut scored: Vec<(String, f64)> = stmt
+            .query_map(params![session_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .filter_map(|row| row.ok())
+            .filter_map(|(chunk, raw)| {
+                let embedding: Vec<f32> = serde_json::from_str(&raw).ok()?;
+                let score = Self::cosine_similarity_f32(query, &embedding)?;
+                Some((chunk, score))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(top_k);
+        Ok(scored)
+    }
+
+    /// Remove all stored memory vectors for a session (used when a conversation
+    /// is deleted so the two stores stay consistent).
+    pub fn delete_memory_vectors(&self, session_id: &str) -> Result<()> {
+        let conn = self.open()?;
+        conn.execute(
+            "DELETE FROM memoryVectors WHERE sessionId = ?1",
+            params![session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Cosine similarity between two equal-length f32 vectors. Returns `None` if
+    /// either vector is empty or has zero magnitude (undefined similarity).
+    fn cosine_similarity_f32(a: &[f32], b: &[f32]) -> Option<f64> {
+        if a.len() != b.len() || a.is_empty() {
+            return None;
+        }
+        let mut dot = 0.0_f64;
+        let mut mag_a = 0.0_f64;
+        let mut mag_b = 0.0_f64;
+        for (x, y) in a.iter().zip(b.iter()) {
+            let x = *x as f64;
+            let y = *y as f64;
+            dot += x * y;
+            mag_a += x * x;
+            mag_b += y * y;
+        }
+        if mag_a == 0.0 || mag_b == 0.0 {
+            return None;
+        }
+        Some(dot / (mag_a.sqrt() * mag_b.sqrt()))
+    }
+
+    // ── Model Aliases (Phase 4.3) ──────────────────────────────────────────
     /// Upsert a batch of model catalog entries (Phase 7.1).
     pub fn upsert_model_catalog(&self, entries: &[ModelCatalogEntry]) -> Result<()> {
         if entries.is_empty() {
@@ -2492,6 +2585,20 @@ CREATE TABLE IF NOT EXISTS model_catalog (
   PRIMARY KEY (provider, model)
 );
 CREATE INDEX IF NOT EXISTS idx_model_catalog_provider ON model_catalog(provider);
+
+-- Phase 8.3: semantic memory vectors. Embeddings are stored as a JSON array
+-- of floats (TEXT) so the store stays dependency-free and self-contained; a
+-- production deployment can swap in a dedicated vector DB without changing the
+-- retrieval contract.
+CREATE TABLE IF NOT EXISTS memoryVectors (
+  id TEXT PRIMARY KEY,
+  sessionId TEXT NOT NULL,
+  role TEXT NOT NULL,
+  chunk TEXT NOT NULL,
+  embedding TEXT NOT NULL,
+  createdAt INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_memory_vectors_session ON memoryVectors(sessionId);
 "#;
 
 #[cfg(test)]
@@ -2995,6 +3102,50 @@ mod tests {
             }
         );
         assert!(storage.resolve_model_route("unknown-model").is_err());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn memory_vectors_upsert_and_search_by_similarity() {
+        let (storage, path) = temp_storage("memory-vectors");
+        // Helper avoids float literals (which trip the edit serializer).
+        fn v(x: i32, y: i32, z: i32) -> Vec<f32> {
+            vec![x as f32, y as f32, z as f32]
+        }
+        let a = v(10, 0, 0);
+        let b = v(0, 10, 0);
+        let q = v(9, 1, 0);
+        let zero = v(0, 0, 10);
+        let other = v(10, 0, 0);
+
+        storage
+            .upsert_memory_vector("sess-1", "user", "the cat sat on the mat", &a, 1)
+            .unwrap();
+        storage
+            .upsert_memory_vector("sess-1", "assistant", "a dog ran across the field", &b, 2)
+            .unwrap();
+
+        let results = storage.search_memory_vectors("sess-1", &q, 1).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "the cat sat on the mat");
+        assert!(results[0].1 > 0.9);
+
+        let all = storage.search_memory_vectors("sess-1", &zero, 2).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].0, "the cat sat on the mat");
+        assert_eq!(all[1].0, "a dog ran across the field");
+
+        assert!(storage
+            .search_memory_vectors("other", &other, 2)
+            .unwrap()
+            .is_empty());
+
+        storage.delete_memory_vectors("sess-1").unwrap();
+        assert!(storage
+            .search_memory_vectors("sess-1", &other, 2)
+            .unwrap()
+            .is_empty());
 
         let _ = fs::remove_file(path);
     }
