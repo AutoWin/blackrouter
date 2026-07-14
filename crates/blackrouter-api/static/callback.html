@@ -1,104 +1,105 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>OAuth Callback</title>
+<meta name="color-scheme" content="light dark" />
+<title>BlackRouter — OAuth Callback</title>
 <style>
-  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; max-width: 520px; margin: 100px auto; text-align: center; color: #1f2933; }
-  h1 { font-size: 1.25rem; }
-  p { color: #52606d; }
-  .ok { color: #2f7d5b; }
-  .err { color: #b5453f; }
-  code { display:block; word-break: break-all; background:#f4f5f7; border:1px solid #e4e7eb; border-radius:8px; padding:10px; font-size:12px; margin-top:12px; text-align:left; }
+:root {
+  color-scheme: light dark;
+  --bg:#f8f9f7;--surface:#fff;--surface-2:#f1f3ee;--border:#d9ddd2;
+  --text:#1f2520;--muted:#687165;--primary:#2f7d5b;--primary-soft:#e4f2ea;
+  --danger:#b5453f;--danger-soft:#fbe5e2;--info:#2563eb;--info-soft:#e0e7ff;
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#141714;--surface:#1c201d;--surface-2:#232825;--border:#353c36;
+  --text:#e4e8e1;--muted:#8a9486;--primary:#4aad82;--primary-soft:#1a3022;
+  --danger:#e0706a;--danger-soft:#2d1816;--info:#6495ed;--info-soft:#161d30;
+}}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+.card{width:min(100%,520px);padding:32px;border:1px solid var(--border);border-radius:16px;background:var(--surface);box-shadow:0 16px 48px rgba(0,0,0,.12);text-align:center}
+.brand{display:inline-flex;align-items:center;gap:10px;margin-bottom:28px;font-weight:750}.mark{display:grid;place-items:center;width:36px;height:36px;border:1px solid var(--border);border-radius:9px;color:var(--primary);background:var(--surface-2);font-size:12px}
+.status-icon{display:grid;place-items:center;width:56px;height:56px;margin:0 auto 18px;border-radius:50%;background:var(--info-soft);color:var(--info);font-size:24px}.status-icon.ok{background:var(--primary-soft);color:var(--primary)}.status-icon.err{background:var(--danger-soft);color:var(--danger)}
+h1{margin:0;font-size:22px;line-height:1.25}p{margin:10px 0 0;color:var(--muted);font-size:14px;line-height:1.55}
+.spinner{width:24px;height:24px;border:3px solid currentColor;border-top-color:transparent;border-radius:50%;animation:spin .7s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
+.manual{display:none;margin-top:24px;padding-top:20px;border-top:1px solid var(--border);text-align:left}.manual.visible{display:block}.manual p{margin:0 0 10px}
+.code-row{display:flex;gap:8px;align-items:stretch}code{display:block;flex:1;min-width:0;max-height:120px;overflow:auto;padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--surface-2);color:var(--text);font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;word-break:break-all}
+button{min-height:38px;padding:0 14px;border:1px solid var(--primary);border-radius:8px;background:var(--primary);color:#fff;font:600 13px inherit;cursor:pointer}button:focus-visible{outline:3px solid var(--primary-soft);outline-offset:2px}
+.copy-status{min-height:18px;margin-top:6px;color:var(--primary);font-size:12px}
+@media(max-width:520px){.card{padding:24px}.code-row{flex-direction:column}}
+@media(prefers-reduced-motion:reduce){.spinner{animation:none}}
 </style>
 </head>
 <body>
+<main class="card">
+  <div class="brand"><span class="mark">BR</span><span>BlackRouter</span></div>
+  <div id="statusIcon" class="status-icon"><span class="spinner" aria-hidden="true"></span></div>
   <h1 id="title">Completing authorization…</h1>
-  <p id="message">Please wait while we send the result back to BlackRouter.</p>
-  <div id="manual" style="display:none">
-    <p>If this tab did not close automatically, copy the address below and paste it into BlackRouter's “Submit code” box:</p>
-    <code id="url"></code>
-  </div>
+  <p id="message">Please wait while we securely relay the result to the control panel.</p>
+  <section id="manual" class="manual" aria-live="polite">
+    <p>If the window does not close automatically, copy this address and paste it into BlackRouter's manual code field.</p>
+    <div class="code-row"><code id="url"></code><button id="copyButton" type="button">Copy</button></div>
+    <div id="copyStatus" class="copy-status" role="status"></div>
+  </section>
+</main>
+<script>
+(function () {
+  var params = new URLSearchParams(window.location.search);
+  var data = {
+    code: params.get("code"),
+    state: params.get("state"),
+    error: params.get("error"),
+    errorDescription: params.get("error_description"),
+    fullUrl: window.location.href
+  };
+  var icon = document.getElementById("statusIcon");
+  var manual = document.getElementById("manual");
 
-  <script>
-    (function () {
-      var params = new URLSearchParams(window.location.search);
-      var code = params.get("code");
-      var state = params.get("state");
-      var error = params.get("error");
-      var errorDescription = params.get("error_description");
+  function setStatus(kind, title, message, symbol) {
+    document.getElementById("title").textContent = title;
+    document.getElementById("message").textContent = message;
+    icon.className = "status-icon" + (kind ? " " + kind : "");
+    icon.textContent = symbol || "";
+  }
+  function showManual() {
+    manual.classList.add("visible");
+    document.getElementById("url").textContent = window.location.href;
+  }
 
-      var data = {
-        code: code,
-        state: state,
-        error: error,
-        errorDescription: errorDescription,
-        fullUrl: window.location.href
-      };
+  var expectedOrigins = [window.location.origin, "http://localhost:1455"];
+  if (window.opener) {
+    expectedOrigins.forEach(function (origin) {
+      try { window.opener.postMessage({ type: "oauth_callback", data: data }, origin); } catch (_) {}
+    });
+  }
+  ["oauth_callback", "br_oauth"].forEach(function (name) {
+    try { var channel = new BroadcastChannel(name); channel.postMessage(data); channel.close(); } catch (_) {}
+  });
+  try {
+    localStorage.setItem("oauth_callback", JSON.stringify(Object.assign({}, data, { timestamp: Date.now() })));
+  } catch (_) {}
 
-      function setStatus(kind, title, message) {
-        var t = document.getElementById("title");
-        var m = document.getElementById("message");
-        t.textContent = title;
-        t.className = kind;
-        m.textContent = message;
-      }
+  if (data.error) {
+    setStatus("err", "Authorization failed", data.errorDescription || data.error, "!");
+    showManual();
+  } else if (!data.code) {
+    setStatus("", "Nothing to relay", "No authorization code was found in this address.", "—");
+    showManual();
+  } else {
+    setStatus("ok", "Authorization successful", "The result was sent to BlackRouter. This window will close automatically.", "✓");
+    setTimeout(function () { if (window.opener) window.close(); else showManual(); }, 1200);
+  }
 
-      // Trusted origins we are willing to relay the code/state to. We only ever
-      // post to our own origin (the setup page) or the Codex loopback origin.
-      var expectedOrigins = [window.location.origin, "http://localhost:1455"];
-
-      var relayed = false;
-
-      // Method 1: postMessage to the opener window (popup mode).
-      if (window.opener) {
-        expectedOrigins.forEach(function (origin) {
-          try {
-            window.opener.postMessage({ type: "oauth_callback", data: data }, origin);
-            relayed = true;
-          } catch (e) { /* ignore */ }
-        });
-      }
-
-      // Method 2: BroadcastChannel (other same-origin tabs).
-      try {
-        var channel = new BroadcastChannel("oauth_callback");
-        channel.postMessage(data);
-        channel.close();
-        relayed = true;
-      } catch (e) { /* ignore */ }
-
-      // Method 3: localStorage event (fallback for any tab listening).
-      try {
-        localStorage.setItem("oauth_callback", JSON.stringify(Object.assign({}, data, { timestamp: Date.now() })));
-        relayed = true;
-      } catch (e) { /* ignore */ }
-
-      if (error) {
-        setStatus("err", "Authorization Failed", errorDescription || error);
-        return;
-      }
-      if (!code) {
-        // Landed without a code (e.g. user opened the URL directly).
-        setStatus("", "Nothing to relay", "No authorization code was found in this URL.");
-        document.getElementById("manual").style.display = "block";
-        document.getElementById("url").textContent = window.location.href;
-        return;
-      }
-
-      setStatus("ok", "Authorization Successful", "This window will close automatically…");
-
-      // Close the popup if we opened it; otherwise show the manual copy box.
-      setTimeout(function () {
-        if (window.opener) {
-          window.close();
-        } else {
-          document.getElementById("manual").style.display = "block";
-          document.getElementById("url").textContent = window.location.href;
-        }
-      }, 1200);
-    })();
-  </script>
+  document.getElementById("copyButton").addEventListener("click", async function () {
+    try {
+      await navigator.clipboard.writeText(window.location.href);
+      document.getElementById("copyStatus").textContent = "Copied to clipboard.";
+    } catch (_) {
+      document.getElementById("copyStatus").textContent = "Copy failed. Select the address manually.";
+    }
+  });
+})();
+</script>
 </body>
 </html>

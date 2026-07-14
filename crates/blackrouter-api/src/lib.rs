@@ -110,6 +110,13 @@ pub fn build_router(state: AppState) -> Router {
         .route("/setup", get(setup_page))
         .route("/setup.css", get(setup_css))
         .route("/setup.js", get(setup_js))
+        .route("/core.js", get(core_js))
+        .route("/pages.js", get(pages_js))
+        .route("/apikeys.js", get(apikeys_js))
+        .route("/aliases.js", get(aliases_js))
+        .route("/limits.js", get(limits_js))
+        .route("/settings.js", get(settings_js))
+        .route("/versions.js", get(versions_js))
         .route("/oauth/callback", get(oauth::oauth_callback_page))
         .route("/health", get(health))
         .route("/healthz", get(healthz))
@@ -240,6 +247,7 @@ fn build_cors_layer() -> Option<CorsLayer> {
                 axum::http::header::AUTHORIZATION,
                 axum::http::header::CONTENT_TYPE,
                 axum::http::header::ACCEPT,
+                axum::http::HeaderName::from_static("x-control-token"),
             ])
             .allow_credentials(true),
     )
@@ -269,6 +277,37 @@ async fn setup_js() -> impl IntoResponse {
         include_str!("../static/setup.js"),
     )
 }
+
+async fn core_js() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        include_str!("../static/core.js"),
+    )
+}
+
+macro_rules! js_route {
+    ($name:ident, $path:literal) => {
+        async fn $name() -> impl IntoResponse {
+            (
+                [(
+                    header::CONTENT_TYPE,
+                    "application/javascript; charset=utf-8",
+                )],
+                include_str!(concat!("../static/", $path)),
+            )
+        }
+    };
+}
+
+js_route!(pages_js, "pages.js");
+js_route!(apikeys_js, "apikeys.js");
+js_route!(aliases_js, "aliases.js");
+js_route!(limits_js, "limits.js");
+js_route!(settings_js, "settings.js");
+js_route!(versions_js, "versions.js");
 
 #[derive(Serialize)]
 struct HealthResponse {

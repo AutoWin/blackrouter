@@ -1,0 +1,10 @@
+{
+  "name": "blackrouter-ui-tests",
+  "private": true,
+  "scripts": {
+    "test:ui": "playwright test --config=playwright.config.cjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.55.0"
+  }
+}

@@ -1,659 +1,534 @@
 <!doctype html>
 <html lang="en">
-    <head>
-        <meta charset="utf-8" />
-        <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <title>BlackRouter Setup</title>
-        <link rel="stylesheet" href="/setup.css" />
-    </head>
-    <body>
-        <div class="app-shell">
-            <aside class="sidebar">
-                <a class="brand" href="/setup" aria-label="BlackRouter setup">
-                    <span class="brand-mark">BR</span>
-                    <span>
-                        <strong>BlackRouter</strong>
-                        <small id="versionLabel">0.1.0</small>
-                    </span>
-                </a>
-                <nav class="tabs" aria-label="Setup sections">
-                    <button
-                        class="tab active"
-                        data-panel="runtime"
-                        type="button"
-                    >
-                        Runtime
-                    </button>
-                    <button class="tab" data-panel="database" type="button">
-                        Database
-                    </button>
-                    <button class="tab" data-panel="keys" type="button">
-                        API Keys
-                    </button>
-                    <button class="tab" data-panel="telegram" type="button">
-                        Telegram
-                    </button>
-                    <button class="tab" data-panel="providers" type="button">
-                        Providers
-                    </button>
-                    <button class="tab" data-panel="limits" type="button">
-                        Limits
-                    </button>
-                    <button class="tab" data-panel="combos" type="button">
-                        Combos
-                    </button>
-                    <button class="tab" data-panel="aliases" type="button">
-                        Aliases
-                    </button>
-                </nav>
-            </aside>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="color-scheme" content="light dark" />
+<title>BlackRouter — Control Panel</title>
+<link rel="stylesheet" href="/setup.css" />
+</head>
+<body>
+<div class="app-shell">
 
-            <main class="content">
-                <header class="topbar">
-                    <div>
-                        <h1>Setup</h1>
-                        <p id="endpointLabel">127.0.0.1:20130</p>
-                    </div>
-                    <div class="actions">
-                        <span id="healthBadge" class="badge muted"
-                            >Checking</span
-                        >
-                        <button
-                            id="refreshButton"
-                            class="icon-button"
-                            type="button"
-                            aria-label="Refresh"
-                        >
-                            <span aria-hidden="true">R</span>
-                        </button>
-                    </div>
-                </header>
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<!-- SIDEBAR                                                         -->
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<aside class="sidebar" id="sidebar">
+    <a class="brand" href="/setup" aria-label="BlackRouter Control Panel">
+        <span class="brand-mark">BR</span>
+        <span class="brand-text">
+            <strong>BlackRouter</strong>
+            <small id="versionLabel">—</small>
+        </span>
+    </a>
 
-                <section id="runtime" class="panel active">
-                    <div class="section-head">
-                        <h2>Runtime</h2>
-                        <span id="uptimeLabel" class="metric">0s</span>
-                    </div>
-                    <div class="grid two">
-                        <label class="field">
-                            <span>Host</span>
-                            <input id="hostValue" readonly />
-                        </label>
-                        <label class="field">
-                            <span>Port</span>
-                            <input id="portValue" readonly />
-                        </label>
-                        <label class="field">
-                            <span>Data Dir</span>
-                            <input id="dataDirValue" readonly />
-                        </label>
-                        <label class="field">
-                            <span>Database URL</span>
-                            <input id="databaseUrlValue" readonly />
-                        </label>
-                    </div>
-                    <form id="configForm" class="form-block">
-                        <div class="section-head compact">
-                            <h2>Saved Config</h2>
-                            <span id="configSaveBadge" class="badge muted"
-                                >DB backed</span
-                            >
-                        </div>
-                        <label class="check-field">
-                            <input id="configRequireApiKey" type="checkbox" />
-                            <span
-                                >Require API key for v1 routes after runtime
-                                wiring</span
-                            >
-                        </label>
-                        <div class="grid two">
-                            <label class="check-field inline">
-                                <input id="healthProbeEnabledInput" type="checkbox" />
-                                <span>Proactive provider probes</span>
-                            </label>
-                            <label class="field">
-                                <span>Probe interval (seconds)</span>
-                                <input id="healthProbeIntervalInput" type="number" min="5" value="30" />
-                            </label>
-                            <label class="field">
-                                <span>Probe timeout (seconds)</span>
-                                <input id="healthProbeTimeoutInput" type="number" min="1" value="5" />
-                            </label>
-                            <label class="field">
-                                <span>Failure threshold</span>
-                                <input id="healthProbeThresholdInput" type="number" min="1" value="3" />
-                            </label>
-                        </div>
-                        <div class="form-actions">
-                            <button class="primary-button" type="submit">
-                                Save Config
-                            </button>
-                        </div>
-                    </form>
-                </section>
+    <nav class="nav" aria-label="Main navigation">
+        <button class="nav-item active" data-panel="overview" type="button">
+            <span class="nav-icon">◉</span>
+            <span class="nav-label">Overview</span>
+            <span class="nav-badge" id="navStatusDot"></span>
+        </button>
 
-                <section id="database" class="panel">
-                    <div class="section-head">
-                        <h2>Database</h2>
-                        <span id="databaseBadge" class="badge muted"
-                            >Unknown</span
-                        >
-                    </div>
-                    <div class="grid two">
-                        <label class="field wide">
-                            <span>SQLite Path</span>
-                            <input id="databasePathValue" readonly />
-                        </label>
-                        <label class="field">
-                            <span>9Router Compatibility</span>
-                            <input id="compatValue" readonly />
-                        </label>
-                    </div>
-                    <div
-                        id="tableCounts"
-                        class="table-list"
-                        aria-live="polite"
-                    ></div>
-                </section>
+        <div class="nav-divider"><span>Routing</span></div>
 
-                <section id="keys" class="panel">
-                    <div class="section-head">
-                        <h2>API Keys</h2>
-                        <span id="apiKeyBadge" class="badge muted"
-                            >Unknown</span
-                        >
-                    </div>
-                    <div class="grid two">
-                        <label class="field">
-                            <span>Require API Key</span>
-                            <input id="requireApiKeyValue" readonly />
-                        </label>
-                        <label class="field">
-                            <span>Configured Keys</span>
-                            <input id="apiKeyCountValue" readonly />
-                        </label>
-                    </div>
-                    <form id="apiKeyForm" class="form-block">
-                        <input id="apiKeyEditIdInput" type="hidden" />
-                        <div class="grid two">
-                            <label class="field">
-                                <span>Name</span>
-                                <input
-                                    id="apiKeyNameInput"
-                                    placeholder="Local CLI"
-                                />
-                            </label>
-                            <label class="field">
-                                <span>Tenant ID</span>
-                                <input id="apiKeyTenantInput" placeholder="team-acme" />
-                            </label>
-                            <label class="field">
-                                <span>Requests / day</span>
-                                <input id="apiKeyRequestsInput" type="number" min="1" placeholder="unlimited" />
-                            </label>
-                            <label class="field">
-                                <span>Tokens / day</span>
-                                <input id="apiKeyTokensInput" type="number" min="1" placeholder="unlimited" />
-                            </label>
-                            <label class="field">
-                                <span>Cost / month (USD)</span>
-                                <input id="apiKeyCostInput" type="number" min="0" step="0.01" placeholder="unlimited" />
-                            </label>
-                            <label class="field">
-                                <span>Provider allowlist</span>
-                                <input id="apiKeyProvidersInput" placeholder="openai, anthropic" />
-                            </label>
-                            <label class="field">
-                                <span>Model allowlist</span>
-                                <input id="apiKeyModelsInput" placeholder="openai/gpt-5, claude-sonnet" />
-                            </label>
-                            <label class="field">
-                                <span>Machine ID</span>
-                                <input
-                                    id="apiKeyMachineInput"
-                                    placeholder="optional"
-                                />
-                            </label>
-                        </div>
-                        <div class="form-actions">
-                            <button class="primary-button" type="submit">
-                                <span id="apiKeySubmitLabel">Create API Key</span>
-                            </button>
-                            <button id="apiKeyCancelEditButton" class="secondary-button hidden" type="button">Cancel</button>
-                        </div>
-                    </form>
-                    <div id="newApiKeyNotice" class="notice hidden"></div>
-                    <div
-                        id="apiKeysList"
-                        class="table-list"
-                        aria-live="polite"
-                    ></div>
-                </section>
+        <button class="nav-item" data-panel="providers" type="button">
+            <span class="nav-icon">⬡</span>
+            <span class="nav-label">Providers</span>
+            <span class="nav-badge pill muted" id="navProvidersBadge"></span>
+        </button>
 
-                <section id="telegram" class="panel">
-                    <div class="section-head">
-                        <h2>Telegram</h2>
-                        <span id="telegramBadge" class="badge muted"
-                            >Unknown</span
-                        >
-                    </div>
-                    <div class="grid two">
-                        <label class="check-field inline">
-                            <input id="telegramEnabledInput" type="checkbox" />
-                            <span>Enabled</span>
-                        </label>
-                        <label class="field">
-                            <span>Admin IDs</span>
-                            <input
-                                id="telegramAdminInput"
-                                placeholder="123456,987654"
-                            />
-                        </label>
-                        <label class="check-field inline">
-                            <input id="telegramWebhookInput" type="checkbox" />
-                            <span>Use Webhook</span>
-                        </label>
-                        <label class="field">
-                            <span>Link TTL</span>
-                            <input
-                                id="telegramTtlInput"
-                                type="number"
-                                min="60"
-                                step="1"
-                            />
-                        </label>
-                        <label class="field wide">
-                            <span>Webhook URL</span>
-                            <input
-                                id="telegramWebhookUrlInput"
-                                placeholder="https://example.com/telegram/webhook"
-                            />
-                        </label>
-                    </div>
-                    <div class="form-actions">
-                        <button
-                            id="saveTelegramButton"
-                            class="primary-button"
-                            type="button"
-                        >
-                            Save Telegram Config
-                        </button>
-                    </div>
-                </section>
+        <button class="nav-item" data-panel="combos" type="button">
+            <span class="nav-icon">⌘</span>
+            <span class="nav-label">Combos</span>
+            <span class="nav-badge pill muted" id="navCombosBadge"></span>
+        </button>
 
-                <section id="providers" class="panel">
-                    <div class="section-head">
-                        <h2>Providers</h2>
-                        <span id="modelsBadge" class="badge muted"
-                            >0 models</span
-                        >
-                    </div>
-                    <form id="providerForm" class="form-block">
-                        <input id="providerEditIdInput" type="hidden" />
-                        <div class="grid two">
-                            <label class="field wide">
-                                <span>Preset</span>
-                                <select id="providerPresetInput"></select>
-                            </label>
-                            <label class="field">
-                                <span>Provider</span>
-                                <input
-                                    id="providerInput"
-                                    placeholder="openai"
-                                    required
-                                />
-                            </label>
-                            <label class="field">
-                                <span>Auth Type</span>
-                                <select id="authTypeInput">
-                                    <option value="api-key">
-                                        API Key (Bearer)
-                                    </option>
-                                    <option value="bearer">Bearer Token</option>
-                                    <option value="oauth">OAuth Token</option>
-                                    <option value="basic">Basic Auth</option>
-                                    <option value="header">
-                                        Custom Header
-                                    </option>
-                                    <option value="none">None</option>
-                                </select>
-                            </label>
-                            <label class="field">
-                                <span>Base URL</span>
-                                <input
-                                    id="providerBaseUrlInput"
-                                    placeholder="https://api.openai.com/v1/chat/completions"
-                                />
-                            </label>
-                            <label class="field">
-                                <span>Format</span>
-                                <input
-                                    id="providerFormatInput"
-                                    placeholder="openai"
-                                />
-                            </label>
-                            <label class="field">
-                                <span>Name</span>
-                                <input
-                                    id="providerNameInput"
-                                    placeholder="OpenAI primary"
-                                />
-                            </label>
-                            <input id="providerEmailInput" type="hidden" />
-                            <label class="field">
-                                <span>Priority</span>
-                                <input
-                                    id="providerPriorityInput"
-                                    type="number"
-                                    step="1"
-                                    placeholder="1"
-                                />
-                            </label>
-                            <!-- API Key / Bearer Token field (shown for api-key, bearer) -->
-                            <label class="field wide" id="apiKeyField">
-                                <span>API Key / Token</span>
-                                <input
-                                    id="providerApiKeyInput"
-                                    autocomplete="off"
-                                    placeholder="provider API key or access token"
-                                />
-                                <button
-                                    id="oauthGithubButton"
-                                    class="oauth-button"
-                                    type="button"
-                                    style="display: none; margin-top: 6px"
-                                >
-                                    🔑 Login with GitHub
-                                </button>
-                            </label>
-                            <!-- Basic Auth fields (shown for basic) -->
-                            <label
-                                class="field"
-                                id="basicUserField"
-                                style="display: none"
-                            >
-                                <span>Username</span>
-                                <input
-                                    id="providerBasicUserInput"
-                                    autocomplete="off"
-                                    placeholder="username"
-                                />
-                            </label>
-                            <label
-                                class="field"
-                                id="basicPassField"
-                                style="display: none"
-                            >
-                                <span>Password</span>
-                                <input
-                                    id="providerBasicPassInput"
-                                    type="password"
-                                    autocomplete="off"
-                                    placeholder="password"
-                                />
-                            </label>
-                            <!-- Custom Header fields (shown for header) -->
-                            <label
-                                class="field"
-                                id="headerNameField"
-                                style="display: none"
-                            >
-                                <span>Header Name</span>
-                                <input
-                                    id="providerHeaderNameInput"
-                                    autocomplete="off"
-                                    placeholder="X-API-Key"
-                                />
-                            </label>
-                            <label
-                                class="field"
-                                id="headerValueField"
-                                style="display: none"
-                            >
-                                <span>Header Value</span>
-                                <input
-                                    id="providerHeaderValueInput"
-                                    autocomplete="off"
-                                    placeholder="header value"
-                                />
-                            </label>
-                            <label class="check-field inline">
-                                <input
-                                    id="providerActiveInput"
-                                    type="checkbox"
-                                    checked
-                                />
-                                <span>Active</span>
-                            </label>
-                            <label class="field wide">
-                                <span>Data JSON</span>
-                                <textarea
-                                    id="providerDataInput"
-                                    rows="6"
-                                    spellcheck="false"
-                                    placeholder='{"baseUrl":"https://api.openai.com/v1/chat/completions","apiKey":"..."}'
-                                ></textarea>
-                            </label>
-                        </div>
-                        <div class="form-actions">
-                            <button
-                                id="providerCancelEditButton"
-                                class="secondary-button hidden"
-                                type="button"
-                            >
-                                Cancel Edit
-                            </button>
-                            <button
-                                id="providerSubmitButton"
-                                class="primary-button"
-                                type="submit"
-                            >
-                                Add Provider
-                            </button>
-                        </div>
-                    </form>
-                    <div
-                        id="oauthNotice"
-                        class="notice hidden"
-                        style="margin-bottom: 12px"
-                    ></div>
-                    <div
-                        id="oauthManual"
-                        class="notice hidden"
-                        style="margin-bottom: 12px"
-                    >
-                        <p style="margin: 0 0 6px">
-                            If the login window can't redirect back automatically
-                            (e.g. BlackRouter runs remotely/Docker), copy the URL
-                            from its address bar and paste it below:
-                        </p>
-                        <input
-                            id="oauthManualInput"
-                            type="text"
-                            placeholder="http://localhost:1455/auth/callback?code=...&amp;state=..."
-                            style="width: 100%; box-sizing: border-box"
-                        />
-                        <button
-                            id="oauthManualButton"
-                            type="button"
-                            class="oauth-button"
-                            style="margin-top: 6px"
-                        >
-                            Submit code
-                        </button>
-                    </div>
-                    <div id="providerTestNotice" class="notice hidden"></div>
-                    <div
-                        id="providersList"
-                        class="table-list"
-                        aria-live="polite"
-                    ></div>
-                    <div
-                        id="modelsList"
-                        class="model-list"
-                        aria-live="polite"
-                    ></div>
-                </section>
+        <button class="nav-item" data-panel="aliases" type="button">
+            <span class="nav-icon">→</span>
+            <span class="nav-label">Aliases</span>
+            <span class="nav-badge pill muted" id="navAliasesBadge"></span>
+        </button>
 
-                <section id="limits" class="panel">
-                    <div class="section-head">
-                        <h2>Limits</h2>
-                        <span id="limitsBadge" class="badge muted"
-                            >No upstream data</span
-                        >
-                    </div>
-                    <div class="form-actions limits-actions">
-                        <span id="limitsUpdated" class="muted-note"></span>
-                        <button
-                            id="refreshLimitsButton"
-                            class="secondary-button"
-                            type="button"
-                        >
-                            Refresh Limits
-                        </button>
-                    </div>
-                    <div
-                        id="limitsNotice"
-                        class="notice hidden"
-                        aria-live="polite"
-                    ></div>
-                    <div id="limitsSummary" class="limit-summary"></div>
-                    <div id="costGuardSummary" class="limit-summary"></div>
-                    <form id="costGuardForm" class="form-block">
-                        <div class="grid two">
-                            <label class="check-field inline">
-                                <input id="costGuardEnabledInput" type="checkbox" />
-                                <span>Enable cost guard</span>
-                            </label>
-                            <label class="field">
-                                <span>Daily budget (USD)</span>
-                                <input id="costGuardDailyInput" type="number" min="0" step="0.01" placeholder="unlimited" />
-                            </label>
-                            <label class="field">
-                                <span>Monthly budget (USD)</span>
-                                <input id="costGuardMonthlyInput" type="number" min="0" step="0.01" placeholder="unlimited" />
-                            </label>
-                        </div>
-                        <div class="form-actions"><button class="primary-button" type="submit">Save Cost Guard</button></div>
-                    </form>
-                    <div
-                        id="limitsList"
-                        class="table-list limit-list"
-                        aria-live="polite"
-                    ></div>
-                </section>
+        <div class="nav-divider"><span>Access</span></div>
 
-                <section id="combos" class="panel">
-                    <div class="section-head">
-                        <h2>Combos</h2>
-                        <span id="combosBadge" class="badge muted"
-                            >0 combos</span
-                        >
-                    </div>
-                    <form id="comboForm" class="form-block">
-                        <input id="comboEditIdInput" type="hidden" />
-                        <div class="grid two">
-                            <label class="field">
-                                <span>Name</span>
-                                <input
-                                    id="comboNameInput"
-                                    placeholder="code-high"
-                                    required
-                                />
-                            </label>
-                            <label class="field">
-                                <span>Provider</span>
-                                <select id="comboProviderInput">
-                                    <option value="">All providers</option>
-                                </select>
-                            </label>
-                            <input id="comboKindInput" type="hidden" value="llm" />
-                        </div>
+        <button class="nav-item" data-panel="apikeys" type="button">
+            <span class="nav-icon">🔑</span>
+            <span class="nav-label">API Keys</span>
+            <span class="nav-badge pill muted" id="navApiKeysBadge"></span>
+        </button>
 
-                        <div class="field wide">
-                            <span>
-                                Models in Combo
-                                <small>(fallback order, top = highest priority)</small>
-                            </span>
-                            <div
-                                id="comboModelsInput"
-                                class="model-editor"
-                                aria-live="polite"
-                            ></div>
-                            <p
-                                id="comboEmptyHint"
-                                class="empty-hint"
-                            >
-                                No models added yet. Pick from the list below or
-                                type a provider/model above.
-                            </p>
-                        </div>
+        <div class="nav-divider"><span>Operations</span></div>
 
-                        <div class="combo-add-row">
-                            <input
-                                id="comboModelManualInput"
-                                class="combo-add-input"
-                                placeholder="provider/model (e.g. cline/claude-sonnet-4)"
-                                spellcheck="false"
-                            />
-                            <button
-                                id="comboAddManualButton"
-                                class="secondary-button"
-                                type="button"
-                            >
-                                Add Model
-                            </button>
-                        </div>
+        <button class="nav-item" data-panel="limits" type="button">
+            <span class="nav-icon">◫</span>
+            <span class="nav-label">Limits &amp; Cost</span>
+            <span class="nav-badge pill muted" id="navLimitsBadge"></span>
+        </button>
 
-                        <div
-                            id="comboNotice"
-                            class="notice hidden"
-                            aria-live="polite"
-                        ></div>
+        <button class="nav-item" data-panel="settings" type="button">
+            <span class="nav-icon">⚙</span>
+            <span class="nav-label">Settings</span>
+        </button>
+    </nav>
 
-                        <div class="form-actions">
-                            <button
-                                id="comboCancelEditButton"
-                                class="secondary-button hidden"
-                                type="button"
-                            >
-                                Cancel Edit
-                            </button>
-                            <button
-                                id="comboSubmitButton"
-                                class="primary-button"
-                                type="submit"
-                            >
-                                Add Combo
-                            </button>
-                        </div>
-                    </form>
-                    <h3 class="subhead">Available Models</h3>
-                    <div
-                        id="comboModelsList"
-                        class="model-list"
-                        aria-live="polite"
-                    ></div>
-                    <div
-                        id="combosList"
-                        class="table-list"
-                        aria-live="polite"
-                    ></div>
-                </section>
+    <div class="sidebar-footer">
+        <button id="themeToggle" class="icon-button" type="button" aria-label="Toggle theme" title="Toggle dark/light mode">
+            ◐
+        </button>
+        <button id="sidebarRefresh" class="icon-button" type="button" aria-label="Refresh data" title="Refresh">
+            ↻
+        </button>
+    </div>
+</aside>
 
-                <section id="aliases" class="panel">
-                    <div class="section-head"><h2>Model Aliases</h2><span id="aliasesBadge" class="badge muted">0 aliases</span></div>
-                    <form id="aliasForm" class="form-block">
-                        <div class="grid two">
-                            <label class="field"><span>Alias</span><input id="aliasNameInput" placeholder="fast" required /></label>
-                            <label class="field"><span>Target</span><input id="aliasTargetInput" placeholder="openai/gpt-5-mini" required /></label>
-                        </div>
-                        <div class="form-actions"><button class="primary-button" type="submit">Add Alias</button></div>
-                    </form>
-                    <div id="aliasesList" class="table-list" aria-live="polite"></div>
-                </section>
-            </main>
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<!-- MOBILE NAV OVERLAY                                             -->
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<div class="mobile-nav-overlay hidden" id="mobileNavOverlay"></div>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<!-- MAIN CONTENT                                                   -->
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<main class="content">
+    <header class="topbar">
+        <div class="topbar-left">
+            <button id="mobileMenuBtn" class="icon-button mobile-only" type="button" aria-label="Open menu">
+                ☰
+            </button>
+            <div>
+                <h1 id="pageTitle">Overview</h1>
+                <p id="pageSubtitle">System status at a glance</p>
+            </div>
         </div>
-        <script src="/setup.js"></script>
-    </body>
+        <div class="topbar-right">
+            <span id="healthPill" class="pill muted">Checking…</span>
+            <button id="globalRefreshBtn" class="icon-button" type="button" aria-label="Refresh all data" title="Refresh">
+                ↻
+            </button>
+            <span id="uptimeLabel" class="pill muted">—</span>
+            <span id="endpointLabel" class="pill muted">—</span>
+        </div>
+    </header>
+
+    <!-- ═══════════ PANEL: Overview ═══════════ -->
+    <section id="overview" class="panel active">
+        <div class="dashboard-grid cols-4" id="dashSystemStatus"></div>
+        <div id="dashAlerts" class="alerts-area hidden"></div>
+
+        <div class="card dash-section">
+            <div class="card-header">
+                <h2 class="card-title">Providers</h2>
+                <button class="btn btn-sm btn-ghost" type="button" data-action="nav-to" data-panel="providers">Manage →</button>
+            </div>
+            <div id="dashProviders" class="dash-list" aria-live="polite"></div>
+        </div>
+
+        <div class="dashboard-grid cols-2" style="margin-top:20px">
+            <div class="card">
+                <div class="card-header"><h2 class="card-title">Traffic (today)</h2></div>
+                <div class="dashboard-grid cols-3" id="dashTraffic"></div>
+            </div>
+            <div class="card">
+                <div class="card-header"><h2 class="card-title">Cost</h2></div>
+                <div class="dashboard-grid cols-2" id="dashCost"></div>
+            </div>
+        </div>
+
+        <div class="card" style="margin-top:20px">
+            <div class="card-header"><h2 class="card-title">Quick Actions</h2></div>
+            <div class="btn-row">
+                <button class="btn btn-primary" type="button" data-action="add-provider">+ Add Provider</button>
+                <button class="btn btn-secondary" type="button" data-action="add-apikey">+ Create API Key</button>
+                <button class="btn btn-secondary" type="button" data-action="add-combo">+ Create Combo</button>
+                <button class="btn btn-ghost" type="button" data-action="run-doctor">🔍 Run Doctor</button>
+            </div>
+        </div>
+    </section>
+
+    <!-- ═══════════ PANEL: Providers ═══════════ -->
+    <section id="providers" class="panel">
+        <div class="panel-header">
+            <div>
+                <h2>Provider Connections</h2>
+                <p class="text-muted">Manage upstream AI provider connections</p>
+            </div>
+            <div class="panel-header-actions">
+                <input id="providerSearchInput" class="input provider-search" type="search" placeholder="Search…" />
+                <button id="addProviderBtn" class="btn btn-primary" type="button">+ Add Provider</button>
+            </div>
+        </div>
+        <div id="providersList" class="data-list" aria-live="polite"></div>
+        <div id="modelsList" class="data-list" style="margin-top:20px" aria-live="polite"></div>
+    </section>
+
+    <!-- ═══════════ PANEL: Combos ═══════════ -->
+    <section id="combos" class="panel">
+        <div class="panel-header">
+            <div>
+                <h2>Combos</h2>
+                <p class="text-muted">Fallback model chains — models tried top-to-bottom on failure.</p>
+            </div>
+            <button id="addComboBtn" class="btn btn-primary" type="button">+ Create Combo</button>
+        </div>
+        <div id="combosList" class="data-list" aria-live="polite"></div>
+    </section>
+
+    <!-- ═══════════ PANEL: Aliases ═══════════ -->
+    <section id="aliases" class="panel">
+        <div class="panel-header">
+            <div>
+                <h2>Model Aliases</h2>
+                <p class="text-muted">Map friendly names to provider/model targets.</p>
+            </div>
+        </div>
+        <form id="aliasForm" class="inline-form">
+            <label class="field"><span>Alias</span><input id="aliasNameInput" class="input" placeholder="fast" required /></label>
+            <label class="field"><span>Target</span><input id="aliasTargetInput" class="input" placeholder="openai/gpt-5-mini" required /></label>
+            <button class="btn btn-primary" type="submit">Add Alias</button>
+        </form>
+        <div id="aliasesList" class="data-list" aria-live="polite"></div>
+    </section>
+
+    <!-- ═══════════ PANEL: API Keys ═══════════ -->
+    <section id="apikeys" class="panel">
+        <div class="panel-header">
+            <div>
+                <h2>API Keys</h2>
+                <p class="text-muted">Gateway API keys with per-tenant quota and access policies.</p>
+            </div>
+            <button id="addApiKeyBtn" class="btn btn-primary" type="button">+ Create API Key</button>
+        </div>
+        <div id="apiKeysList" class="data-list" aria-live="polite"></div>
+        <div id="newApiKeyNotice" class="notice hidden"></div>
+    </section>
+
+    <!-- ═══════════ PANEL: Limits & Cost ═══════════ -->
+    <section id="limits" class="panel">
+        <div class="panel-header">
+            <div>
+                <h2>Limits &amp; Cost</h2>
+                <p class="text-muted">Gateway rate limits, upstream provider limits, and cost guard.</p>
+            </div>
+            <div class="panel-header-actions">
+                <span id="limitsUpdated" class="text-muted text-sm"></span>
+                <button id="refreshLimitsBtn" class="btn btn-secondary" type="button">Refresh</button>
+            </div>
+        </div>
+        <div id="limitsNotice" class="notice hidden" aria-live="polite"></div>
+        <div class="dashboard-grid cols-4" id="limitsSummary"></div>
+        <div class="dashboard-grid cols-3" id="costGuardSummary"></div>
+
+        <form id="costGuardForm" class="card" style="margin-top:20px">
+            <div class="card-header"><h3 class="card-title">Cost Guard</h3></div>
+            <div class="dashboard-grid cols-3">
+                <label class="check-field"><input id="costGuardEnabledInput" type="checkbox" /><span>Enable cost guard</span></label>
+                <label class="field"><span>Daily budget (USD)</span><input id="costGuardDailyInput" class="input" type="number" min="0" step="0.01" placeholder="unlimited" /></label>
+                <label class="field"><span>Monthly budget (USD)</span><input id="costGuardMonthlyInput" class="input" type="number" min="0" step="0.01" placeholder="unlimited" /></label>
+            </div>
+            <div class="form-actions">
+                <button class="btn btn-primary" type="submit">Save Cost Guard</button>
+            </div>
+        </form>
+
+        <div id="limitsList" class="data-list" style="margin-top:20px" aria-live="polite"></div>
+    </section>
+
+    <!-- ═══════════ PANEL: Settings ═══════════ -->
+    <section id="settings" class="panel">
+        <!-- Runtime -->
+        <div class="card">
+            <div class="card-header"><h3 class="card-title">Runtime</h3></div>
+            <div class="dashboard-grid cols-2">
+                <label class="field"><span>Host</span><input id="hostValue" class="input" readonly /></label>
+                <label class="field"><span>Port</span><input id="portValue" class="input" readonly /></label>
+                <label class="field"><span>Data Dir</span><input id="dataDirValue" class="input" readonly /></label>
+                <label class="field"><span>Database URL</span><input id="databaseUrlValue" class="input" readonly /></label>
+            </div>
+        </div>
+
+        <!-- Database -->
+        <div class="card" style="margin-top:20px">
+            <div class="card-header">
+                <h3 class="card-title">Database</h3>
+                <span id="databaseBadge" class="pill muted">Unknown</span>
+            </div>
+            <div class="dashboard-grid cols-2">
+                <label class="field"><span>SQLite Path</span><input id="databasePathValue" class="input" readonly /></label>
+                <label class="field"><span>9Router Compat</span><input id="compatValue" class="input" readonly /></label>
+            </div>
+            <div id="tableCounts" class="data-list" style="margin-top:12px"></div>
+        </div>
+
+        <!-- Global config -->
+        <form id="configForm" class="card" style="margin-top:20px">
+            <div class="card-header">
+                <h3 class="card-title">Configuration</h3>
+                <span id="configSaveBadge" class="pill muted">DB backed</span>
+            </div>
+            <label class="check-field" style="margin-bottom:16px">
+                <input id="configRequireApiKey" type="checkbox" />
+                <span>Require API key for /v1 routes</span>
+            </label>
+
+            <h4 class="subhead">Health Probe</h4>
+            <div class="dashboard-grid cols-4">
+                <label class="check-field"><input id="healthProbeEnabledInput" type="checkbox" /><span>Enable proactive probes</span></label>
+                <label class="field"><span>Interval (s)</span><input id="healthProbeIntervalInput" class="input" type="number" min="5" value="30" /></label>
+                <label class="field"><span>Timeout (s)</span><input id="healthProbeTimeoutInput" class="input" type="number" min="1" value="5" /></label>
+                <label class="field"><span>Failure threshold</span><input id="healthProbeThresholdInput" class="input" type="number" min="1" value="3" /></label>
+            </div>
+
+            <h4 class="subhead">Telegram</h4>
+            <div class="dashboard-grid cols-2">
+                <label class="check-field"><input id="telegramEnabledInput" type="checkbox" /><span>Enabled</span></label>
+                <label class="field"><span>Admin IDs</span><input id="telegramAdminInput" class="input" placeholder="123456,987654" /></label>
+                <label class="check-field"><input id="telegramWebhookInput" type="checkbox" /><span>Use Webhook</span></label>
+                <label class="field"><span>Link TTL (s)</span><input id="telegramTtlInput" class="input" type="number" min="60" value="300" /></label>
+                <label class="field wide"><span>Webhook URL</span><input id="telegramWebhookUrlInput" class="input" placeholder="https://example.com/telegram/webhook" /></label>
+            </div>
+
+            <div class="form-actions">
+                <button class="btn btn-primary" type="submit">Save Config</button>
+            </div>
+        </form>
+
+        <div class="card" style="margin-top:20px">
+            <div class="card-header">
+                <h3 class="card-title">Config History</h3>
+                <button id="loadVersionsBtn" class="btn btn-sm btn-ghost" type="button">Load versions</button>
+            </div>
+            <div id="configVersionsList" class="data-list">
+                <p class="text-muted text-sm">Click Load versions to fetch config history.</p>
+            </div>
+        </div>
+    </section>
+</main>
+
+</div><!-- .app-shell -->
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+<!-- MODALS                                                          -->
+<!-- ═══════════════════════════════════════════════════════════════ -->
+
+<!-- Provider drawer -->
+<div id="drawer-provider" class="drawer-overlay hidden" aria-hidden="true">
+    <div class="drawer" role="dialog" aria-modal="true" aria-labelledby="drawerProviderTitle">
+        <div class="drawer-header">
+            <h3 id="drawerProviderTitle">Add Provider</h3>
+            <button class="icon-button" type="button" data-close="drawer-provider" aria-label="Close">✕</button>
+        </div>
+        <div class="drawer-body">
+            <form id="providerForm">
+                <input id="providerEditIdInput" type="hidden" />
+                <div class="dashboard-grid cols-2">
+                    <label class="field wide"><span>Preset</span><select id="providerPresetInput" class="input"></select></label>
+                    <label class="field"><span>Provider</span><input id="providerInput" class="input" placeholder="openai" required /></label>
+                    <label class="field"><span>Auth Type</span>
+                        <select id="authTypeInput" class="input">
+                            <option value="api-key">API Key (Bearer)</option>
+                            <option value="bearer">Bearer Token</option>
+                            <option value="oauth">OAuth Token</option>
+                            <option value="basic">Basic Auth</option>
+                            <option value="header">Custom Header</option>
+                            <option value="none">None</option>
+                        </select>
+                    </label>
+                    <label class="field"><span>Base URL</span><input id="providerBaseUrlInput" class="input" /></label>
+                    <label class="field"><span>Format</span><input id="providerFormatInput" class="input" placeholder="openai" /></label>
+                    <label class="field"><span>Name</span><input id="providerNameInput" class="input" placeholder="OpenAI primary" /></label>
+                    <input id="providerEmailInput" type="hidden" />
+                    <label class="field"><span>Priority</span><input id="providerPriorityInput" class="input" type="number" step="1" placeholder="1" /></label>
+                </div>
+                <div id="apiKeyField" class="field wide" style="margin-top:12px">
+                    <span>API Key / Token</span>
+                    <input id="providerApiKeyInput" class="input" autocomplete="off" />
+                    <button id="oauthGithubButton" class="btn btn-oauth" type="button" style="display:none;margin-top:6px">🔑 Connect Account</button>
+                </div>
+                <div id="basicUserField" class="field" style="display:none;margin-top:12px"><span>Username</span><input id="providerBasicUserInput" class="input" autocomplete="off" /></div>
+                <div id="basicPassField" class="field" style="display:none;margin-top:12px"><span>Password</span><input id="providerBasicPassInput" class="input" type="password" autocomplete="off" /></div>
+                <div id="headerNameField" class="field" style="display:none;margin-top:12px"><span>Header Name</span><input id="providerHeaderNameInput" class="input" autocomplete="off" /></div>
+                <div id="headerValueField" class="field" style="display:none;margin-top:12px"><span>Header Value</span><input id="providerHeaderValueInput" class="input" autocomplete="off" /></div>
+                <label class="check-field" style="margin-top:12px"><input id="providerActiveInput" type="checkbox" checked /><span>Active</span></label>
+                <label class="field wide" style="margin-top:12px"><span>Data JSON</span><textarea id="providerDataInput" class="textarea" rows="6" spellcheck="false"></textarea></label>
+                <div id="oauthNotice" class="notice hidden" style="margin-top:12px"></div>
+                <div id="oauthManual" class="notice hidden" style="margin-top:12px">
+                    <p style="margin:0 0 6px">If the login window can't redirect automatically, paste the redirect URL below:</p>
+                    <input id="oauthManualInput" class="input" type="text" style="width:100%" />
+                    <button id="oauthManualButton" class="btn btn-oauth" type="button" style="margin-top:6px">Submit code</button>
+                </div>
+                <div id="providerTestNotice" class="notice hidden" style="margin-top:12px"></div>
+            </form>
+        </div>
+        <div class="drawer-footer">
+            <button id="providerCancelEditButton" class="btn btn-secondary hidden" type="button">Cancel</button>
+            <button id="providerSubmitButton" class="btn btn-primary" type="submit" form="providerForm">Add Provider</button>
+        </div>
+    </div>
+</div>
+
+<!-- API Key drawer -->
+<div id="drawer-apikey" class="drawer-overlay hidden" aria-hidden="true">
+    <div class="drawer" role="dialog" aria-modal="true" aria-labelledby="drawerApiKeyTitle">
+        <div class="drawer-header">
+            <h3 id="drawerApiKeyTitle">Create API Key</h3>
+            <button class="icon-button" type="button" data-close="drawer-apikey" aria-label="Close">✕</button>
+        </div>
+        <div class="drawer-body">
+            <form id="apiKeyForm">
+                <input id="apiKeyEditIdInput" type="hidden" />
+                <h4 class="subhead">Identity</h4>
+                <div class="dashboard-grid cols-2">
+                    <label class="field"><span>Name</span><input id="apiKeyNameInput" class="input" required /></label>
+                    <label class="field"><span>Machine ID</span><input id="apiKeyMachineInput" class="input" /></label>
+                    <label class="field wide"><span>Tenant ID</span><input id="apiKeyTenantInput" class="input" /></label>
+                </div>
+
+                <h4 class="subhead">Quota</h4>
+                <div class="dashboard-grid cols-3">
+                    <label class="field"><span>Requests / day</span><input id="apiKeyRequestsInput" class="input" type="number" step="1" placeholder="unlimited" /></label>
+                    <label class="field"><span>Tokens / day</span><input id="apiKeyTokensInput" class="input" type="number" step="1" placeholder="unlimited" /></label>
+                    <label class="field"><span>Cost / month (USD)</span><input id="apiKeyCostInput" class="input" type="number" step="0.01" placeholder="unlimited" /></label>
+                </div>
+
+                <h4 class="subhead">Access Policy</h4>
+                <div class="dashboard-grid cols-2">
+                    <label class="field"><span>Provider allowlist</span><input id="apiKeyProvidersInput" class="input" placeholder="openai, anthropic" /></label>
+                    <label class="field"><span>Model allowlist</span><input id="apiKeyModelsInput" class="input" placeholder="openai/gpt-5" /></label>
+                </div>
+            </form>
+        </div>
+        <div class="drawer-footer">
+            <button id="apiKeyCancelEditButton" class="btn btn-secondary hidden" type="button">Cancel</button>
+            <button id="apiKeySubmitButton" class="btn btn-primary" type="submit" form="apiKeyForm">Create API Key</button>
+        </div>
+    </div>
+</div>
+
+<!-- Combo builder drawer -->
+<div id="drawer-combo" class="drawer-overlay hidden" aria-hidden="true">
+    <div class="drawer" role="dialog" aria-modal="true" aria-labelledby="drawerComboTitle">
+        <div class="drawer-header">
+            <h3 id="drawerComboTitle">Create Combo</h3>
+            <button class="icon-button" type="button" data-close="drawer-combo" aria-label="Close">✕</button>
+        </div>
+        <div class="drawer-body">
+            <form id="comboForm">
+                <input id="comboEditIdInput" type="hidden" />
+                <div class="dashboard-grid cols-2">
+                    <label class="field"><span>Name</span><input id="comboNameInput" class="input" placeholder="code-high" required /></label>
+                    <label class="field"><span>Provider connection</span><select id="comboProviderInput" class="input"><option value="">All connected providers</option></select></label>
+                    <input id="comboKindInput" type="hidden" value="llm" />
+                </div>
+
+                <div class="field wide" style="margin-top:12px">
+                    <span>Models in Combo (fallback order)</span>
+                    <div id="comboModelsInput" class="model-draft" aria-live="polite"></div>
+                    <p id="comboEmptyHint" class="empty-hint">Pick models from the list below — no need to type them manually. Use ↑ ↓ to set fallback priority.</p>
+                </div>
+
+                <details class="combo-custom-model">
+                    <summary>Add a custom model id</summary>
+                    <div class="model-add-row">
+                        <input id="comboModelManualInput" class="input" style="flex:1" placeholder="e.g. cline/claude-sonnet-4" spellcheck="false" />
+                        <button id="comboAddManualButton" class="btn btn-secondary" type="button">Add</button>
+                    </div>
+                </details>
+
+                <h4 class="subhead">Available models</h4>
+                <p class="text-muted text-sm" style="margin:0 0 8px">Choose a connected provider account, tick its saved models, then “Add selected”. Combos contain provider models only — not other combos.</p>
+            <div id="comboModelsList" class="data-list" aria-live="polite"></div>
+        </div>
+        <div class="drawer-footer">
+            <button id="comboCancelEditButton" class="btn btn-secondary hidden" type="button">Cancel</button>
+            <button id="comboSubmitButton" class="btn btn-primary" type="submit" form="comboForm">Create Combo</button>
+        </div>
+    </div>
+</div>
+
+<!-- Secret reveal modal -->
+<div id="modal-secret" class="modal-overlay hidden" aria-hidden="true">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalSecretTitle">
+        <div class="modal-header">
+            <h3 id="modalSecretTitle">API Key Created</h3>
+            <button class="modal-close" type="button" data-close="modal-secret" aria-label="Close">✕</button>
+        </div>
+        <div class="modal-body">
+            <p style="margin:0 0 8px" class="text-muted">Copy this key now. <strong>You won't be able to see it again.</strong></p>
+            <div id="modalSecretValue" class="secret-box"><span id="modalSecretText"></span></div>
+            <button id="modalSecretCopyBtn" class="btn btn-secondary" type="button" style="margin-top:8px">📋 Copy to clipboard</button>
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-primary" type="button" data-close="modal-secret">I've saved this key</button>
+        </div>
+    </div>
+</div>
+
+<!-- Config Diff modal -->
+<div id="modal-config-diff" class="modal-overlay hidden" aria-hidden="true">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="configDiffTitle">
+        <div class="modal-header">
+            <h3 id="configDiffTitle">Version</h3>
+            <button class="modal-close" type="button" data-close="modal-config-diff" aria-label="Close">✕</button>
+        </div>
+        <div class="modal-body">
+            <pre id="configDiffContent" style="font-family:var(--font-mono);font-size:var(--font-xs);max-height:400px;overflow:auto;white-space:pre-wrap;word-break:break-all;margin:0"></pre>
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-secondary" type="button" data-close="modal-config-diff">Close</button>
+        </div>
+    </div>
+</div>
+
+<!-- Control Token modal -->
+<div id="modal-control-token" class="modal-overlay hidden" aria-hidden="true">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTokenTitle">
+        <div class="modal-header">
+            <h3 id="modalTokenTitle">Control Token Required</h3>
+        </div>
+        <div class="modal-body">
+            <p class="text-muted">The server requires a control token to use admin routes. Enter it below — it will be stored in this browsing session.</p>
+            <form id="controlTokenForm">
+                <label class="field wide" style="margin-top:12px">
+                    <span>Control Token</span>
+                    <input id="controlTokenInput" class="input" type="password" autocomplete="off" placeholder="br-ct-..." />
+                </label>
+                <div id="controlTokenError" class="notice error hidden" style="margin-top:8px"></div>
+            </form>
+        </div>
+        <div class="modal-footer">
+            <button id="controlTokenSubmit" class="btn btn-primary" type="submit" form="controlTokenForm">Save Token</button>
+        </div>
+    </div>
+</div>
+
+<!-- Confirm dialog -->
+<div id="modal-confirm" class="modal-overlay hidden" aria-hidden="true">
+    <div class="modal" role="alertdialog" aria-labelledby="modalConfirmTitle" aria-describedby="modalConfirmDesc">
+        <div class="modal-header">
+            <h3 id="modalConfirmTitle">Confirm</h3>
+            <button class="modal-close" type="button" data-close="modal-confirm" aria-label="Close">✕</button>
+        </div>
+        <div class="modal-body">
+            <p id="modalConfirmDesc"></p>
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-secondary" type="button" data-close="modal-confirm">Cancel</button>
+            <button id="modalConfirmAction" class="btn btn-danger" type="button">Confirm</button>
+        </div>
+    </div>
+</div>
+
+<!-- Toast container -->
+<div class="toast-container" id="toastContainer" aria-live="polite" aria-relevant="additions"></div>
+
+<script src="/core.js"></script>
+<script src="/setup.js"></script>
+<script src="/pages.js"></script>
+<script src="/apikeys.js"></script>
+<script src="/aliases.js"></script>
+<script src="/limits.js"></script>
+<script src="/versions.js"></script>
+<script src="/settings.js"></script>
+</body>
 </html>
+

@@ -1,0 +1,1 @@
+[{"id":"openai","name":"OpenAI","alias":"openai","auth_type":"api-key","base_url":"https://api.openai.com/v1","format":"openai"},{"id":"anthropic","name":"Anthropic","alias":"claude","auth_type":"api-key","base_url":"https://api.anthropic.com/v1/messages","format":"claude"}]

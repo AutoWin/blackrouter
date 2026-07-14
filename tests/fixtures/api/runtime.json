@@ -1,0 +1,1 @@
+{"uptime_seconds":8642,"config":{"host":"127.0.0.1","port":20129,"data_dir":"/data","database_url":"sqlite:///data/blackrouter.db","compat_9router_db":true},"storage":{"database_path":"/data/blackrouter.db","schema_compatible":true,"table_counts":{"providerConnections":2,"apiKeys":1,"combos":1}}}

@@ -1,0 +1,1 @@
+{"data":[{"id":"key-local-cli","name":"Local CLI","key_masked":"br-****abcd","tenant_id":"default","machine_id":null,"policy":{"requests_per_day":1000,"tokens_per_day":500000,"cost_per_month_usd":50,"provider_allowlist":["openai"],"model_allowlist":["openai/gpt-5-mini"]}}]}

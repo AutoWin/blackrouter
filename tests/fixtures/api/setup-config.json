@@ -1,0 +1,1 @@
+{"settings":{"requireApiKey":true,"healthProbe":{"enabled":true,"intervalSeconds":30,"timeoutSeconds":5,"failureThreshold":3},"costGuard":{"enabled":true,"dailyBudgetUsd":5,"monthlyBudgetUsd":100},"telegram":{"enabled":false,"adminIds":[],"useWebhook":false,"linkCodeTtlSeconds":300}}}
