@@ -373,8 +373,8 @@ function editProvider(p) {
   resetProviderForm();
   $("providerEditIdInput").value = p.id || p.provider;
   $("providerInput").value = p.provider || "";
-  $("providerBaseUrlInput").value = p.baseUrl || p.base_url || "";
-  $("providerFormatInput").value = p.format || "";
+  $("providerBaseUrlInput").value = p.data?.baseUrl || p.baseUrl || p.base_url || "";
+  $("providerFormatInput").value = p.data?.format || p.format || "";
   $("providerNameInput").value = p.name || "";
   $("providerEmailInput").value = p.email || "";
   $("providerPriorityInput").value = p.priority ?? "";
@@ -417,6 +417,10 @@ function buildProviderPayload() {
   try { data = JSON.parse($("providerDataInput").value || "{}"); } catch {}
 
   data.authType = authType;
+  const baseUrl = $("providerBaseUrlInput").value.trim();
+  const format = $("providerFormatInput").value.trim();
+  if (baseUrl) data.baseUrl = baseUrl;
+  if (format) data.format = format;
   if (["api-key","bearer"].includes(authType)) data.apiKey = $("providerApiKeyInput").value;
   if (authType === "oauth") data.apiKey = $("providerApiKeyInput").value;
   if (authType === "basic") { data.username = $("providerBasicUserInput").value; data.password = $("providerBasicPassInput").value; }
@@ -427,8 +431,6 @@ function buildProviderPayload() {
     provider: $("providerInput").value.trim(),
     name: $("providerNameInput").value.trim() || $("providerInput").value.trim(),
     email: $("providerEmailInput").value.trim() || null,
-    base_url: $("providerBaseUrlInput").value.trim() || null,
-    format: $("providerFormatInput").value.trim() || null,
     auth_type: authType,
     is_active: $("providerActiveInput").checked,
     priority: parseInt($("providerPriorityInput").value) || null,
@@ -505,19 +507,19 @@ function populatePresets() {
   sel.innerHTML = '<option value="">— Manual config —</option>';
   const catalog = providerCatalog();
   catalog.forEach(c => {
-    sel.appendChild(el("option", { value: c.provider, textContent: c.name || c.provider }));
+    sel.appendChild(el("option", { value: c.id, textContent: c.name || c.id }));
   });
 }
 
 $("providerPresetInput").addEventListener("change", function () {
   const v = this.value; if (!v) return;
   const catalog = providerCatalog();
-  const c = catalog.find(x => x.provider === v);
+  const c = catalog.find(x => x.id === v);
   if (!c) return;
-  $("providerInput").value = c.provider || "";
-  $("providerBaseUrlInput").value = c.baseUrl || c.base_url || "";
+  $("providerInput").value = c.id || "";
+  $("providerBaseUrlInput").value = c.base_url || c.baseUrl || "";
   $("providerFormatInput").value = c.format || "";
-  $("authTypeInput").value = c.authType || c.auth_type || "api-key";
+  $("authTypeInput").value = c.auth_type || c.authType || "api-key";
   renderAuthFields();
 });
 

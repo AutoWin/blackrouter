@@ -16,7 +16,7 @@ use crate::AppState;
 
 /// GitHub Copilot OAuth (Device Code Flow)
 fn github_client_id() -> String {
-    std::env::var("OAUTH_GITHUB_CLIENT_ID").unwrap_or_default()
+    std::env::var("OAUTH_GITHUB_CLIENT_ID").unwrap_or_else(|_| "Iv1.b507a08c87ecfe98".to_string())
 }
 
 /// Google / Gemini OAuth (Authorization Code Flow)
@@ -27,12 +27,22 @@ fn google_client_secret() -> String {
     std::env::var("OAUTH_GOOGLE_CLIENT_SECRET").unwrap_or_default()
 }
 
-/// Antigravity OAuth credentials.
+/// Antigravity OAuth credentials (Google Cloud Code Assist).
+///
+/// These must be supplied via the `OAUTH_ANTIGRAVITY_CLIENT_ID` and
+/// `OAUTH_ANTIGRAVITY_CLIENT_SECRET` environment variables. They are no longer
+/// embedded here because GitHub push protection blocks committing them; set the
+/// env vars in your deployment (e.g. Dockerfile / runtime config) instead.
+const ANTIGRAVITY_CLIENT_ID_FALLBACK: &str = "";
+const ANTIGRAVITY_CLIENT_SECRET_FALLBACK: &str = "";
+
 fn antigravity_client_id() -> String {
-    std::env::var("OAUTH_ANTIGRAVITY_CLIENT_ID").unwrap_or_default()
+    std::env::var("OAUTH_ANTIGRAVITY_CLIENT_ID")
+        .unwrap_or_else(|_| ANTIGRAVITY_CLIENT_ID_FALLBACK.to_string())
 }
 fn antigravity_client_secret() -> String {
-    std::env::var("OAUTH_ANTIGRAVITY_CLIENT_SECRET").unwrap_or_default()
+    std::env::var("OAUTH_ANTIGRAVITY_CLIENT_SECRET")
+        .unwrap_or_else(|_| ANTIGRAVITY_CLIENT_SECRET_FALLBACK.to_string())
 }
 
 /// Antigravity OAuth scopes (cloud-platform + userinfo + cclog + experiments)
@@ -276,7 +286,9 @@ pub async fn oauth_start(
     let configured = match provider.as_str() {
         "github" => !github_client_id().is_empty(),
         "google" | "gemini" => !google_client_id().is_empty() && !google_client_secret().is_empty(),
-        "antigravity" => !antigravity_client_id().is_empty(),
+        "antigravity" => {
+            !antigravity_client_id().is_empty() && !antigravity_client_secret().is_empty()
+        }
         "codex" | "openai" => !codex_client_id().is_empty(),
         _ => false,
     };
@@ -358,6 +370,7 @@ pub async fn oauth_start(
             // BLACKROUTER_BASE_URL only when the client didn't/couldn't supply one.
             let callback_url = sanitize_redirect_uri(&client_redirect_uri, &request_host)
                 .unwrap_or_else(|| redirect_uri(port, &provider));
+            tracing::info!("Google/Gemini OAuth start: redirect_uri={callback_url}, client_redirect={client_redirect_uri:?}, request_host={request_host}");
             let client_id = google_client_id();
 
             let auth_url = format!(
@@ -406,6 +419,7 @@ pub async fn oauth_start(
             // Antigravity: Authorization Code Flow with extended scopes.
             let callback_url = sanitize_redirect_uri(&client_redirect_uri, &request_host)
                 .unwrap_or_else(|| redirect_uri(port, &provider));
+            tracing::info!("Antigravity OAuth start: redirect_uri={callback_url}, client_redirect={client_redirect_uri:?}, request_host={request_host}");
             let client_id = antigravity_client_id();
 
             let auth_url = format!(
@@ -887,7 +901,11 @@ pub async fn oauth_exchange(
     let port = state.config.port;
     match provider.as_str() {
         "google" | "gemini" => {
-            let callback_url = redirect_uri(port, &provider);
+            let callback_url = session_redirect_uri(&body.state, port, &provider);
+            tracing::info!(
+                "Google/Gemini token exchange: redirect_uri={callback_url}, state={}",
+                body.state
+            );
             let client_id = google_client_id();
             let client_secret = google_client_secret();
             let resp = state
@@ -913,9 +931,15 @@ pub async fn oauth_exchange(
             let refresh_token = token["refresh_token"].as_str().unwrap_or("").to_string();
 
             if access_token.is_empty() {
+                let err_detail = token["error"].as_str().unwrap_or("");
+                let err_desc = token["error_description"].as_str().unwrap_or("");
                 return Err((
                     StatusCode::BAD_REQUEST,
-                    "No access token received".to_string(),
+                    if !err_detail.is_empty() {
+                        format!("No access token received: {err_detail} — {err_desc}")
+                    } else {
+                        "No access token received".to_string()
+                    },
                 ));
             }
 
@@ -947,7 +971,11 @@ pub async fn oauth_exchange(
         }
 
         "antigravity" => {
-            let callback_url = redirect_uri(port, &provider);
+            let callback_url = session_redirect_uri(&body.state, port, &provider);
+            tracing::info!(
+                "Antigravity token exchange: redirect_uri={callback_url}, state={}",
+                body.state
+            );
             let client_id = antigravity_client_id();
             let client_secret = antigravity_client_secret();
             let resp = state
@@ -980,9 +1008,15 @@ pub async fn oauth_exchange(
             let refresh_token = token["refresh_token"].as_str().unwrap_or("").to_string();
 
             if access_token.is_empty() {
+                let err_detail = token["error"].as_str().unwrap_or("");
+                let err_desc = token["error_description"].as_str().unwrap_or("");
                 return Err((
                     StatusCode::BAD_REQUEST,
-                    "No access token received".to_string(),
+                    if !err_detail.is_empty() {
+                        format!("No access token received: {err_detail} — {err_desc}")
+                    } else {
+                        "No access token received".to_string()
+                    },
                 ));
             }
 

@@ -10,7 +10,11 @@ use tokio::sync::oneshot;
 
 // ── OAuth Configuration (matches 9router-master) ─────────────────────
 
-// Antigravity credentials (Gemini Code Assist)
+// Antigravity credentials (Gemini Code Assist) — supply via env vars
+// OAUTH_ANTIGRAVITY_CLIENT_ID / OAUTH_ANTIGRAVITY_CLIENT_SECRET.
+const ANTIGRAVITY_CLIENT_ID_FALLBACK: &str = "";
+const ANTIGRAVITY_CLIENT_SECRET_FALLBACK: &str = "";
+
 const ANTIGRAVITY_SCOPES: &str = "\
     https://www.googleapis.com/auth/cloud-platform \
     https://www.googleapis.com/auth/userinfo.email \
@@ -40,6 +44,16 @@ fn oauth_env(key: &'static str) -> anyhow::Result<String> {
         .ok()
         .filter(|value| !value.is_empty())
         .with_context(|| format!("{key} is required for this OAuth login"))
+}
+
+/// Read an OAuth env var with a built-in fallback (used for Google Cloud SDK
+/// credentials that ship with the gcloud CLI / Cloud Code plugins).
+fn oauth_env_or_fallback(key: &'static str, fallback: &str) -> String {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| fallback.to_string())
 }
 
 // ── Platform enum (matches 9router-master, arch-aware) ────────────────
@@ -80,8 +94,14 @@ struct CallbackParams {
 pub async fn login(provider: &str) -> anyhow::Result<()> {
     let (client_id, client_secret, scopes, is_antigravity) = match provider {
         "antigravity" => (
-            oauth_env("OAUTH_ANTIGRAVITY_CLIENT_ID")?,
-            oauth_env("OAUTH_ANTIGRAVITY_CLIENT_SECRET")?,
+            oauth_env_or_fallback(
+                "OAUTH_ANTIGRAVITY_CLIENT_ID",
+                ANTIGRAVITY_CLIENT_ID_FALLBACK,
+            ),
+            oauth_env_or_fallback(
+                "OAUTH_ANTIGRAVITY_CLIENT_SECRET",
+                ANTIGRAVITY_CLIENT_SECRET_FALLBACK,
+            ),
             ANTIGRAVITY_SCOPES,
             true,
         ),

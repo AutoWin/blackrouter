@@ -1,13 +1,17 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.7
 
-FROM rust:1-bookworm AS builder
+FROM rust:1.97-bookworm AS builder
 
 WORKDIR /app
 
-COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-RUN cargo build --release -p blackrouter-bin
+RUN --mount=type=cache,id=blackrouter-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=blackrouter-cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=blackrouter-target,target=/app/target \
+    cargo build --release --locked -j 6 -p blackrouter-bin \
+    && cp /app/target/release/blackrouter /tmp/blackrouter
 
 FROM debian:bookworm-slim AS runtime
 
@@ -17,7 +21,7 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY --from=builder /app/target/release/blackrouter /usr/local/bin/blackrouter
+COPY --from=builder /tmp/blackrouter /usr/local/bin/blackrouter
 
 ENV BLACKROUTER_HOST=0.0.0.0 \
     BLACKROUTER_PORT=20129 \

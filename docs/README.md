@@ -18,14 +18,16 @@ Luồng xử lý request từ lúc nhận prompt đến khi trả về output.
 
 ---
 
-### [Provider Login Mechanisms](./PROVIDER_LOGIN_MECHANISMS.md)
-Các cơ chế xác thực của providers - API Key, OAuth 2.0, và No Auth.
+### [Provider Authentication Mechanisms](./PROVIDER_LOGIN_MECHANISMS.md)
+Tài liệu kỹ thuật đầy đủ về cách cấu hình, lưu trữ, áp dụng và kiểm tra credential của providers.
 
 **Key sections:**
-- API Key Authentication
-- OAuth 2.0 Flows (Device Code, Authorization Code, PKCE)
-- Supported Providers
-- API Reference
+- Schema `data` và quy ước `baseUrl`, `format`, credential fields
+- Sáu auth types: API key, bearer, OAuth, Basic, custom header và no auth
+- OAuth popup, callback relay, Device Code và PKCE flows
+- Antigravity onboarding, Codex loopback và GitHub device login
+- Provider connection testing, health probe và secret masking
+- Troubleshooting và checklist thêm cơ chế xác thực mới
 
 ---
 
