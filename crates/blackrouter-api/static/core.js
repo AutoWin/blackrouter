@@ -238,8 +238,9 @@ window.fetch = async function(url, options) {
       try {
         var cloned = response.clone();
         var body = await cloned.json();
-        var msg = body.error || body.message || "";
-        if (msg.toLowerCase().indexOf("token") !== -1 || msg.toLowerCase().indexOf("unauthorized") !== -1) {
+        var msg = errMsg(body, "Control token required");
+        var normalized = String(msg).toLowerCase();
+        if (normalized.indexOf("token") !== -1 || normalized.indexOf("unauthorized") !== -1) {
           await promptControlToken(msg);
         }
       } catch(_) {}
