@@ -72,6 +72,49 @@ test('opens create combo drawer and reorders models', async ({ page }) => {
   await expect(page.locator('#comboModelsInput .model-draft-row').first()).toContainText('anthropic/claude-sonnet-4');
 });
 
+test('adds a vendor-prefixed CommandCode model to a combo', async ({ page }) => {
+  await page.unroute('**/*');
+  await mockApi(page, {
+    '/api/setup/providers': {
+      data: [{
+        id: 'provider-commandcode',
+        provider: 'commandcode',
+        name: 'Command Code',
+        auth_type: 'api-key',
+        is_active: true,
+        data: { format: 'commandcode', models: ['tencent/Hy3'] },
+      }],
+    },
+  });
+  await page.reload();
+
+  let submitted;
+  await page.route('**/api/setup/combos', async (route) => {
+    if (route.request().method() !== 'POST') return route.fallback();
+    submitted = route.request().postDataJSON();
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        id: 'combo-hy3',
+        name: 'hy3-fallback',
+        kind: 'llm',
+        models: ['commandcode/tencent/Hy3'],
+      }),
+    });
+  });
+
+  await page.getByRole('button', { name: 'Combos' }).click();
+  await page.getByRole('button', { name: '+ Create Combo' }).click();
+  await expect(page.getByText('commandcode/tencent/Hy3')).toBeVisible();
+  await page.getByRole('button', { name: 'Add commandcode/tencent/Hy3' }).click();
+  await page.locator('#comboNameInput').fill('hy3-fallback');
+  await page.getByRole('button', { name: 'Create Combo', exact: true }).click();
+
+  await expect(page.getByText('Combo created')).toBeVisible();
+  expect(submitted.models).toEqual(['commandcode/tencent/Hy3']);
+});
+
 test('shows control token prompt on protected endpoint', async ({ page }) => {
   await page.unroute('**/*');
   await mockApi(page, {
@@ -93,6 +136,104 @@ test('fetches provider models via the Models button', async ({ page }) => {
   await page.getByRole('button', { name: 'Providers' }).click();
   await page.getByRole('button', { name: 'Models' }).first().click();
   await expect(page.getByText(/Models updated for/)).toBeVisible();
+});
+
+test('creates an API key with the backend schema and copies the returned key', async ({ page }) => {
+  let submitted;
+  await page.route('**/api/setup/api-keys', async (route) => {
+    if (route.request().method() !== 'POST') return route.fallback();
+    submitted = route.request().postDataJSON();
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        record: { id: 'key-created', name: 'CI key', key_masked: 'brk_****ated' },
+        key: 'brk_created_secret',
+      }),
+    });
+  });
+  await page.evaluate(() => {
+    window.__copiedText = null;
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: async (value) => { window.__copiedText = value; } },
+    });
+  });
+
+  await page.getByRole('button', { name: 'API Keys' }).click();
+  await page.getByRole('button', { name: '+ Create API Key' }).click();
+  await page.locator('#apiKeyNameInput').fill('CI key');
+  await page.locator('#apiKeyMachineInput').fill('runner-1');
+  await page.locator('#apiKeyTenantInput').fill('tenant-ci');
+  await page.locator('#apiKeyRequestsInput').fill('200');
+  await page.locator('#apiKeyProvidersInput').fill('openai, anthropic');
+  await page.getByRole('button', { name: 'Create API Key', exact: true }).click();
+
+  await expect(page.getByRole('dialog', { name: 'API Key Created' })).toBeVisible();
+  await expect(page.locator('#modalSecretText')).toHaveText('brk_created_secret');
+  await expect(page.getByRole('button', { name: /Copy to clipboard/ })).toBeVisible();
+  await page.getByRole('button', { name: /Copy to clipboard/ }).click();
+  await expect(page.getByText('API key copied to clipboard')).toBeVisible();
+  expect(await page.evaluate(() => window.__copiedText)).toBe('brk_created_secret');
+  expect(submitted).toEqual({
+    name: 'CI key',
+    tenant_id: 'tenant-ci',
+    machine_id: 'runner-1',
+    policy: {
+      requests_per_day: 200,
+      tokens_per_day: null,
+      cost_per_month_usd: null,
+      provider_allowlist: ['openai', 'anthropic'],
+      model_allowlist: [],
+    },
+  });
+});
+
+test('rotates an active API key and exposes the new key for copying', async ({ page }) => {
+  await page.route('**/api/setup/api-keys/key-local-cli/rotate', async (route) => {
+    expect(route.request().method()).toBe('POST');
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        record: { id: 'key-rotated', name: 'Local CLI', key_masked: 'brk_****ated' },
+        key: 'brk_rotated_secret',
+      }),
+    });
+  });
+
+  await page.getByRole('button', { name: 'API Keys' }).click();
+  await expect(page.getByText('br-****abcd')).toBeVisible();
+  await expect(page.getByText('1,000 req/day')).toBeVisible();
+  await page.getByRole('button', { name: 'Rotate' }).click();
+  await expect(page.getByRole('alertdialog', { name: 'Rotate API Key' })).toBeVisible();
+  await page.locator('#modalConfirmAction').click();
+
+  await expect(page.getByRole('dialog', { name: 'API Key Rotated' })).toBeVisible();
+  await expect(page.locator('#modalSecretText')).toHaveText('brk_rotated_secret');
+  await expect(page.getByRole('button', { name: /Copy to clipboard/ })).toBeVisible();
+});
+
+test('deletes an API key after confirmation', async ({ page }) => {
+  let deleteCalled = false;
+  await page.route('**/api/setup/api-keys/key-local-cli', async (route) => {
+    if (route.request().method() !== 'DELETE') return route.fallback();
+    deleteCalled = true;
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ ok: true }),
+    });
+  });
+
+  await page.getByRole('button', { name: 'API Keys' }).click();
+  await page.getByRole('button', { name: 'Delete' }).click();
+  const confirm = page.getByRole('alertdialog', { name: 'Delete API Key' });
+  await expect(confirm).toContainText('immediately revoke access');
+  await confirm.getByRole('button', { name: 'Delete' }).click();
+
+  await expect(page.getByText('Local CLI deleted')).toBeVisible();
+  expect(deleteCalled).toBe(true);
 });
 
 test('mobile navigation opens and closes', async ({ page }) => {

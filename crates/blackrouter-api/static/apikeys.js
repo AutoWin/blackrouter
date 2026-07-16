@@ -4,6 +4,13 @@
 
 function apiKeyData() { return Array.isArray(state.apiKeys?.data) ? state.apiKeys.data : []; }
 
+function apiKeyPolicy(k) { return k?.policy && typeof k.policy === "object" ? k.policy : {}; }
+
+function apiKeySecret(result) {
+  if (typeof result === "string") return result;
+  return result?.key || result?.apiKey || result?.token || null;
+}
+
 function renderApiKeys() {
   const list = $("apiKeysList");
   if (!list) return;
@@ -24,27 +31,36 @@ function renderApiKeys() {
   }
 
   keys.forEach(k => {
-    const masked = "br-" + (k.id || "").toString().substring(0, 4) + "..." + (k.id || "").toString().substring((k.id || "").length - 4);
+    const masked = k.key_masked || k.keyMasked || ("br-" + (k.id || "").toString().substring(0, 4) + "..." + (k.id || "").toString().slice(-4));
+    const policy = apiKeyPolicy(k);
     const limits = Array.isArray(k.limits) ? k.limits : [];
     const dailyRpm = limits.find(l => l.period === "daily" && l.type === "rpm");
     const dailyTpm = limits.find(l => l.period === "daily" && l.type === "tpm");
+    const requestsPerDay = policy.requests_per_day ?? dailyRpm?.quota;
+    const tokensPerDay = policy.tokens_per_day ?? dailyTpm?.quota;
+    const tenant = k.tenant_id || k.tenantId || k.tenant;
+    const isActive = k.is_active ?? k.isActive ?? true;
 
     list.appendChild(el("div", { className: "data-row" },
       el("div", { className: "data-row-info" },
         el("strong", { textContent: k.name || k.id }),
         el("div", { className: "data-row-meta" },
           el("span", { className: "model-chip", textContent: masked }),
-          k.tenant ? el("span", { textContent: "Tenant: " + k.tenant }) : null,
-          dailyRpm?.quota ? el("span", { textContent: fmtNum(dailyRpm.quota) + " req/day" }) : null,
-          dailyTpm?.quota ? el("span", { textContent: fmtNum(dailyTpm.quota) + " tok/day" }) : null,
+          tenant ? el("span", { textContent: "Tenant: " + tenant }) : null,
+          requestsPerDay != null ? el("span", { textContent: fmtNum(requestsPerDay) + " req/day" }) : null,
+          tokensPerDay != null ? el("span", { textContent: fmtNum(tokensPerDay) + " tok/day" }) : null,
+          !isActive ? el("span", { className: "pill muted", textContent: "Inactive" }) : null,
         ),
       ),
       el("div", { className: "data-row-actions" },
-        el("button", { className: "btn btn-sm btn-secondary", textContent: "Edit",
+        isActive ? el("button", { className: "btn btn-sm btn-secondary", textContent: "Edit",
           onclick() { editApiKey(k); }
-        }),
-        el("button", { className: "btn btn-sm btn-ghost", textContent: "Rotate",
+        }) : null,
+        isActive ? el("button", { className: "btn btn-sm btn-ghost", textContent: "Rotate",
           onclick() { rotateApiKey(k); }
+        }) : null,
+        el("button", { className: "btn btn-sm btn-danger", textContent: "Delete",
+          onclick() { deleteApiKey(k); }
         }),
       ),
     ));
@@ -71,16 +87,19 @@ function editApiKey(k) {
   $("apiKeyEditIdInput").value = k.id || "";
   $("apiKeyNameInput").value = k.name || "";
   $("apiKeyMachineInput").value = k.machineId || k.machine_id || "";
-  $("apiKeyTenantInput").value = k.tenant || "";
+  $("apiKeyTenantInput").value = k.tenant_id || k.tenantId || k.tenant || "";
+  const policy = apiKeyPolicy(k);
   const limits = Array.isArray(k.limits) ? k.limits : [];
   const rpm = limits.find(l => l.type === "rpm");
   const tpm = limits.find(l => l.type === "tpm");
   const cost = limits.find(l => l.type === "cost");
-  if (rpm) $("apiKeyRequestsInput").value = rpm.quota || "";
-  if (tpm) $("apiKeyTokensInput").value = tpm.quota || "";
-  if (cost) $("apiKeyCostInput").value = cost.quota || "";
-  $("apiKeyProvidersInput").value = Array.isArray(k.allowProviders) ? k.allowProviders.join(", ") : (k.allowProviders || "");
-  $("apiKeyModelsInput").value = Array.isArray(k.allowModels) ? k.allowModels.join(", ") : (k.allowModels || "");
+  $("apiKeyRequestsInput").value = policy.requests_per_day ?? rpm?.quota ?? "";
+  $("apiKeyTokensInput").value = policy.tokens_per_day ?? tpm?.quota ?? "";
+  $("apiKeyCostInput").value = policy.cost_per_month_usd ?? cost?.quota ?? "";
+  const providers = policy.provider_allowlist || k.allowProviders || [];
+  const models = policy.model_allowlist || k.allowModels || [];
+  $("apiKeyProvidersInput").value = Array.isArray(providers) ? providers.join(", ") : providers;
+  $("apiKeyModelsInput").value = Array.isArray(models) ? models.join(", ") : models;
   $("apiKeySubmitButton").textContent = "Save API Key";
   $("apiKeyCancelEditButton").classList.remove("hidden");
   setText("drawerApiKeyTitle", "Edit API Key");
@@ -91,21 +110,21 @@ async function saveApiKey() {
   const name = $("apiKeyNameInput").value.trim();
   if (!name) { toast("API key name is required", "error"); return; }
   const id = $("apiKeyEditIdInput").value;
+  const requestsPerDay = numOrNull($("apiKeyRequestsInput").value);
+  const tokensPerDay = numOrNull($("apiKeyTokensInput").value);
+  const costPerMonth = numOrNull($("apiKeyCostInput").value);
   const payload = {
     name,
-    tenant: $("apiKeyTenantInput").value.trim() || null,
-    machineId: $("apiKeyMachineInput").value.trim() || null,
-    apiKey: null,
-    allowProviders: csvValues($("apiKeyProvidersInput").value),
-    allowModels: csvValues($("apiKeyModelsInput").value),
-    limits: [],
+    tenant_id: $("apiKeyTenantInput").value.trim() || null,
+    machine_id: $("apiKeyMachineInput").value.trim() || null,
+    policy: {
+      requests_per_day: requestsPerDay,
+      tokens_per_day: tokensPerDay,
+      cost_per_month_usd: costPerMonth,
+      provider_allowlist: csvValues($("apiKeyProvidersInput").value),
+      model_allowlist: csvValues($("apiKeyModelsInput").value),
+    },
   };
-  const reqVal = numOrNull($("apiKeyRequestsInput").value);
-  const tokVal = numOrNull($("apiKeyTokensInput").value);
-  const costVal = numOrNull($("apiKeyCostInput").value);
-  if (reqVal != null) payload.limits.push({ type: "rpm", quota: reqVal, period: "daily" });
-  if (tokVal != null) payload.limits.push({ type: "tpm", quota: tokVal, period: "daily" });
-  if (costVal != null) payload.limits.push({ type: "cost", quota: costVal });
   try {
     let result;
     if (id) {
@@ -113,9 +132,9 @@ async function saveApiKey() {
       toast("API key updated", "success");
     } else {
       result = await sendJson("/api/setup/api-keys", "POST", payload);
-      const rawKey = result.apiKey || result.token || result;
-      if (rawKey && typeof rawKey === "string") {
-        showSecretModal(rawKey);
+      const rawKey = apiKeySecret(result);
+      if (rawKey) {
+        showSecretModal(rawKey, "API Key Created");
       } else {
         toast("API key created", "success");
       }
@@ -126,17 +145,36 @@ async function saveApiKey() {
   } catch (e) { toast(e.message, "error"); }
 }
 
-function showSecretModal(rawKey) {
+function showSecretModal(rawKey, title) {
+  setText("modalSecretTitle", title || "API Key Created");
   setText("modalSecretText", rawKey);
   openModal("modal-secret");
 }
 
 $("modalSecretCopyBtn")?.addEventListener("click", async () => {
   try {
-    await navigator.clipboard.writeText($("modalSecretText").textContent);
+    await copyText($("modalSecretText").textContent);
     toast("API key copied to clipboard", "success");
   } catch (_) { toast("Failed to copy", "error"); }
 });
+
+async function copyText(value) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(value);
+      return;
+    } catch (_) {
+      // Fall through for browsers/contexts where Clipboard API permission is denied.
+    }
+  }
+  const input = el("textarea", { readonly: true, style: { position: "fixed", opacity: "0" } });
+  input.value = value;
+  document.body.appendChild(input);
+  input.select();
+  const copied = typeof document.execCommand === "function" && document.execCommand("copy");
+  input.remove();
+  if (!copied) throw new Error("Copy failed");
+}
 
 async function rotateApiKey(k) {
   showConfirm("Rotate API Key",
@@ -144,9 +182,27 @@ async function rotateApiKey(k) {
     "Rotate", async () => {
       try {
         const result = await sendJson("/api/setup/api-keys/" + encodeURIComponent(k.id) + "/rotate", "POST", {});
-        const rawKey = result.apiKey || result.token;
-        if (rawKey && typeof rawKey === "string") showSecretModal(rawKey);
+        const rawKey = apiKeySecret(result);
+        if (!rawKey) throw new Error("Rotate succeeded but the new API key was not returned");
+        showSecretModal(rawKey, "API Key Rotated");
         toast("API key rotated", "success");
+        await refresh();
+        renderApiKeys();
+      } catch (e) { toast(e.message, "error"); }
+    });
+}
+
+async function deleteApiKey(k) {
+  const name = k.name || k.id;
+  const activeWarning = (k.is_active ?? k.isActive ?? true)
+    ? " This will immediately revoke access for applications using it."
+    : "";
+  showConfirm("Delete API Key",
+    "Delete \"" + name + "\"?" + activeWarning + " This cannot be undone.",
+    "Delete", async () => {
+      try {
+        await sendJson("/api/setup/api-keys/" + encodeURIComponent(k.id), "DELETE");
+        toast(name + " deleted", "success");
         await refresh();
         renderApiKeys();
       } catch (e) { toast(e.message, "error"); }

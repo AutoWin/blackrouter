@@ -612,7 +612,10 @@ function connectedProviderModels() {
     const connectionId = provider.id || providerType;
     const connectionLabel = provider.name || provider.email || providerType;
     providerModelIds(provider).forEach(model => {
-      const value = model.includes("/") ? model : providerType + "/" + model;
+      // Provider model catalogs contain native upstream IDs. Some native IDs
+      // include a vendor prefix (for example CommandCode's `tencent/Hy3`), so
+      // they still need the BlackRouter provider prefix for routing.
+      const value = providerType + "/" + model;
       if (seen.has(value)) return;
       seen.add(value);
       choices.push({

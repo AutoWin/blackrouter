@@ -140,7 +140,10 @@ pub fn build_router(state: AppState) -> Router {
             post(restore_settings_version),
         )
         .route("/setup/api-keys", get(list_api_keys).post(create_api_key))
-        .route("/setup/api-keys/{id}", put(update_api_key_policy))
+        .route(
+            "/setup/api-keys/{id}",
+            put(update_api_key_policy).delete(delete_api_key),
+        )
         .route("/setup/api-keys/{id}/rotate", post(rotate_api_key))
         .route(
             "/setup/providers",
@@ -696,6 +699,17 @@ async fn update_api_key_policy(
         .update_api_key_policy(&id, payload.tenant_id, payload.policy)
         .map_err(|error| storage_error_to_api(error, "API key update failed"))?;
     Ok(Json(record))
+}
+
+async fn delete_api_key(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<DeleteResponse>, ApiErrorResponse> {
+    state
+        .storage
+        .delete_api_key(&id)
+        .map_err(|error| storage_error_to_api(error, "API key delete failed"))?;
+    Ok(Json(DeleteResponse { ok: true }))
 }
 
 #[derive(Serialize)]

@@ -474,22 +474,37 @@ impl Storage {
 
     /// Rotate an API key: deactivate old key, create new one with same metadata
     pub fn rotate_api_key(&self, key_id: &str) -> Result<CreatedApiKey> {
-        let conn = self.open()?;
+        let mut conn = self.open()?;
+        let transaction = conn.transaction()?;
         // Get existing key metadata
-        let (name, machine_id, tenant_id, policy): (
+        let (name, machine_id, tenant_id, policy, is_active): (
             Option<String>,
             Option<String>,
             Option<String>,
             Option<String>,
-        ) = conn.query_row(
-            "SELECT name, machineId, tenantId, policy FROM apiKeys WHERE id = ?1",
+            i64,
+        ) = transaction.query_row(
+            "SELECT name, machineId, tenantId, policy, isActive FROM apiKeys WHERE id = ?1",
             params![key_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )?;
+        if is_active == 0 {
+            return Err(StorageError::Validation(
+                "API key is already inactive".to_string(),
+            ));
+        }
 
         // Deactivate old key
-        conn.execute(
-            "UPDATE apiKeys SET isActive = 0 WHERE id = ?1",
+        transaction.execute(
+            "UPDATE apiKeys SET isActive = 0 WHERE id = ?1 AND isActive = 1",
             params![key_id],
         )?;
 
@@ -498,13 +513,15 @@ impl Storage {
         let key = format!("brk_{}", Uuid::new_v4().simple());
         let created_at = now_text();
 
-        conn.execute(
+        transaction.execute(
             r#"
             INSERT INTO apiKeys (id, key, name, machineId, tenantId, policy, isActive, createdAt)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)
             "#,
             params![new_id, key, name, machine_id, tenant_id, policy, created_at],
         )?;
+
+        transaction.commit()?;
 
         Ok(CreatedApiKey {
             record: ApiKeyRecord {
@@ -540,6 +557,21 @@ impl Storage {
         }
         self.get_api_key_record(key_id)?
             .ok_or_else(|| StorageError::Validation("API key not found".to_string()))
+    }
+
+    pub fn delete_api_key(&self, key_id: &str) -> Result<()> {
+        let mut conn = self.open()?;
+        let transaction = conn.transaction()?;
+        transaction.execute(
+            "DELETE FROM apiKeyQuotaCounters WHERE keyId = ?1",
+            params![key_id],
+        )?;
+        let changed = transaction.execute("DELETE FROM apiKeys WHERE id = ?1", params![key_id])?;
+        if changed == 0 {
+            return Err(StorageError::Validation("API key not found".to_string()));
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn authenticate_api_key(&self, api_key: &str) -> Result<Option<AuthenticatedApiKey>> {
@@ -2603,8 +2635,11 @@ CREATE INDEX IF NOT EXISTS idx_memory_vectors_session ON memoryVectors(sessionId
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiKeyPolicy, NewApiKey, NewCombo, NewProviderConnection, Storage, UsageEntry};
+    use super::{
+        ApiKeyPolicy, NewApiKey, NewCombo, NewProviderConnection, Storage, StorageError, UsageEntry,
+    };
     use blackrouter_core::{ModelRef, RouteKind};
+    use rusqlite::params;
     use serde_json::json;
     use std::fs;
 
@@ -2702,6 +2737,49 @@ mod tests {
         let authenticated = storage.authenticate_api_key(&rotated.key).unwrap().unwrap();
         assert_eq!(authenticated.policy, policy);
         assert_eq!(authenticated.tenant_id.as_deref(), Some("tenant-a"));
+        assert!(matches!(
+            storage.rotate_api_key(&created.record.id),
+            Err(StorageError::Validation(message)) if message == "API key is already inactive"
+        ));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn deleting_api_key_revokes_access_and_removes_quota_counters() {
+        let (storage, path) = temp_storage("api-key-delete");
+        let created = storage
+            .create_api_key(NewApiKey {
+                name: Some("temporary key".to_string()),
+                machine_id: None,
+                tenant_id: None,
+                policy: ApiKeyPolicy::default(),
+            })
+            .unwrap();
+        assert!(storage
+            .reserve_api_key_request(&created.record.id, 1_000, 10)
+            .unwrap());
+
+        storage.delete_api_key(&created.record.id).unwrap();
+
+        assert!(storage
+            .authenticate_api_key(&created.key)
+            .unwrap()
+            .is_none());
+        assert!(storage.list_api_keys().unwrap().is_empty());
+        assert!(matches!(
+            storage.delete_api_key(&created.record.id),
+            Err(StorageError::Validation(message)) if message == "API key not found"
+        ));
+        let conn = storage.open().unwrap();
+        let counters: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM apiKeyQuotaCounters WHERE keyId = ?1",
+                params![created.record.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(counters, 0);
+        drop(conn);
         let _ = fs::remove_file(path);
     }
 
@@ -3102,6 +3180,34 @@ mod tests {
             }
         );
         assert!(storage.resolve_model_route("unknown-model").is_err());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn commandcode_vendor_prefixed_model_can_be_used_in_combo() {
+        let (storage, path) = temp_storage("commandcode-vendor-model-combo");
+        storage
+            .create_provider_connection(active_provider("commandcode"))
+            .expect("provider creates");
+        storage
+            .create_combo(NewCombo {
+                name: "hy3-fallback".to_string(),
+                kind: None,
+                models: vec!["commandcode/tencent/Hy3".to_string()],
+            })
+            .expect("combo creates");
+
+        assert_eq!(
+            storage.resolve_model_route("hy3-fallback").unwrap(),
+            RouteKind::Combo {
+                name: "hy3-fallback".to_string(),
+                models: vec![ModelRef {
+                    provider: "commandcode".to_string(),
+                    model: "tencent/Hy3".to_string(),
+                }],
+            }
+        );
 
         let _ = fs::remove_file(path);
     }
