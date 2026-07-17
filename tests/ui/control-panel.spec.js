@@ -124,6 +124,33 @@ test('shows control token prompt on protected endpoint', async ({ page }) => {
   await expect(page.getByRole('dialog', { name: 'Control Token Required' })).toBeVisible();
 });
 
+test('keeps control token when v1 models requires an API key', async ({ page }) => {
+  await page.unroute('**/*');
+  await mockApi(page, {
+    '/v1/models': {
+      __status: 401,
+      body: { error: { message: 'Missing API key', type: 'authentication_error' } },
+    },
+  });
+  await page.evaluate(() => sessionStorage.setItem('br-ct', 'br-ct-test'));
+  await page.reload();
+
+  await expect(page.getByRole('dialog', { name: 'Control Token Required' })).toBeHidden();
+  expect(await page.evaluate(() => sessionStorage.getItem('br-ct'))).toBe('br-ct-test');
+});
+
+test('clears an invalid control token and prompts again', async ({ page }) => {
+  await page.unroute('**/*');
+  await mockApi(page, {
+    '/api/setup/config': { __status: 401, body: { error: 'Invalid or missing control token' } },
+  });
+  await page.evaluate(() => sessionStorage.setItem('br-ct', 'br-ct-invalid'));
+  await page.reload();
+
+  await expect(page.getByRole('dialog', { name: 'Control Token Required' })).toBeVisible();
+  expect(await page.evaluate(() => sessionStorage.getItem('br-ct'))).toBeNull();
+});
+
 test('loads config history and opens preview', async ({ page }) => {
   await page.getByRole('button', { name: 'Settings' }).click();
   await page.getByRole('button', { name: 'Load versions' }).click();

@@ -227,20 +227,23 @@ window.fetch = async function(url, options) {
     opts.headers["X-Control-Token"] = controlToken;
   }
   var response = await _originalFetch(url, opts);
-  if (response.status === 401 || response.status === 403) {
-    if (controlToken) {
-      controlToken = null;
-      sessionStorage.removeItem("br-ct");
-      controlTokenPrompted = false;
-    }
+  if (response.status === 401) {
     var ct = response.headers.get("Content-Type") || "";
-    if (ct.includes("json")) {
+    if (ct.toLowerCase().includes("json")) {
       try {
         var cloned = response.clone();
         var body = await cloned.json();
         var msg = errMsg(body, "Control token required");
         var normalized = String(msg).toLowerCase();
-        if (normalized.indexOf("token") !== -1 || normalized.indexOf("unauthorized") !== -1) {
+        // Other endpoints (notably /v1/models) can return 401 for a missing API key.
+        // Only discard the browsing-session token when the server identifies the
+        // failed credential as the control token.
+        if (normalized.indexOf("control token") !== -1) {
+          if (controlToken) {
+            controlToken = null;
+            sessionStorage.removeItem("br-ct");
+            controlTokenPrompted = false;
+          }
           await promptControlToken(msg);
         }
       } catch(_) {}
