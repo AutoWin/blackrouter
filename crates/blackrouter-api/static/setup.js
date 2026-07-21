@@ -492,7 +492,7 @@ async function deleteProvider(id, name) {
 async function fetchModelsFor(id) {
   try {
     toast("Fetching models for " + id + "…", "info");
-    await sendJson(`/api/setup/providers/${encodeURIComponent(id)}/models`, "POST", {});
+    await sendJson(`/api/setup/providers/${encodeURIComponent(id)}/models?refresh=1`, "POST", {});
     toast("Models updated for " + id, "success");
     await refresh();
     renderProviders();

@@ -93,6 +93,7 @@ const CLINE_MODELS: &[&str] = &[
     "cline-pass/glm-5.2",
     "cline-pass/mimo-v2.5",
     "cline-pass/kimi-k2.7-code",
+    "cline-pass/kimi-k3",
     "cline-pass/deepseek-v4-flash",
     "cline-pass/deepseek-v4-pro",
     "cline-pass/kimi-k2.6",
@@ -100,6 +101,7 @@ const CLINE_MODELS: &[&str] = &[
     "deepseek/deepseek-v4-flash",
     "zai/glm-5.2",
     "moonshotai/kimi-k2.7-code",
+    "moonshotai/kimi-k3",
     "anthropic/claude-opus-4.8",
     "anthropic/claude-sonnet-4.6",
     "openai/gpt-5.5",
@@ -121,6 +123,7 @@ const COMMANDCODE_MODELS: &[&str] = &[
     // Moonshot
     "moonshotai/Kimi-K2.7-Code",
     "moonshotai/Kimi-K2.7-Code-Highspeed",
+    "moonshotai/Kimi-K3",
     "moonshotai/Kimi-K2.6",
     "moonshotai/Kimi-K2.5",
     // Zhipu
@@ -564,6 +567,13 @@ const MODEL_CATALOG: &[(&str, ModelInfo)] = &[
     ),
     (
         "kimi-k2.7-code-highspeed",
+        ModelInfo {
+            context_window: 262_144,
+            max_output_tokens: 16_384,
+        },
+    ),
+    (
+        "kimi-k3",
         ModelInfo {
             context_window: 262_144,
             max_output_tokens: 16_384,
